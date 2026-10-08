@@ -62,6 +62,12 @@ type SDKConfig struct {
 	// APIKeys is a list of keys for authenticating clients to this proxy server.
 	APIKeys []string `yaml:"api-keys" json:"api-keys"`
 
+	// KeyPools optionally scopes a client API key to one or more credential pools.
+	// Each credential may carry a "pool" attribute; a key listed here only routes to
+	// credentials tagged with one of the listed pools. Keys absent from this map are
+	// unrestricted, preserving the previous behavior.
+	KeyPools map[string][]string `yaml:"key-pools,omitempty" json:"key-pools,omitempty"`
+
 	// PassthroughHeaders controls whether upstream response headers are forwarded to downstream clients.
 	// Default is false (disabled).
 	PassthroughHeaders bool `yaml:"passthrough-headers" json:"passthrough-headers"`

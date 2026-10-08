@@ -24,16 +24,19 @@ func Register(cfg *sdkconfig.SDKConfig) {
 
 	sdkaccess.RegisterProvider(
 		sdkaccess.AccessProviderTypeConfigAPIKey,
-		newProvider(sdkaccess.DefaultAccessProviderName, keys),
+		newProvider(sdkaccess.DefaultAccessProviderName, keys, cfg.KeyPools),
 	)
 }
 
 type provider struct {
 	name string
 	keys map[string]struct{}
+	// pools maps a client API key to its allowed credential pools. A key absent
+	// from this map is unrestricted.
+	pools map[string][]string
 }
 
-func newProvider(name string, keys []string) *provider {
+func newProvider(name string, keys []string, pools map[string][]string) *provider {
 	providerName := strings.TrimSpace(name)
 	if providerName == "" {
 		providerName = sdkaccess.DefaultAccessProviderName
@@ -42,7 +45,45 @@ func newProvider(name string, keys []string) *provider {
 	for _, key := range keys {
 		keySet[key] = struct{}{}
 	}
-	return &provider{name: providerName, keys: keySet}
+	return &provider{name: providerName, keys: keySet, pools: normalizeKeyPools(keySet, pools)}
+}
+
+// normalizeKeyPools drops entries for unknown keys and empty pool lists so a
+// configured map cannot silently expand or restrict unrelated credentials.
+func normalizeKeyPools(keys map[string]struct{}, pools map[string][]string) map[string][]string {
+	if len(pools) == 0 {
+		return nil
+	}
+	out := make(map[string][]string, len(pools))
+	for key, list := range pools {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		if _, known := keys[key]; !known {
+			continue
+		}
+		normalized := make([]string, 0, len(list))
+		seen := make(map[string]struct{}, len(list))
+		for _, pool := range list {
+			pool = strings.ToLower(strings.TrimSpace(pool))
+			if pool == "" {
+				continue
+			}
+			if _, exists := seen[pool]; exists {
+				continue
+			}
+			seen[pool] = struct{}{}
+			normalized = append(normalized, pool)
+		}
+		if len(normalized) > 0 {
+			out[key] = normalized
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func (p *provider) Identifier() string {
@@ -90,12 +131,16 @@ func (p *provider) Authenticate(_ context.Context, r *http.Request) (*sdkaccess.
 			continue
 		}
 		if _, ok := p.keys[candidate.value]; ok {
+			metadata := map[string]string{
+				"source": candidate.source,
+			}
+			if pools := p.pools[candidate.value]; len(pools) > 0 {
+				metadata["pools"] = strings.Join(pools, ",")
+			}
 			return &sdkaccess.Result{
 				Provider:  p.Identifier(),
 				Principal: candidate.value,
-				Metadata: map[string]string{
-					"source": candidate.source,
-				},
+				Metadata:  metadata,
 			}, nil
 		}
 	}
