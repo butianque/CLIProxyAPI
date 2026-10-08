@@ -13,9 +13,25 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/secretstore"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy"
 	log "github.com/sirupsen/logrus"
 )
+
+// initSecretStore installs the process-wide secret store used by the management
+// API and by plugins through the host.secret.* callbacks. It is best-effort: a
+// store that cannot be opened disables the feature instead of blocking startup.
+func initSecretStore(configPath string) {
+	path := secretstore.DefaultPath(configPath)
+	store, errOpen := secretstore.Open(path)
+	if errOpen != nil {
+		log.Warnf("secret store disabled: %v", errOpen)
+		secretstore.Configure(nil)
+		return
+	}
+	secretstore.Configure(store)
+	log.Infof("secret store ready at %s (locked)", path)
+}
 
 // StartService builds and runs the proxy service using the exported SDK.
 // It creates a new proxy service instance, sets up signal handling for graceful shutdown,
@@ -31,6 +47,7 @@ func StartService(cfg *config.Config, configPath string, localPassword string) {
 
 // StartServiceWithPluginHost builds and runs the proxy service with a shared plugin host.
 func StartServiceWithPluginHost(cfg *config.Config, configPath string, localPassword string, host *pluginhost.Host, serverOptions ...api.ServerOption) {
+	initSecretStore(configPath)
 	builder := cliproxy.NewBuilder().
 		WithConfig(cfg).
 		WithConfigPath(configPath).
@@ -75,6 +92,7 @@ func StartServiceBackground(cfg *config.Config, configPath string, localPassword
 
 // StartServiceBackgroundWithPluginHost starts the proxy service with a shared plugin host.
 func StartServiceBackgroundWithPluginHost(cfg *config.Config, configPath string, localPassword string, host *pluginhost.Host, serverOptions ...api.ServerOption) (cancel func(), done <-chan struct{}) {
+	initSecretStore(configPath)
 	builder := cliproxy.NewBuilder().
 		WithConfig(cfg).
 		WithConfigPath(configPath).

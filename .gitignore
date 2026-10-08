@@ -5,6 +5,9 @@ cli-proxy-api
 # Configuration
 config.yaml
 .env
+# Passphrase-encrypted host secret store (default location: beside config.yaml)
+cpa-secrets.enc
+cpa-secrets.enc.tmp*
 
 # Generated content
 bin/*

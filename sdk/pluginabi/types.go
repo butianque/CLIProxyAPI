@@ -112,6 +112,14 @@ const (
 	MethodHostAffinityLookup     = "host.affinity.lookup"
 
 	MethodHostRoutingResetCooldown = "host.routing.reset_cooldown"
+
+	// MethodHostSecretStatus reports whether the host secret store is unlocked
+	// and, while unlocked, which secret names exist.
+	MethodHostSecretStatus = "host.secret.status"
+	// MethodHostSecretGet reads one named secret from the host secret store.
+	MethodHostSecretGet = "host.secret.get"
+	// MethodHostSecretSet creates or replaces one named secret in the host secret store.
+	MethodHostSecretSet = "host.secret.set"
 )
 
 type Envelope struct {

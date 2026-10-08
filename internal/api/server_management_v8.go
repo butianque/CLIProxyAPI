@@ -60,4 +60,10 @@ func (s *Server) registerManagementV8Routes() {
 	v8.GET("/plugins/:id/quota", s.mgmt.GetPluginQuota)
 	v8.POST("/plugins/:id/quota", s.mgmt.FetchPluginQuota)
 	v8.DELETE("/plugins/:id/quota", s.mgmt.ResetPluginQuota)
+
+	v8.GET("/secrets", s.mgmt.GetSecretStatus)
+	v8.POST("/secrets/unlock", s.mgmt.PostSecretUnlock)
+	v8.POST("/secrets/lock", s.mgmt.PostSecretLock)
+	v8.PUT("/secrets/:name", s.mgmt.PutSecret)
+	v8.DELETE("/secrets/:name", s.mgmt.DeleteSecret)
 }

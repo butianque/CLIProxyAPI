@@ -898,6 +898,59 @@ type HostRoutingResetCooldownResponse struct {
 	Models []string `json:"models,omitempty"`
 }
 
+// HostSecretStatusRequest asks the host for the state of its secret store.
+type HostSecretStatusRequest struct{}
+
+// HostSecretStatusResponse reports whether the host secret store is enabled and
+// unlocked, and which secret names exist while unlocked.
+type HostSecretStatusResponse struct {
+	// Enabled reports whether the host secret store is configured.
+	Enabled bool `json:"enabled"`
+	// Unlocked reports whether a key is currently held in memory.
+	Unlocked bool `json:"unlocked"`
+	// Names lists available secret names; empty while locked.
+	Names []string `json:"names,omitempty"`
+}
+
+// HostSecretGetRequest asks the host to read one named secret.
+type HostSecretGetRequest struct {
+	// Name identifies the secret.
+	Name string `json:"name"`
+}
+
+// HostSecretGetResponse returns the state and, when available, the decrypted
+// value of one named secret. Locked and Found are reported in a successful
+// envelope because the plugin host surfaces every callback error under a single
+// code, so a distinct error code cannot be relied upon.
+type HostSecretGetResponse struct {
+	// Name identifies the secret.
+	Name string `json:"name"`
+	// Locked reports that the store is locked, so the value cannot be read.
+	Locked bool `json:"locked"`
+	// Found reports that the secret exists.
+	Found bool `json:"found"`
+	// Value is the decrypted secret value; empty unless Found is true.
+	Value string `json:"value,omitempty"`
+}
+
+// HostSecretSetRequest asks the host to store one named secret.
+type HostSecretSetRequest struct {
+	// Name identifies the secret.
+	Name string `json:"name"`
+	// Value is the plaintext secret value.
+	Value string `json:"value"`
+}
+
+// HostSecretSetResponse reports the outcome of storing one named secret.
+type HostSecretSetResponse struct {
+	// Name identifies the secret.
+	Name string `json:"name"`
+	// Locked reports that the store is locked, so nothing was stored.
+	Locked bool `json:"locked"`
+	// Stored reports that the value was persisted.
+	Stored bool `json:"stored"`
+}
+
 // HTTPWireProfile configures transport-level wire representation for plugin HTTP requests.
 type HTTPWireProfile struct {
 	// HTTP1Only forces the transport to use HTTP/1.1 and disables HTTP/2 negotiation.
