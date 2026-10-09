@@ -24,6 +24,7 @@ func (h *Host) callHostSecretStatus(_ context.Context, request []byte) ([]byte, 
 	if store := secretstore.Default(); store != nil {
 		resp.Enabled = true
 		resp.Unlocked = store.Unlocked()
+		resp.Passphrase = store.HasPassphrase()
 		if names, errNames := store.Names(); errNames == nil {
 			resp.Names = names
 		}
@@ -88,5 +89,67 @@ func (h *Host) callHostSecretSet(_ context.Context, request []byte) ([]byte, err
 		return nil, fmt.Errorf("write host secret %q: %w", name, errSet)
 	}
 	resp.Stored = true
+	return marshalRPCResult(resp)
+}
+
+// callHostSecretVerify checks a master passphrase. It always succeeds at the
+// transport level: Configured and Verified carry the outcome so a plugin can
+// distinguish "no passphrase installed" from "wrong passphrase".
+func (h *Host) callHostSecretVerify(_ context.Context, request []byte) ([]byte, error) {
+	var req pluginapi.HostSecretVerifyRequest
+	if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
+		return nil, fmt.Errorf("decode host secret verify request: %w", errUnmarshal)
+	}
+	resp := pluginapi.HostSecretVerifyResponse{}
+	store := secretstore.Default()
+	if store == nil || !store.HasPassphrase() {
+		return marshalRPCResult(resp)
+	}
+	resp.Configured = true
+	resp.Verified = store.VerifyPassphrase(req.Passphrase) == nil
+	return marshalRPCResult(resp)
+}
+
+// callHostSecretSetPassphrase installs or replaces the master passphrase.
+func (h *Host) callHostSecretSetPassphrase(_ context.Context, request []byte) ([]byte, error) {
+	var req pluginapi.HostSecretSetPassphraseRequest
+	if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
+		return nil, fmt.Errorf("decode host secret set passphrase request: %w", errUnmarshal)
+	}
+	resp := pluginapi.HostSecretSetPassphraseResponse{}
+	store := secretstore.Default()
+	if store == nil {
+		return marshalRPCResult(resp)
+	}
+	if errSet := store.SetPassphrase(req.Current, req.Next); errSet != nil {
+		return nil, fmt.Errorf("set master passphrase: %w", errSet)
+	}
+	resp.Installed = true
+	return marshalRPCResult(resp)
+}
+
+// callHostSecretDelete removes one named secret.
+func (h *Host) callHostSecretDelete(_ context.Context, request []byte) ([]byte, error) {
+	var req pluginapi.HostSecretDeleteRequest
+	if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
+		return nil, fmt.Errorf("decode host secret delete request: %w", errUnmarshal)
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		return nil, errors.New("host secret delete: name is required")
+	}
+	resp := pluginapi.HostSecretDeleteResponse{Name: name}
+	store := secretstore.Default()
+	if store == nil {
+		return marshalRPCResult(resp)
+	}
+	if !store.Unlocked() {
+		resp.Locked = true
+		return marshalRPCResult(resp)
+	}
+	if errDelete := store.Delete(name); errDelete != nil {
+		return nil, fmt.Errorf("delete host secret %q: %w", name, errDelete)
+	}
+	resp.Deleted = true
 	return marshalRPCResult(resp)
 }

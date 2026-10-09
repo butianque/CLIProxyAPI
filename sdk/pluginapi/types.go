@@ -902,13 +902,15 @@ type HostRoutingResetCooldownResponse struct {
 type HostSecretStatusRequest struct{}
 
 // HostSecretStatusResponse reports whether the host secret store is enabled and
-// unlocked, and which secret names exist while unlocked.
+// available, and which secret names exist.
 type HostSecretStatusResponse struct {
 	// Enabled reports whether the host secret store is configured.
 	Enabled bool `json:"enabled"`
-	// Unlocked reports whether a key is currently held in memory.
+	// Unlocked reports whether the machine key is held, i.e. secrets are usable.
 	Unlocked bool `json:"unlocked"`
-	// Names lists available secret names; empty while locked.
+	// Passphrase reports whether a master passphrase is installed.
+	Passphrase bool `json:"passphrase,omitempty"`
+	// Names lists available secret names.
 	Names []string `json:"names,omitempty"`
 }
 
@@ -921,7 +923,8 @@ type HostSecretGetRequest struct {
 // HostSecretGetResponse returns the state and, when available, the decrypted
 // value of one named secret. Locked and Found are reported in a successful
 // envelope because the plugin host surfaces every callback error under a single
-// code, so a distinct error code cannot be relied upon.
+// code, so a distinct error code cannot be relied upon. Locked means the machine
+// key is unavailable, which is a broken deployment rather than a routine state.
 type HostSecretGetResponse struct {
 	// Name identifies the secret.
 	Name string `json:"name"`
@@ -949,6 +952,52 @@ type HostSecretSetResponse struct {
 	Locked bool `json:"locked"`
 	// Stored reports that the value was persisted.
 	Stored bool `json:"stored"`
+}
+
+// HostSecretVerifyRequest asks the host to check a master passphrase. The
+// passphrase itself is never stored.
+type HostSecretVerifyRequest struct {
+	// Passphrase is the candidate master passphrase.
+	Passphrase string `json:"passphrase"`
+}
+
+// HostSecretVerifyResponse reports whether the candidate matched and whether a
+// master passphrase is installed at all.
+type HostSecretVerifyResponse struct {
+	// Configured reports that a master passphrase exists.
+	Configured bool `json:"configured"`
+	// Verified reports that the candidate matched.
+	Verified bool `json:"verified"`
+}
+
+// HostSecretSetPassphraseRequest installs or replaces the master passphrase.
+type HostSecretSetPassphraseRequest struct {
+	// Current is the existing passphrase; required when replacing one.
+	Current string `json:"current,omitempty"`
+	// Next is the passphrase to install.
+	Next string `json:"next"`
+}
+
+// HostSecretSetPassphraseResponse reports the installation outcome.
+type HostSecretSetPassphraseResponse struct {
+	// Installed reports that the passphrase was stored.
+	Installed bool `json:"installed"`
+}
+
+// HostSecretDeleteRequest asks the host to remove one named secret.
+type HostSecretDeleteRequest struct {
+	// Name identifies the secret.
+	Name string `json:"name"`
+}
+
+// HostSecretDeleteResponse reports the outcome of removing one named secret.
+type HostSecretDeleteResponse struct {
+	// Name identifies the secret.
+	Name string `json:"name"`
+	// Locked reports that the store is locked, so nothing was removed.
+	Locked bool `json:"locked"`
+	// Deleted reports that the secret no longer exists.
+	Deleted bool `json:"deleted"`
 }
 
 // HTTPWireProfile configures transport-level wire representation for plugin HTTP requests.

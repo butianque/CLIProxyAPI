@@ -46,7 +46,7 @@ func TestHostSecretCallbacksWithoutStore(t *testing.T) {
 	}
 }
 
-func TestHostSecretCallbacksLockedAndUnlocked(t *testing.T) {
+func TestHostSecretCallbacksAvailableAndLocked(t *testing.T) {
 	store, errOpen := secretstore.Open(filepath.Join(t.TempDir(), "secrets.enc"))
 	if errOpen != nil {
 		t.Fatalf("open store: %v", errOpen)
@@ -55,26 +55,8 @@ func TestHostSecretCallbacksLockedAndUnlocked(t *testing.T) {
 	t.Cleanup(func() { secretstore.Configure(nil) })
 	host := New()
 
-	// Locked: reads and writes are reported in the envelope, not as errors.
-	getResp, errGet := decodeRPCEnvelope[pluginapi.HostSecretGetResponse](callSecret(t, host, pluginabi.MethodHostSecretGet, pluginapi.HostSecretGetRequest{Name: "haozhuma"}))
-	if errGet != nil {
-		t.Fatalf("decode locked get: %v", errGet)
-	}
-	if !getResp.Locked || getResp.Found {
-		t.Fatalf("locked get = %+v, want locked and not found", getResp)
-	}
-	setResp, errSet := decodeRPCEnvelope[pluginapi.HostSecretSetResponse](callSecret(t, host, pluginabi.MethodHostSecretSet, pluginapi.HostSecretSetRequest{Name: "haozhuma", Value: "v"}))
-	if errSet != nil {
-		t.Fatalf("decode locked set: %v", errSet)
-	}
-	if !setResp.Locked || setResp.Stored {
-		t.Fatalf("locked set = %+v, want locked and not stored", setResp)
-	}
-
-	if errUnlock := store.Unlock("passphrase"); errUnlock != nil {
-		t.Fatalf("unlock: %v", errUnlock)
-	}
-
+	// A machine-protected store opens ready: a plugin can read and write without
+	// any operator input.
 	stored, errStore := decodeRPCEnvelope[pluginapi.HostSecretSetResponse](callSecret(t, host, pluginabi.MethodHostSecretSet, pluginapi.HostSecretSetRequest{Name: "haozhuma", Value: "user=abc"}))
 	if errStore != nil {
 		t.Fatalf("decode set: %v", errStore)
@@ -95,10 +77,72 @@ func TestHostSecretCallbacksLockedAndUnlocked(t *testing.T) {
 	if errStatus != nil {
 		t.Fatalf("decode status: %v", errStatus)
 	}
-	if !status.Enabled || !status.Unlocked {
-		t.Fatalf("status = %+v, want enabled and unlocked", status)
+	if !status.Enabled || !status.Unlocked || status.Passphrase {
+		t.Fatalf("status = %+v, want enabled, available, no passphrase", status)
 	}
 	if len(status.Names) != 1 || status.Names[0] != "haozhuma" {
 		t.Fatalf("status names = %v, want [haozhuma]", status.Names)
+	}
+
+	// After a Lock the machine key is gone, so reads and writes report Locked in
+	// the envelope rather than as errors.
+	store.Lock()
+	lockedGet, errLockedGet := decodeRPCEnvelope[pluginapi.HostSecretGetResponse](callSecret(t, host, pluginabi.MethodHostSecretGet, pluginapi.HostSecretGetRequest{Name: "haozhuma"}))
+	if errLockedGet != nil {
+		t.Fatalf("decode locked get: %v", errLockedGet)
+	}
+	if !lockedGet.Locked || lockedGet.Found {
+		t.Fatalf("locked get = %+v, want locked and not found", lockedGet)
+	}
+	lockedSet, errLockedSet := decodeRPCEnvelope[pluginapi.HostSecretSetResponse](callSecret(t, host, pluginabi.MethodHostSecretSet, pluginapi.HostSecretSetRequest{Name: "haozhuma", Value: "v"}))
+	if errLockedSet != nil {
+		t.Fatalf("decode locked set: %v", errLockedSet)
+	}
+	if !lockedSet.Locked || lockedSet.Stored {
+		t.Fatalf("locked set = %+v, want locked and not stored", lockedSet)
+	}
+}
+
+func TestHostSecretPassphraseCallbacks(t *testing.T) {
+	store, errOpen := secretstore.Open(filepath.Join(t.TempDir(), "secrets.enc"))
+	if errOpen != nil {
+		t.Fatalf("open store: %v", errOpen)
+	}
+	secretstore.Configure(store)
+	t.Cleanup(func() { secretstore.Configure(nil) })
+	host := New()
+
+	// Before any passphrase is installed, verify reports neither configured nor
+	// verified rather than an error.
+	before, errBefore := decodeRPCEnvelope[pluginapi.HostSecretVerifyResponse](callSecret(t, host, pluginabi.MethodHostSecretVerify, pluginapi.HostSecretVerifyRequest{Passphrase: "x"}))
+	if errBefore != nil {
+		t.Fatalf("decode verify: %v", errBefore)
+	}
+	if before.Configured || before.Verified {
+		t.Fatalf("verify before install = %+v, want neither", before)
+	}
+
+	installed, errInstall := decodeRPCEnvelope[pluginapi.HostSecretSetPassphraseResponse](callSecret(t, host, pluginabi.MethodHostSecretSetPassphrase, pluginapi.HostSecretSetPassphraseRequest{Next: "master"}))
+	if errInstall != nil {
+		t.Fatalf("decode install: %v", errInstall)
+	}
+	if !installed.Installed {
+		t.Fatal("passphrase must be installed")
+	}
+
+	ok, errOk := decodeRPCEnvelope[pluginapi.HostSecretVerifyResponse](callSecret(t, host, pluginabi.MethodHostSecretVerify, pluginapi.HostSecretVerifyRequest{Passphrase: "master"}))
+	if errOk != nil {
+		t.Fatalf("decode verify correct: %v", errOk)
+	}
+	if !ok.Configured || !ok.Verified {
+		t.Fatalf("verify = %+v, want configured and verified", ok)
+	}
+
+	bad, errBad := decodeRPCEnvelope[pluginapi.HostSecretVerifyResponse](callSecret(t, host, pluginabi.MethodHostSecretVerify, pluginapi.HostSecretVerifyRequest{Passphrase: "wrong"}))
+	if errBad != nil {
+		t.Fatalf("decode verify wrong: %v", errBad)
+	}
+	if !bad.Configured || bad.Verified {
+		t.Fatalf("verify wrong = %+v, want configured but not verified", bad)
 	}
 }

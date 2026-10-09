@@ -9,23 +9,17 @@ import (
 	"testing"
 )
 
-func TestSetGetRoundTrip(t *testing.T) {
+func TestOpenStartsUsable(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "secrets.enc")
 	store, errOpen := Open(path)
 	if errOpen != nil {
 		t.Fatalf("open: %v", errOpen)
 	}
-	if store.Unlocked() {
-		t.Fatal("store must start locked")
-	}
-	if errSet := store.Set("haozhuma", "value"); !errors.Is(errSet, ErrLocked) {
-		t.Fatalf("set while locked: got %v, want ErrLocked", errSet)
-	}
-	if errUnlock := store.Unlock("correct horse"); errUnlock != nil {
-		t.Fatalf("unlock: %v", errUnlock)
-	}
 	if !store.Unlocked() {
-		t.Fatal("store must be unlocked")
+		t.Fatal("a store with no key file must open usable")
+	}
+	if _, errGet := store.Get("missing"); !errors.Is(errGet, ErrNotFound) {
+		t.Fatalf("get missing: got %v, want ErrNotFound", errGet)
 	}
 	if errSet := store.Set("haozhuma", "user=abc&key=def"); errSet != nil {
 		t.Fatalf("set: %v", errSet)
@@ -37,27 +31,25 @@ func TestSetGetRoundTrip(t *testing.T) {
 	if got != "user=abc&key=def" {
 		t.Fatalf("get = %q", got)
 	}
-	names, errNames := store.Names()
-	if errNames != nil {
-		t.Fatalf("names: %v", errNames)
-	}
-	if len(names) != 1 || names[0] != "haozhuma" {
-		t.Fatalf("names = %v", names)
+}
+
+func TestReopenDecryptsWithoutOperatorInput(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "secrets.enc")
+	store, _ := Open(path)
+	if errSet := store.Set("haozhuma", "secret"); errSet != nil {
+		t.Fatalf("set: %v", errSet)
 	}
 
-	// Reopen with the same passphrase.
+	// A fresh Open must decrypt by itself: no passphrase is needed.
 	reopened, errReopen := Open(path)
 	if errReopen != nil {
 		t.Fatalf("reopen: %v", errReopen)
 	}
-	if _, errGet := reopened.Get("haozhuma"); !errors.Is(errGet, ErrLocked) {
-		t.Fatalf("get before unlock: got %v, want ErrLocked", errGet)
+	if !reopened.Unlocked() {
+		t.Fatal("reopened store must be usable")
 	}
-	if errUnlock := reopened.Unlock("correct horse"); errUnlock != nil {
-		t.Fatalf("reopen unlock: %v", errUnlock)
-	}
-	got, errGet = reopened.Get("haozhuma")
-	if errGet != nil || got != "user=abc&key=def" {
+	got, errGet := reopened.Get("haozhuma")
+	if errGet != nil || got != "secret" {
 		t.Fatalf("reopened get = %q, err = %v", got, errGet)
 	}
 }
@@ -65,9 +57,6 @@ func TestSetGetRoundTrip(t *testing.T) {
 func TestMultipleSecretsRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "secrets.enc")
 	store, _ := Open(path)
-	if errUnlock := store.Unlock("pw"); errUnlock != nil {
-		t.Fatalf("unlock: %v", errUnlock)
-	}
 	for _, name := range []string{"zeta", "alpha", "haozhuma"} {
 		if errSet := store.Set(name, "value-"+name); errSet != nil {
 			t.Fatalf("set %s: %v", name, errSet)
@@ -78,9 +67,6 @@ func TestMultipleSecretsRoundTrip(t *testing.T) {
 	}
 
 	reopened, _ := Open(path)
-	if errUnlock := reopened.Unlock("pw"); errUnlock != nil {
-		t.Fatalf("reopen unlock: %v", errUnlock)
-	}
 	names, errNames := reopened.Names()
 	if errNames != nil {
 		t.Fatalf("names: %v", errNames)
@@ -96,29 +82,8 @@ func TestMultipleSecretsRoundTrip(t *testing.T) {
 	}
 }
 
-func TestUnlockRejectsWrongPassphrase(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "secrets.enc")
-	store, _ := Open(path)
-	if errUnlock := store.Unlock("right"); errUnlock != nil {
-		t.Fatalf("unlock: %v", errUnlock)
-	}
-	if errSet := store.Set("k", "v"); errSet != nil {
-		t.Fatalf("set: %v", errSet)
-	}
-	reopened, _ := Open(path)
-	if errUnlock := reopened.Unlock("wrong"); !errors.Is(errUnlock, ErrInvalidPassphrase) {
-		t.Fatalf("unlock with wrong passphrase: got %v, want ErrInvalidPassphrase", errUnlock)
-	}
-	if reopened.Unlocked() {
-		t.Fatal("store must stay locked after a failed unlock")
-	}
-}
-
 func TestDeleteAndNotFound(t *testing.T) {
 	store, _ := Open(filepath.Join(t.TempDir(), "secrets.enc"))
-	if errUnlock := store.Unlock("pw"); errUnlock != nil {
-		t.Fatalf("unlock: %v", errUnlock)
-	}
 	if _, errGet := store.Get("missing"); !errors.Is(errGet, ErrNotFound) {
 		t.Fatalf("get missing: got %v, want ErrNotFound", errGet)
 	}
@@ -136,10 +101,12 @@ func TestDeleteAndNotFound(t *testing.T) {
 	}
 }
 
-func TestLockClearsKeyAndItems(t *testing.T) {
-	store, _ := Open(filepath.Join(t.TempDir(), "secrets.enc"))
-	_ = store.Unlock("pw")
-	_ = store.Set("a", "1")
+func TestLockRequiresKeyFileToRecover(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "secrets.enc")
+	store, _ := Open(path)
+	if errSet := store.Set("a", "1"); errSet != nil {
+		t.Fatalf("set: %v", errSet)
+	}
 	store.Lock()
 	if store.Unlocked() {
 		t.Fatal("store must be locked")
@@ -156,7 +123,7 @@ func TestLockClearsKeyAndItems(t *testing.T) {
 	if items != nil {
 		t.Fatal("plaintext items must not survive Lock")
 	}
-	if errUnlock := store.Unlock("pw"); errUnlock != nil {
+	if errUnlock := store.Unlock(); errUnlock != nil {
 		t.Fatalf("re-unlock: %v", errUnlock)
 	}
 	if got, _ := store.Get("a"); got != "1" {
@@ -164,11 +131,10 @@ func TestLockClearsKeyAndItems(t *testing.T) {
 	}
 }
 
-func TestFileDisclosesNeitherNamesNorValues(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "secrets.enc")
+func TestStoreFileDisclosesNeitherNamesNorValues(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "secrets.enc")
 	store, _ := Open(path)
-	const passphrase = "PassphraseThatMustNotAppearInTheFile"
-	_ = store.Unlock(passphrase)
 	const secret = "super-secret-token-value"
 	if errSet := store.Set("haozhuma", secret); errSet != nil {
 		t.Fatalf("set: %v", errSet)
@@ -183,9 +149,6 @@ func TestFileDisclosesNeitherNamesNorValues(t *testing.T) {
 	if strings.Contains(string(raw), "haozhuma") {
 		t.Fatal("secret name leaked into the store file")
 	}
-	if strings.Contains(string(raw), passphrase) {
-		t.Fatal("passphrase leaked into the store file")
-	}
 	var decoded map[string]any
 	if errUnmarshal := json.Unmarshal(raw, &decoded); errUnmarshal != nil {
 		t.Fatalf("store file is not JSON: %v", errUnmarshal)
@@ -195,6 +158,130 @@ func TestFileDisclosesNeitherNamesNorValues(t *testing.T) {
 	}
 	if _, ok := decoded["items"]; !ok {
 		t.Fatal("store file has no items payload")
+	}
+
+	// The machine key must live in a separate file with restrictive permissions,
+	// never inside the store file.
+	keyRaw, errKey := os.ReadFile(path + ".key")
+	if errKey != nil {
+		t.Fatalf("read key file: %v", errKey)
+	}
+	if len(keyRaw) != machineKeyLen {
+		t.Fatalf("key length = %d, want %d", len(keyRaw), machineKeyLen)
+	}
+	if strings.Contains(string(raw), string(keyRaw)) {
+		t.Fatal("machine key leaked into the store file")
+	}
+}
+
+func TestOpenFailsWhenKeyFileIsMissing(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "secrets.enc")
+	store, _ := Open(path)
+	if errSet := store.Set("a", "1"); errSet != nil {
+		t.Fatalf("set: %v", errSet)
+	}
+	if errRemove := os.Remove(path + ".key"); errRemove != nil {
+		t.Fatalf("remove key: %v", errRemove)
+	}
+	if _, errOpen := Open(path); errOpen == nil {
+		t.Fatal("expected open to fail when the machine key is gone")
+	}
+}
+
+func TestOpenRejectsMismatchedKey(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "secrets.enc")
+	store, _ := Open(path)
+	if errSet := store.Set("a", "1"); errSet != nil {
+		t.Fatalf("set: %v", errSet)
+	}
+	if errWrite := os.WriteFile(path+".key", randomBytes(machineKeyLen), 0o600); errWrite != nil {
+		t.Fatalf("overwrite key: %v", errWrite)
+	}
+	if _, errOpen := Open(path); errOpen == nil {
+		t.Fatal("expected a mismatched machine key to be rejected")
+	}
+}
+
+func TestPassphraseLifecycle(t *testing.T) {
+	store, _ := Open(filepath.Join(t.TempDir(), "secrets.enc"))
+	if store.HasPassphrase() {
+		t.Fatal("a fresh store has no passphrase")
+	}
+	if errVerify := store.VerifyPassphrase("anything"); !errors.Is(errVerify, ErrNoPassphrase) {
+		t.Fatalf("verify before install: got %v, want ErrNoPassphrase", errVerify)
+	}
+	if errSet := store.SetPassphrase("", "master"); errSet != nil {
+		t.Fatalf("install: %v", errSet)
+	}
+	if !store.HasPassphrase() {
+		t.Fatal("passphrase must be recorded")
+	}
+	if errVerify := store.VerifyPassphrase("master"); errVerify != nil {
+		t.Fatalf("verify correct: %v", errVerify)
+	}
+	if errVerify := store.VerifyPassphrase("wrong"); !errors.Is(errVerify, ErrInvalidPassphrase) {
+		t.Fatalf("verify wrong: got %v, want ErrInvalidPassphrase", errVerify)
+	}
+	if errVerify := store.VerifyPassphrase(""); !errors.Is(errVerify, ErrEmptyPassphrase) {
+		t.Fatalf("verify empty: got %v, want ErrEmptyPassphrase", errVerify)
+	}
+}
+
+func TestSetPassphraseRequiresCurrentToReplace(t *testing.T) {
+	store, _ := Open(filepath.Join(t.TempDir(), "secrets.enc"))
+	if errSet := store.SetPassphrase("", "first"); errSet != nil {
+		t.Fatalf("install: %v", errSet)
+	}
+	if errSet := store.SetPassphrase("", "second"); !errors.Is(errSet, ErrEmptyPassphrase) {
+		t.Fatalf("replace without current: got %v, want ErrEmptyPassphrase", errSet)
+	}
+	if errSet := store.SetPassphrase("nope", "second"); !errors.Is(errSet, ErrInvalidPassphrase) {
+		t.Fatalf("replace with wrong current: got %v, want ErrInvalidPassphrase", errSet)
+	}
+	if errSet := store.SetPassphrase("first", "second"); errSet != nil {
+		t.Fatalf("replace with current: %v", errSet)
+	}
+	if errVerify := store.VerifyPassphrase("second"); errVerify != nil {
+		t.Fatalf("verify new passphrase: %v", errVerify)
+	}
+	if errVerify := store.VerifyPassphrase("first"); !errors.Is(errVerify, ErrInvalidPassphrase) {
+		t.Fatalf("old passphrase must stop matching: got %v", errVerify)
+	}
+}
+
+func TestPassphraseSurvivesReopenAndDoesNotLeak(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "secrets.enc")
+	store, _ := Open(path)
+	const passphrase = "PassphraseThatMustNotAppearInTheFile"
+	if errSet := store.SetPassphrase("", passphrase); errSet != nil {
+		t.Fatalf("install: %v", errSet)
+	}
+	if errSet := store.Set("haozhuma", "secret"); errSet != nil {
+		t.Fatalf("set: %v", errSet)
+	}
+
+	reopened, errReopen := Open(path)
+	if errReopen != nil {
+		t.Fatalf("reopen: %v", errReopen)
+	}
+	if !reopened.HasPassphrase() {
+		t.Fatal("passphrase must survive a reopen")
+	}
+	if errVerify := reopened.VerifyPassphrase(passphrase); errVerify != nil {
+		t.Fatalf("verify after reopen: %v", errVerify)
+	}
+	if got, _ := reopened.Get("haozhuma"); got != "secret" {
+		t.Fatalf("secrets must survive alongside the passphrase, got %q", got)
+	}
+
+	raw, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatalf("read: %v", errRead)
+	}
+	if strings.Contains(string(raw), passphrase) {
+		t.Fatal("passphrase leaked into the store file")
 	}
 }
 
@@ -214,7 +301,7 @@ func TestSlotsAreBoundByAAD(t *testing.T) {
 
 func TestOpenRejectsUnsupportedVersion(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "secrets.enc")
-	if errWrite := os.WriteFile(path, []byte(`{"v":99,"kdf":{"name":"argon2id","salt":"AAAAAAAAAAAAAAAAAAAAAA==","time":3,"memory":65536,"parallelism":4,"keylen":32},"aead":"aes-256-gcm","items":{}}`), 0o600); errWrite != nil {
+	if errWrite := os.WriteFile(path, []byte(`{"v":99,"aead":"aes-256-gcm","items":{}}`), 0o600); errWrite != nil {
 		t.Fatalf("write: %v", errWrite)
 	}
 	if _, errOpen := Open(path); errOpen == nil {
@@ -224,10 +311,9 @@ func TestOpenRejectsUnsupportedVersion(t *testing.T) {
 
 func TestEmptyInputs(t *testing.T) {
 	store, _ := Open(filepath.Join(t.TempDir(), "secrets.enc"))
-	if errUnlock := store.Unlock(""); !errors.Is(errUnlock, ErrEmptyPassphrase) {
-		t.Fatalf("empty passphrase: got %v", errUnlock)
+	if errSet := store.SetPassphrase("", ""); !errors.Is(errSet, ErrEmptyPassphrase) {
+		t.Fatalf("empty passphrase: got %v", errSet)
 	}
-	_ = store.Unlock("pw")
 	if errSet := store.Set("", "v"); !errors.Is(errSet, ErrEmptyName) {
 		t.Fatalf("empty name: got %v", errSet)
 	}

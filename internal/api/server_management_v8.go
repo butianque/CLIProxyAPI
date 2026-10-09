@@ -64,6 +64,8 @@ func (s *Server) registerManagementV8Routes() {
 	v8.GET("/secrets", s.mgmt.GetSecretStatus)
 	v8.POST("/secrets/unlock", s.mgmt.PostSecretUnlock)
 	v8.POST("/secrets/lock", s.mgmt.PostSecretLock)
+	v8.POST("/secrets/passphrase", s.mgmt.PostSecretPassphrase)
+	v8.POST("/secrets/verify", s.mgmt.PostSecretVerify)
 	v8.PUT("/secrets/:name", s.mgmt.PutSecret)
 	v8.DELETE("/secrets/:name", s.mgmt.DeleteSecret)
 }

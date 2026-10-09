@@ -113,13 +113,19 @@ const (
 
 	MethodHostRoutingResetCooldown = "host.routing.reset_cooldown"
 
-	// MethodHostSecretStatus reports whether the host secret store is unlocked
-	// and, while unlocked, which secret names exist.
+	// MethodHostSecretStatus reports whether the host secret store is available
+	// and which secret names exist.
 	MethodHostSecretStatus = "host.secret.status"
 	// MethodHostSecretGet reads one named secret from the host secret store.
 	MethodHostSecretGet = "host.secret.get"
 	// MethodHostSecretSet creates or replaces one named secret in the host secret store.
 	MethodHostSecretSet = "host.secret.set"
+	// MethodHostSecretVerify checks a master passphrase without changing it.
+	MethodHostSecretVerify = "host.secret.verify"
+	// MethodHostSecretSetPassphrase installs or replaces the master passphrase.
+	MethodHostSecretSetPassphrase = "host.secret.set_passphrase"
+	// MethodHostSecretDelete removes one named secret.
+	MethodHostSecretDelete = "host.secret.delete"
 )
 
 type Envelope struct {
