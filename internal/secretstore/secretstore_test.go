@@ -333,6 +333,72 @@ func TestDisableMachineUnlockRefusesWithoutPassphrase(t *testing.T) {
 	}
 }
 
+func TestUnlockVerifiesPassphraseEvenWhenAlreadyUnlocked(t *testing.T) {
+	// A wrong passphrase must never report success, even on an already-unlocked
+	// store: otherwise "wrong" is indistinguishable from "correct".
+	store := initStore(t, filepath.Join(t.TempDir(), "secrets.enc"), "correct")
+	if !store.Unlocked() {
+		t.Fatal("initialized store must be unlocked")
+	}
+	if errUnlock := store.Unlock("wrong"); !errors.Is(errUnlock, ErrInvalidPassphrase) {
+		t.Fatalf("unlock(wrong) on an unlocked store: got %v, want ErrInvalidPassphrase", errUnlock)
+	}
+	if !store.Unlocked() {
+		t.Fatal("a rejected unlock must not lock the store")
+	}
+	if errUnlock := store.Unlock("correct"); errUnlock != nil {
+		t.Fatalf("unlock(correct) on an unlocked store must be idempotent, got %v", errUnlock)
+	}
+}
+
+func TestUnlockMachineOnPassphraseStoreIsRejected(t *testing.T) {
+	// A passphrase-only store must refuse machine unlock even while unlocked,
+	// rather than silently reporting success.
+	store := initStore(t, filepath.Join(t.TempDir(), "secrets.enc"), "pw")
+	if errMachine := store.UnlockMachine(); !errors.Is(errMachine, ErrModeConflict) {
+		t.Fatalf("UnlockMachine on a passphrase store: got %v, want ErrModeConflict", errMachine)
+	}
+}
+
+func TestSetPassphraseRejectsCurrentThatUnwrapsToAnotherKey(t *testing.T) {
+	// current must unwrap to the storage key actually held; a wrapping that
+	// decrypts to a different key is rejected.
+	path := filepath.Join(t.TempDir(), "secrets.enc")
+	store := initStore(t, path, "first")
+	if errSet := store.SetPassphrase("first", "second"); errSet != nil {
+		t.Fatalf("replacing the passphrase once: %v", errSet)
+	}
+	if errSet := store.SetPassphrase("first", "third"); !errors.Is(errSet, ErrInvalidPassphrase) {
+		t.Fatalf("stale current: got %v, want ErrInvalidPassphrase", errSet)
+	}
+	if errSet := store.SetPassphrase("second", "third"); errSet != nil {
+		t.Fatalf("current after replacement: %v", errSet)
+	}
+}
+
+func TestEnableMachineUnlockReloadsWhenLocked(t *testing.T) {
+	// In machine mode, re-enabling while locked must reload from the key file
+	// instead of failing with ErrLocked.
+	path := filepath.Join(t.TempDir(), "secrets.enc")
+	store, _ := Open(path)
+	if errEnable := store.EnableMachineUnlock(); errEnable != nil {
+		t.Fatalf("enable: %v", errEnable)
+	}
+	if errSet := store.Set("a", "1"); errSet != nil {
+		t.Fatalf("set: %v", errSet)
+	}
+	store.Lock()
+	if errEnable := store.EnableMachineUnlock(); errEnable != nil {
+		t.Fatalf("re-enable while locked: %v", errEnable)
+	}
+	if !store.Unlocked() {
+		t.Fatal("re-enabling machine unlock must reload the key")
+	}
+	if got, _ := store.Get("a"); got != "1" {
+		t.Fatalf("get after reload = %q", got)
+	}
+}
+
 func TestInitializeTwiceFails(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "secrets.enc")
 	store := initStore(t, path, "pw")

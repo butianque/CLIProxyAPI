@@ -27,6 +27,7 @@
 package secretstore
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -316,6 +317,10 @@ func (s *Store) Lock() {
 // passphrase mode store, and it also works for a "passphrase+machine" store
 // whether or not its key file is present.
 //
+// The passphrase is always verified, even when the store is already unlocked, so
+// a wrong passphrase never reports success. Unlocking an already-unlocked store
+// with the correct passphrase is idempotent.
+//
 // A store in pure machine mode has no passphrase; use Open or UnlockMachine.
 func (s *Store) Unlock(passphrase string) error {
 	if s == nil {
@@ -326,9 +331,6 @@ func (s *Store) Unlock(passphrase string) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.key != nil {
-		return nil
-	}
 	if s.env.KDF == nil {
 		return ErrNoPassphrase
 	}
@@ -337,6 +339,11 @@ func (s *Store) Unlock(passphrase string) error {
 	storageKey, errUnwrap := s.unwrapStorageKey(masterKey)
 	if errUnwrap != nil {
 		return ErrInvalidPassphrase
+	}
+	// The store is already unlocked with the matching key: nothing to install.
+	if s.key != nil {
+		zero(storageKey)
+		return nil
 	}
 	if errDecrypt := s.adoptStorageKeyLocked(storageKey); errDecrypt != nil {
 		return errDecrypt
@@ -353,17 +360,20 @@ func (s *Store) Unlock(passphrase string) error {
 
 // UnlockMachine loads the storage key from the key file. It is the way into a
 // machine mode store and the fast path for a passphrase+machine store.
+//
+// An already-unlocked store is a no-op. A store whose mode does not allow machine
+// unlock is rejected, whether or not the storage key happens to be held.
 func (s *Store) UnlockMachine() error {
 	if s == nil {
 		return ErrLocked
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.key != nil {
-		return nil
-	}
 	if s.mode != UnlockMachine && s.mode != UnlockPassphraseMachine {
 		return fmt.Errorf("%w: store unlock mode is %q", ErrModeConflict, s.mode)
+	}
+	if s.key != nil {
+		return nil
 	}
 	return s.unlockFromMachineKey()
 }
@@ -430,13 +440,17 @@ func (s *Store) SetPassphrase(current, next string) error {
 	if current == "" {
 		return ErrEmptyPassphrase
 	}
-	// Validate the current passphrase by unwrapping the storage key.
+	// Validate the current passphrase against the store: it must unwrap to the
+	// storage key actually held, so a wrapping that decrypts but yields a
+	// different key is rejected rather than silently accepted.
 	currentMasterKey := deriveKDFKey(current, *s.env.KDF)
-	_, errCheck := s.unwrapStorageKey(currentMasterKey)
+	unwrapped, errCheck := s.unwrapStorageKey(currentMasterKey)
 	zero(currentMasterKey)
-	if errCheck != nil {
+	if errCheck != nil || !bytes.Equal(unwrapped, s.key) {
+		zero(unwrapped)
 		return ErrInvalidPassphrase
 	}
+	zero(unwrapped)
 
 	params := newKDFParams()
 	nextMasterKey := deriveKDFKey(next, params)
@@ -518,7 +532,12 @@ func (s *Store) EnableMachineUnlock() error {
 	defer s.mu.Unlock()
 
 	if s.mode == UnlockMachine || s.mode == UnlockPassphraseMachine {
-		return s.cacheStorageKeyFile()
+		// Already machine-unlockable. Refresh the key-file cache when the key is
+		// held; when locked, reload it from the file instead of failing.
+		if s.key != nil {
+			return s.cacheStorageKeyFile()
+		}
+		return s.unlockFromMachineKey()
 	}
 
 	if s.mode == "" {

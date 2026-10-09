@@ -186,10 +186,11 @@ func (h *Handler) PostSecretVerify(c *gin.Context) {
 
 // PutSecret creates or replaces one named secret.
 //
-// Once a master passphrase is installed, it must be presented here: writing a
-// secret is the operator-facing action the passphrase exists to protect. The
-// internal host.secret.set callback a plugin uses is deliberately not gated,
-// because that is the system acting on its own behalf.
+// The store must be unlocked: unlocking is the operator-facing action the master
+// passphrase protects (see PostSecretUnlock). A passphrase supplied per request
+// is still honoured — when present it must be correct. The internal
+// host.secret.set callback a plugin uses is deliberately not gated, because that
+// is the system acting on its own behalf.
 func (h *Handler) PutSecret(c *gin.Context) {
 	store := secretstore.Default()
 	if store == nil {
@@ -250,17 +251,18 @@ func (h *Handler) DeleteSecret(c *gin.Context) {
 // gateWrite refuses a secret write while the store is locked. Unlocking happens
 // once through PostSecretUnlock (with the master passphrase) or on open for a
 // machine-unlockable store; the store then stays unlocked until locked again, so
-// every subsequent write is not required to carry the passphrase.
+// a write does not have to carry the passphrase every time.
+//
+// When a passphrase is supplied anyway it must be correct, except on a store that
+// has no passphrase at all (pure machine mode), where there is nothing to match.
 func gateWrite(store *secretstore.Store, passphrase string) error {
 	if !store.Unlocked() {
 		return secretstore.ErrLocked
 	}
-	// A passphrase may still be supplied per request; when it is, it must be the
-	// right one. Omitting it relies on the store already being unlocked.
-	if passphrase != "" {
-		return store.VerifyPassphrase(passphrase)
+	if passphrase == "" || !store.HasPassphrase() {
+		return nil
 	}
-	return nil
+	return store.VerifyPassphrase(passphrase)
 }
 
 // errStatus maps a secret store error to an HTTP status.
