@@ -92,6 +92,36 @@ func TestRequestExecutionMetadataIncludesHashedCallerScope(t *testing.T) {
 	}
 }
 
+func TestRequestExecutionMetadataIncludesAllowedPools(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	t.Run("includes pools from access metadata", func(t *testing.T) {
+		ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+		ginCtx.Set("userApiKey", "downstream-secret")
+		ginCtx.Set("accessMetadata", map[string]string{"source": "authorization", "pools": "loomy,zcode-bigmodel"})
+		ctx := context.WithValue(context.Background(), "gin", ginCtx)
+
+		meta := requestExecutionMetadata(ctx)
+		if got := meta[coreexecutor.AllowedPoolsMetadataKey]; got != "loomy,zcode-bigmodel" {
+			t.Fatalf("AllowedPoolsMetadataKey = %v, want %q", got, "loomy,zcode-bigmodel")
+		}
+	})
+
+	t.Run("omits pools when the caller is unrestricted", func(t *testing.T) {
+		ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+		ginCtx.Set("userApiKey", "downstream-secret")
+		ginCtx.Set("accessMetadata", map[string]string{"source": "authorization"})
+		ctx := context.WithValue(context.Background(), "gin", ginCtx)
+
+		meta := requestExecutionMetadata(ctx)
+		if _, exists := meta[coreexecutor.AllowedPoolsMetadataKey]; exists {
+			t.Fatalf("unexpected allowed pools in metadata: %v", meta[coreexecutor.AllowedPoolsMetadataKey])
+		}
+	})
+}
+
 func TestRequestExecutionMetadataTraceCallbackWebsocketDetection(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

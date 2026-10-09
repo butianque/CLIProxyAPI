@@ -7,6 +7,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -79,6 +80,7 @@ type authSelectionEligibility struct {
 	requiredKind     string
 	credentialPolicy string
 	disallowFreeAuth bool
+	allowedPools     []string
 }
 
 func withRequiredAuthKind(ctx context.Context, requiredKind string) context.Context {
@@ -98,7 +100,10 @@ func credentialPolicyFromContext(ctx context.Context) string {
 }
 
 func authSelectionEligibilityForRequest(ctx context.Context, opts cliproxyexecutor.Options) authSelectionEligibility {
-	eligibility := authSelectionEligibility{disallowFreeAuth: disallowFreeAuthFromMetadata(opts.Metadata)}
+	eligibility := authSelectionEligibility{
+		disallowFreeAuth: disallowFreeAuthFromMetadata(opts.Metadata),
+		allowedPools:     allowedPoolsFromMetadata(opts.Metadata),
+	}
 	if ctx != nil {
 		eligibility.requiredKind, _ = ctx.Value(requiredAuthKindContextKey{}).(string)
 		eligibility.credentialPolicy, _ = ctx.Value(credentialPolicyContextKey{}).(string)
@@ -116,7 +121,74 @@ func (e authSelectionEligibility) allows(auth *Auth) bool {
 	if e.credentialPolicy != "" && !credentialPolicyAllows(e.credentialPolicy, auth) {
 		return false
 	}
+	if !authMatchesAllowedPools(auth, e.allowedPools) {
+		return false
+	}
 	return !e.disallowFreeAuth || !isFreeCodexAuth(auth)
+}
+
+// allowedPoolsFromMetadata reads the caller's pool scope from execution metadata.
+// The value is a comma-separated pool list carried through the string-typed
+// access metadata channel. Empty or absent means no pool restriction.
+func allowedPoolsFromMetadata(meta map[string]any) []string {
+	if len(meta) == 0 {
+		return nil
+	}
+	raw, _ := meta[cliproxyexecutor.AllowedPoolsMetadataKey].(string)
+	return splitPoolList(raw)
+}
+
+// splitPoolList normalizes a comma-separated pool list, dropping blanks and
+// case-folding entries for comparison.
+func splitPoolList(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	pools := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if trimmed := strings.ToLower(strings.TrimSpace(part)); trimmed != "" {
+			pools = append(pools, trimmed)
+		}
+	}
+	if len(pools) == 0 {
+		return nil
+	}
+	return pools
+}
+
+// authMatchesAllowedPools reports whether an auth may serve a caller scoped to
+// the given pools. An empty allowed set imposes no restriction. A restricted
+// caller may only use credentials that expose the requested pool, so restricted
+// keys never silently fall back onto an unclassified credential.
+func authMatchesAllowedPools(auth *Auth, allowed []string) bool {
+	if len(allowed) == 0 {
+		return true
+	}
+	pools := authPools(auth)
+	for _, pool := range pools {
+		if slices.Contains(allowed, pool) {
+			return true
+		}
+	}
+	return false
+}
+
+// authPools lists the pool names a credential belongs to. An explicit "pool"
+// attribute (comma-separated for multiple pools) wins; a credential without one
+// belongs to the pool named after its provider, so a provider-scoped key keeps
+// working without every plugin having to tag its credentials.
+func authPools(auth *Auth) []string {
+	if auth == nil {
+		return nil
+	}
+	if pools := splitPoolList(auth.Attributes[cliproxyexecutor.AuthPoolAttribute]); len(pools) > 0 {
+		return pools
+	}
+	if provider := strings.ToLower(strings.TrimSpace(auth.Provider)); provider != "" {
+		return []string{provider}
+	}
+	return nil
 }
 
 func (m *Manager) syncSchedulerFromSnapshot(auths []*Auth) {

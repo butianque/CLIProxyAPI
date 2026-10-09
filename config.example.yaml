@@ -100,6 +100,15 @@ access:
     - "your-api-key-2"
     - "your-api-key-3"
 
+  # Optional per-key credential pools. Each credential may carry a "pool"
+  # attribute (plugins tag their own credentials); a key listed here only routes
+  # to credentials tagged with one of the listed pools. Keys omitted from this
+  # map are unrestricted, so leaving it out preserves the default behavior.
+  # key-pools:
+  #   "your-api-key-1":
+  #     - "loomy"
+  #     - "zcode-bigmodel"
+
 # Optional credential concurrency and observation contracts.
 
 # credentials:

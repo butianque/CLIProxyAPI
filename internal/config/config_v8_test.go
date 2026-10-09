@@ -144,6 +144,59 @@ func TestV8PresencePrecedenceAndCleanup(t *testing.T) {
 	}
 }
 
+func TestV8KeyPoolsSaveAndPrune(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	raw := `config-version: 8
+access:
+  api-keys:
+    - "sk-scoped"
+    - "sk-open"
+  key-pools:
+    "sk-scoped":
+      - "loomy"
+`
+	if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pools := cfg.KeyPools["sk-scoped"]; len(pools) != 1 || pools[0] != "loomy" {
+		t.Fatalf("KeyPools[sk-scoped] = %v, want [loomy]", pools)
+	}
+
+	// A pool added at runtime survives a save.
+	cfg.KeyPools["sk-scoped"] = []string{"loomy", "zcode-bigmodel"}
+	if err = SaveConfigPreserveComments(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pools := reloaded.KeyPools["sk-scoped"]; len(pools) != 2 || pools[1] != "zcode-bigmodel" {
+		t.Fatalf("after save KeyPools[sk-scoped] = %v, want [loomy zcode-bigmodel]", pools)
+	}
+
+	// Removing the scope prunes the key from the saved file.
+	cfg.KeyPools = nil
+	if err = SaveConfigPreserveComments(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	saved, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatal(errRead)
+	}
+	var doc yaml.Node
+	if err = yaml.Unmarshal(saved, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if node := yamlPath(doc.Content[0], "access.key-pools"); node != nil && len(node.Content) > 0 {
+		t.Fatalf("removed key-pools survived save: %s", saved)
+	}
+}
+
 func TestV8KeyInheritance(t *testing.T) {
 	for _, provider := range []string{"gemini", "interactions", "vertex", "codex", "claude", "xai", "meta"} {
 		t.Run(provider, func(t *testing.T) {

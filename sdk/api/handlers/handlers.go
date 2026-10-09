@@ -243,10 +243,31 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	if callerScope := requestCallerScope(ginCtx); callerScope != "" {
 		meta[coreexecutor.CallerScopeMetadataKey] = callerScope
 	}
+	if allowedPools := requestAllowedPools(ginCtx); allowedPools != "" {
+		meta[coreexecutor.AllowedPoolsMetadataKey] = allowedPools
+	}
 	if disallowFreeAuthFromContext(ctx) {
 		meta[coreexecutor.DisallowFreeAuthMetadataKey] = true
 	}
 	return meta
+}
+
+// requestAllowedPools returns the credential-pool scope attached to the
+// authenticated client key by the access provider. A missing value means the
+// caller is unrestricted. The value is a comma-separated pool list.
+func requestAllowedPools(ginCtx *gin.Context) string {
+	if ginCtx == nil {
+		return ""
+	}
+	value, exists := ginCtx.Get("accessMetadata")
+	if !exists || value == nil {
+		return ""
+	}
+	metadata, ok := value.(map[string]string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(metadata["pools"])
 }
 
 func requestClientIP(request *http.Request) string {
