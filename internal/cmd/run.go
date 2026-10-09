@@ -30,11 +30,14 @@ func initSecretStore(configPath string) {
 		return
 	}
 	secretstore.Configure(store)
-	if store.Unlocked() {
-		log.Infof("secret store ready at %s (machine-protected, available)", path)
-		return
+	switch {
+	case store.Unlocked():
+		log.Infof("secret store ready at %s (mode %s, unlocked)", path, store.Mode())
+	case !store.Initialized():
+		log.Warnf("secret store at %s is not initialized; set a master passphrase before storing secrets", path)
+	default:
+		log.Warnf("secret store at %s is locked (mode %s); unlock with the master passphrase to use secrets", path, store.Mode())
 	}
-	log.Warnf("secret store at %s could not be decrypted; secrets stay unavailable until its machine key is restored", path)
 }
 
 // StartService builds and runs the proxy service using the exported SDK.

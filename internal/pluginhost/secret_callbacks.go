@@ -110,7 +110,10 @@ func (h *Host) callHostSecretVerify(_ context.Context, request []byte) ([]byte, 
 	return marshalRPCResult(resp)
 }
 
-// callHostSecretSetPassphrase installs or replaces the master passphrase.
+// callHostSecretSetPassphrase installs the master passphrase on a brand-new
+// store or replaces it on an initialized one. On a store that is already
+// initialized the current passphrase is required, so a plugin cannot take over a
+// store it does not control.
 func (h *Host) callHostSecretSetPassphrase(_ context.Context, request []byte) ([]byte, error) {
 	var req pluginapi.HostSecretSetPassphraseRequest
 	if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
@@ -119,6 +122,13 @@ func (h *Host) callHostSecretSetPassphrase(_ context.Context, request []byte) ([
 	resp := pluginapi.HostSecretSetPassphraseResponse{}
 	store := secretstore.Default()
 	if store == nil {
+		return marshalRPCResult(resp)
+	}
+	if !store.Initialized() {
+		if errInit := store.Initialize(req.Next); errInit != nil {
+			return nil, fmt.Errorf("initialize secret store: %w", errInit)
+		}
+		resp.Installed = true
 		return marshalRPCResult(resp)
 	}
 	if errSet := store.SetPassphrase(req.Current, req.Next); errSet != nil {

@@ -46,8 +46,9 @@ func TestHostSecretCallbacksWithoutStore(t *testing.T) {
 	}
 }
 
-func TestHostSecretCallbacksAvailableAndLocked(t *testing.T) {
-	store, errOpen := secretstore.Open(filepath.Join(t.TempDir(), "secrets.enc"))
+func TestHostSecretCallbacksLockedUntilUnlocked(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "secrets.enc")
+	store, errOpen := secretstore.Open(path)
 	if errOpen != nil {
 		t.Fatalf("open store: %v", errOpen)
 	}
@@ -55,8 +56,32 @@ func TestHostSecretCallbacksAvailableAndLocked(t *testing.T) {
 	t.Cleanup(func() { secretstore.Configure(nil) })
 	host := New()
 
-	// A machine-protected store opens ready: a plugin can read and write without
-	// any operator input.
+	// A brand-new store has no unlock policy yet, so it stays locked: a plugin
+	// write is reported as Locked in the envelope rather than silently accepted.
+	newStatus, errNewStatus := decodeRPCEnvelope[pluginapi.HostSecretStatusResponse](callSecret(t, host, pluginabi.MethodHostSecretStatus, pluginapi.HostSecretStatusRequest{}))
+	if errNewStatus != nil {
+		t.Fatalf("decode status: %v", errNewStatus)
+	}
+	if !newStatus.Enabled || newStatus.Unlocked || newStatus.Passphrase {
+		t.Fatalf("status = %+v, want enabled but locked and uninitialized", newStatus)
+	}
+	lockedSet, errLockedSet := decodeRPCEnvelope[pluginapi.HostSecretSetResponse](callSecret(t, host, pluginabi.MethodHostSecretSet, pluginapi.HostSecretSetRequest{Name: "haozhuma", Value: "v"}))
+	if errLockedSet != nil {
+		t.Fatalf("decode set on fresh store: %v", errLockedSet)
+	}
+	if !lockedSet.Locked || lockedSet.Stored {
+		t.Fatalf("set on fresh store = %+v, want locked and not stored", lockedSet)
+	}
+
+	// Install a passphrase: that initializes the store and leaves it unlocked.
+	installed, errInstall := decodeRPCEnvelope[pluginapi.HostSecretSetPassphraseResponse](callSecret(t, host, pluginabi.MethodHostSecretSetPassphrase, pluginapi.HostSecretSetPassphraseRequest{Next: "master"}))
+	if errInstall != nil {
+		t.Fatalf("decode install: %v", errInstall)
+	}
+	if !installed.Installed {
+		t.Fatal("passphrase must initialize the store")
+	}
+
 	stored, errStore := decodeRPCEnvelope[pluginapi.HostSecretSetResponse](callSecret(t, host, pluginabi.MethodHostSecretSet, pluginapi.HostSecretSetRequest{Name: "haozhuma", Value: "user=abc"}))
 	if errStore != nil {
 		t.Fatalf("decode set: %v", errStore)
@@ -77,15 +102,15 @@ func TestHostSecretCallbacksAvailableAndLocked(t *testing.T) {
 	if errStatus != nil {
 		t.Fatalf("decode status: %v", errStatus)
 	}
-	if !status.Enabled || !status.Unlocked || status.Passphrase {
-		t.Fatalf("status = %+v, want enabled, available, no passphrase", status)
+	if !status.Enabled || !status.Unlocked || !status.Passphrase {
+		t.Fatalf("status = %+v, want enabled, unlocked, passphrase-protected", status)
 	}
 	if len(status.Names) != 1 || status.Names[0] != "haozhuma" {
 		t.Fatalf("status names = %v, want [haozhuma]", status.Names)
 	}
 
-	// After a Lock the machine key is gone, so reads and writes report Locked in
-	// the envelope rather than as errors.
+	// After a Lock the key is gone, so reads and writes report Locked in the
+	// envelope rather than as errors.
 	store.Lock()
 	lockedGet, errLockedGet := decodeRPCEnvelope[pluginapi.HostSecretGetResponse](callSecret(t, host, pluginabi.MethodHostSecretGet, pluginapi.HostSecretGetRequest{Name: "haozhuma"}))
 	if errLockedGet != nil {
@@ -94,12 +119,12 @@ func TestHostSecretCallbacksAvailableAndLocked(t *testing.T) {
 	if !lockedGet.Locked || lockedGet.Found {
 		t.Fatalf("locked get = %+v, want locked and not found", lockedGet)
 	}
-	lockedSet, errLockedSet := decodeRPCEnvelope[pluginapi.HostSecretSetResponse](callSecret(t, host, pluginabi.MethodHostSecretSet, pluginapi.HostSecretSetRequest{Name: "haozhuma", Value: "v"}))
-	if errLockedSet != nil {
-		t.Fatalf("decode locked set: %v", errLockedSet)
+	lockedSetAfter, errLockedSetAfter := decodeRPCEnvelope[pluginapi.HostSecretSetResponse](callSecret(t, host, pluginabi.MethodHostSecretSet, pluginapi.HostSecretSetRequest{Name: "haozhuma", Value: "v"}))
+	if errLockedSetAfter != nil {
+		t.Fatalf("decode locked set: %v", errLockedSetAfter)
 	}
-	if !lockedSet.Locked || lockedSet.Stored {
-		t.Fatalf("locked set = %+v, want locked and not stored", lockedSet)
+	if !lockedSetAfter.Locked || lockedSetAfter.Stored {
+		t.Fatalf("locked set = %+v, want locked and not stored", lockedSetAfter)
 	}
 }
 

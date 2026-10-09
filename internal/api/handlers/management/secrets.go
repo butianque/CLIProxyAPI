@@ -10,14 +10,16 @@ import (
 )
 
 // secretStatusPayload describes the secret store to management clients. Secret
-// values are never included; names are disclosed plainly because the store is
-// machine-protected.
+// values are never included; names are only disclosed while the store is
+// unlocked, so a locked passphrase store does not leak the set of stored names.
 type secretStatusPayload struct {
-	Enabled    bool     `json:"enabled"`
-	Path       string   `json:"path,omitempty"`
-	Unlocked   bool     `json:"unlocked"`
-	Passphrase bool     `json:"passphrase"`
-	Names      []string `json:"names"`
+	Enabled     bool     `json:"enabled"`
+	Path        string   `json:"path,omitempty"`
+	Initialized bool     `json:"initialized"`
+	Unlocked    bool     `json:"unlocked"`
+	Passphrase  bool     `json:"passphrase"`
+	Mode        string   `json:"mode,omitempty"`
+	Names       []string `json:"names"`
 }
 
 func secretStatus() secretStatusPayload {
@@ -26,34 +28,101 @@ func secretStatus() secretStatusPayload {
 		return secretStatusPayload{Names: []string{}}
 	}
 	payload := secretStatusPayload{
-		Enabled:    true,
-		Path:       store.Path(),
-		Unlocked:   store.Unlocked(),
-		Passphrase: store.HasPassphrase(),
-		Names:      []string{},
+		Enabled:     true,
+		Path:        store.Path(),
+		Initialized: store.Initialized(),
+		Unlocked:    store.Unlocked(),
+		Passphrase:  store.HasPassphrase(),
+		Mode:        string(store.Mode()),
+		Names:       []string{},
 	}
-	if names, errNames := store.Names(); errNames == nil {
-		payload.Names = names
+	if payload.Unlocked {
+		if names, errNames := store.Names(); errNames == nil {
+			payload.Names = names
+		}
 	}
 	return payload
 }
 
-// GetSecretStatus reports whether the store is enabled, its path, whether it is
-// usable, whether a master passphrase is installed, and which names exist.
+// GetSecretStatus reports whether the store is enabled, its path, its unlock
+// mode and state, whether a master passphrase is installed, and which names
+// exist while unlocked.
 func (h *Handler) GetSecretStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, secretStatus())
 }
 
-// PostSecretUnlock re-reads the machine key file so a store that opened without
-// it can recover. It takes no passphrase: unlocking is a machine operation.
+// PostSecretInitialize sets up a brand-new store with a master passphrase. It
+// exists so the first setup can be done over HTTP; calling it on an initialized
+// store is refused, so an existing policy is never silently replaced.
+func (h *Handler) PostSecretInitialize(c *gin.Context) {
+	store := secretstore.Default()
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "secret store is disabled"})
+		return
+	}
+	var req struct {
+		Passphrase string `json:"passphrase"`
+	}
+	if errBind := c.ShouldBindJSON(&req); errBind != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	if errInit := store.Initialize(req.Passphrase); errInit != nil {
+		c.JSON(errStatus(errInit), gin.H{"error": errInit.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, secretStatus())
+}
+
+// PostSecretUnlock unlocks the store with the master passphrase.
 func (h *Handler) PostSecretUnlock(c *gin.Context) {
 	store := secretstore.Default()
 	if store == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "secret store is disabled"})
 		return
 	}
-	if errUnlock := store.Unlock(); errUnlock != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errUnlock.Error()})
+	var req struct {
+		Passphrase string `json:"passphrase"`
+	}
+	if errBind := c.ShouldBindJSON(&req); errBind != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	if errUnlock := store.Unlock(req.Passphrase); errUnlock != nil {
+		c.JSON(errStatus(errUnlock), gin.H{"error": errUnlock.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, secretStatus())
+}
+
+// PostSecretMachineUnlock opts the store into machine unlock ("remember on this
+// machine"), so a headless deployment does not need the passphrase after each
+// restart. The response carries the resulting status, whose mode field states the
+// weakened protection explicitly.
+func (h *Handler) PostSecretMachineUnlock(c *gin.Context) {
+	store := secretstore.Default()
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "secret store is disabled"})
+		return
+	}
+	if errEnable := store.EnableMachineUnlock(); errEnable != nil {
+		c.JSON(errStatus(errEnable), gin.H{"error": errEnable.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, secretStatus())
+}
+
+// DeleteSecretMachineUnlock removes the machine key file, restoring passphrase-
+// only protection. A store with no passphrase refuses, because dropping its key
+// file would make it unrecoverable.
+func (h *Handler) DeleteSecretMachineUnlock(c *gin.Context) {
+	store := secretstore.Default()
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "secret store is disabled"})
+		return
+	}
+	if errDisable := store.DisableMachineUnlock(); errDisable != nil {
+		c.JSON(errStatus(errDisable), gin.H{"error": errDisable.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, secretStatus())
@@ -178,14 +247,20 @@ func (h *Handler) DeleteSecret(c *gin.Context) {
 	c.JSON(http.StatusOK, secretStatus())
 }
 
-// gateWrite enforces the master passphrase once one is installed. Before that
-// the store has nothing to protect, so the first write is allowed: that is how
-// an operator stores the initial credential and then creates the passphrase.
+// gateWrite refuses a secret write while the store is locked. Unlocking happens
+// once through PostSecretUnlock (with the master passphrase) or on open for a
+// machine-unlockable store; the store then stays unlocked until locked again, so
+// every subsequent write is not required to carry the passphrase.
 func gateWrite(store *secretstore.Store, passphrase string) error {
-	if !store.HasPassphrase() {
-		return nil
+	if !store.Unlocked() {
+		return secretstore.ErrLocked
 	}
-	return store.VerifyPassphrase(passphrase)
+	// A passphrase may still be supplied per request; when it is, it must be the
+	// right one. Omitting it relies on the store already being unlocked.
+	if passphrase != "" {
+		return store.VerifyPassphrase(passphrase)
+	}
+	return nil
 }
 
 // errStatus maps a secret store error to an HTTP status.
@@ -193,9 +268,9 @@ func errStatus(err error) int {
 	switch {
 	case errors.Is(err, secretstore.ErrInvalidPassphrase), errors.Is(err, secretstore.ErrNoPassphrase):
 		return http.StatusUnauthorized
-	case errors.Is(err, secretstore.ErrEmptyPassphrase):
+	case errors.Is(err, secretstore.ErrEmptyPassphrase), errors.Is(err, secretstore.ErrEmptyName):
 		return http.StatusBadRequest
-	case errors.Is(err, secretstore.ErrLocked):
+	case errors.Is(err, secretstore.ErrLocked), errors.Is(err, secretstore.ErrModeConflict):
 		return http.StatusConflict
 	default:
 		return http.StatusInternalServerError
