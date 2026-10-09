@@ -63,10 +63,18 @@ type SDKConfig struct {
 	APIKeys []string `yaml:"api-keys" json:"api-keys"`
 
 	// KeyPools optionally scopes a client API key to one or more credential pools.
-	// Each credential may carry a "pool" attribute; a key listed here only routes to
-	// credentials tagged with one of the listed pools. Keys absent from this map are
-	// unrestricted, preserving the previous behavior.
+	// It maps a client API key to the pools it may route to; a key absent from this
+	// map is unrestricted. Which credentials belong to a pool is declared
+	// explicitly by CredentialPools — this map does not infer membership from a
+	// credential's provider.
 	KeyPools map[string][]string `yaml:"key-pools,omitempty" json:"key-pools,omitempty"`
+
+	// CredentialPools declares pool membership explicitly: a pool name maps to the
+	// credential file names (auth file base names, without the .json suffix) that
+	// belong to it. Selection restricts a scoped key to the union of the
+	// credentials listed here, so "why did this key route here" is answerable from
+	// one table. A pool that names no credential contributes nothing.
+	CredentialPools map[string][]string `yaml:"credential-pools,omitempty" json:"credential-pools,omitempty"`
 
 	// PassthroughHeaders controls whether upstream response headers are forwarded to downstream clients.
 	// Default is false (disabled).

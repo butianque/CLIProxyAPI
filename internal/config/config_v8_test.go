@@ -197,6 +197,59 @@ access:
 	}
 }
 
+func TestV8CredentialPoolsSaveAndPrune(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	raw := `config-version: 8
+access:
+  api-keys:
+    - "sk-scoped"
+  credential-pools:
+    "loomy":
+      - "loomy-main"
+      - "own-7598"
+`
+	if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if members := cfg.CredentialPools["loomy"]; len(members) != 2 || members[0] != "loomy-main" {
+		t.Fatalf("CredentialPools[loomy] = %v, want [loomy-main own-7598]", members)
+	}
+
+	// A pool added at runtime survives a save.
+	cfg.CredentialPools["zcode-bigmodel"] = []string{"zcode-1"}
+	if err = SaveConfigPreserveComments(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if members := reloaded.CredentialPools["zcode-bigmodel"]; len(members) != 1 || members[0] != "zcode-1" {
+		t.Fatalf("after save CredentialPools[zcode-bigmodel] = %v, want [zcode-1]", members)
+	}
+
+	// Removing the table prunes it from the saved file.
+	cfg.CredentialPools = nil
+	if err = SaveConfigPreserveComments(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	saved, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatal(errRead)
+	}
+	var doc yaml.Node
+	if err = yaml.Unmarshal(saved, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if node := yamlPath(doc.Content[0], "access.credential-pools"); node != nil && len(node.Content) > 0 {
+		t.Fatalf("removed credential-pools survived save: %s", saved)
+	}
+}
+
 func TestV8KeyInheritance(t *testing.T) {
 	for _, provider := range []string{"gemini", "interactions", "vertex", "codex", "claude", "xai", "meta"} {
 		t.Run(provider, func(t *testing.T) {

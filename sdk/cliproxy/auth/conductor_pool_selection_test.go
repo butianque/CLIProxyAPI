@@ -9,50 +9,97 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
-func poolAuth(id string, pools ...string) *Auth {
-	attributes := map[string]string{}
-	if len(pools) > 0 {
-		joined := pools[0]
-		for _, pool := range pools[1:] {
-			joined += "," + pool
-		}
-		attributes[cliproxyexecutor.AuthPoolAttribute] = joined
-	}
-	return &Auth{ID: id, Provider: "zcode", Attributes: attributes}
+// poolAuth builds a credential addressed by its backing file name, which is how
+// credential-pools identifies membership. There is no attribute: pool membership
+// is declared in configuration, never inferred from a credential's provider.
+func poolAuth(fileName string) *Auth {
+	return &Auth{ID: fileName, FileName: fileName + ".json", Provider: "zcode"}
 }
 
-func TestAuthMatchesAllowedPools(t *testing.T) {
+func TestCredentialNameUsesAuthFileBase(t *testing.T) {
+	cases := []struct {
+		name string
+		auth *Auth
+		want string
+	}{
+		{"file name wins over id", &Auth{ID: "ignored", FileName: "/creds/loomy-main.json"}, "loomy-main"},
+		{"relative path", &Auth{ID: "ignored", FileName: "/tmp/my credential.json"}, "my credential"},
+		{"falls back to id", &Auth{ID: "only-id"}, "only-id"},
+		{"nil auth", nil, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := credentialName(tc.auth); got != tc.want {
+				t.Fatalf("credentialName() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestAllowsCredentialUsesExplicitPoolTable(t *testing.T) {
+	setCredentialPools(map[string][]string{
+		"loomy":       {"loomy-main", "own-7598"},
+		"zcode-free":  {"zcode-free-1"},
+		"ZCODE-PAID!": {"zcode-paid-1"},
+	})
+	t.Cleanup(func() { setCredentialPools(nil) })
+
 	cases := []struct {
 		name    string
 		auth    *Auth
 		allowed []string
 		want    bool
 	}{
-		{"unrestricted caller allows untagged auth", poolAuth("a"), nil, true},
-		{"unrestricted caller allows tagged auth", poolAuth("a", "loomy"), nil, true},
-		{"restricted caller allows matching pool", poolAuth("a", "loomy"), []string{"loomy"}, true},
-		{"restricted caller allows one of several auth pools", poolAuth("a", "loomy", "zcode-zai"), []string{"zcode-zai"}, true},
-		{"restricted caller rejects other pool", poolAuth("a", "loomy"), []string{"zcode-bigmodel"}, false},
-		{
-			"untagged auth belongs to its provider pool",
-			&Auth{ID: "a", Provider: "loomy"},
-			[]string{"loomy"},
-			true,
-		},
-		{
-			"provider pool does not collide with platform pool",
-			&Auth{ID: "a", Provider: "zcode"},
-			[]string{"zcode-bigmodel"},
-			false,
-		},
+		{"unrestricted caller allows any credential", poolAuth("loomy-main"), nil, true},
+		{"listed credential matches its pool", poolAuth("loomy-main"), []string{"loomy"}, true},
+		{"another member of the same pool matches", poolAuth("own-7598"), []string{"loomy"}, true},
+		{"unlisted credential is rejected", poolAuth("loomy-16723433586"), []string{"loomy"}, false},
+		{"pool name is matched case-insensitively", poolAuth("zcode-paid-1"), []string{"zcode-paid!"}, true},
+		{"wrong pool is rejected", poolAuth("loomy-main"), []string{"zcode-free"}, false},
+		{"membership is not inferred from provider", poolAuth("loomy-unknown"), []string{"zcode"}, false},
+		{"one of several scopes matches", poolAuth("zcode-free-1"), []string{"loomy", "zcode-free"}, true},
 		{"nil auth with restriction is rejected", nil, []string{"loomy"}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := authMatchesAllowedPools(tc.auth, tc.allowed); got != tc.want {
-				t.Fatalf("authMatchesAllowedPools() = %t, want %t", got, tc.want)
+			eligibility := authSelectionEligibility{allowedPools: tc.allowed}
+			if got := eligibility.allows(tc.auth); got != tc.want {
+				t.Fatalf("allows() = %t, want %t", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestAllowsCredentialRejectsEverythingWhenTableIsEmpty(t *testing.T) {
+	// A scoped caller cannot match anything when no pool membership is declared.
+	// This is the safety property: a restricted key must never silently fall back
+	// onto an unrelated credential.
+	setCredentialPools(nil)
+	eligibility := authSelectionEligibility{allowedPools: []string{"loomy"}}
+	if eligibility.allows(poolAuth("loomy-main")) {
+		t.Fatal("a scoped caller was allowed through an empty credential-pools table")
+	}
+}
+
+func TestSetCredentialPoolsPrunesAndNormalizes(t *testing.T) {
+	setCredentialPools(map[string][]string{
+		"  Loomy  ": {" loomy-main ", "", "own-7598"},
+		"empty":     nil,
+		"":          {"orphan"},
+	})
+	t.Cleanup(func() { setCredentialPools(nil) })
+
+	if !credentialContains("loomy", "loomy-main") {
+		t.Fatal("expected normalized pool name and trimmed credential to match")
+	}
+	if !credentialContains("loomy", "own-7598") {
+		t.Fatal("expected second credential to match")
+	}
+	if credentialContains("empty", "anything") {
+		t.Fatal("a pool with no members must not match")
+	}
+	if credentialContains("", "orphan") {
+		t.Fatal("a blank pool name must be dropped")
 	}
 }
 
@@ -87,28 +134,35 @@ func TestAllowedPoolsFromMetadata(t *testing.T) {
 }
 
 func TestAuthSelectionEligibilityAppliesPoolScope(t *testing.T) {
+	setCredentialPools(map[string][]string{"loomy": {"loomy-auth"}})
+	t.Cleanup(func() { setCredentialPools(nil) })
+
 	opts := cliproxyexecutor.Options{
 		Metadata: map[string]any{cliproxyexecutor.AllowedPoolsMetadataKey: "loomy"},
 	}
 	eligibility := authSelectionEligibilityForRequest(context.Background(), opts)
 
-	if !eligibility.allows(poolAuth("loomy-auth", "loomy")) {
-		t.Fatal("expected loomy credential to be eligible for a loomy-scoped caller")
+	if !eligibility.allows(poolAuth("loomy-auth")) {
+		t.Fatal("expected the listed credential to be eligible for a loomy-scoped caller")
 	}
-	if eligibility.allows(poolAuth("zai-auth", "zcode-zai")) {
-		t.Fatal("expected zcode-zai credential to be ineligible for a loomy-scoped caller")
-	}
-	if eligibility.allows(poolAuth("untagged-auth")) {
-		t.Fatal("expected untagged zcode credential to be ineligible for a loomy-scoped caller")
+	if eligibility.allows(poolAuth("zai-auth")) {
+		t.Fatal("expected an unlisted credential to be ineligible for a loomy-scoped caller")
 	}
 }
 
-func TestSelectAuthHonorsPoolScopeEndToEnd(t *testing.T) {
+func TestSelectAuthHonorsCredentialPoolScopeEndToEnd(t *testing.T) {
 	const model = "glm-5.3"
 	reg := registry.GetGlobalRegistry()
 
-	loomyAuth := &Auth{ID: "pool-loomy", Provider: "loomy"}
-	zcodeAuth := &Auth{ID: "pool-zcode", Provider: "zcode", Attributes: map[string]string{"pool": "zcode-bigmodel"}}
+	loomyAuth := poolAuth("pool-loomy")
+	loomyAuth.Provider = "loomy"
+	zcodeAuth := poolAuth("pool-zcode")
+	setCredentialPools(map[string][]string{
+		"loomy":          {"pool-loomy"},
+		"zcode-bigmodel": {"pool-zcode"},
+	})
+	t.Cleanup(func() { setCredentialPools(nil) })
+
 	for _, auth := range []*Auth{loomyAuth, zcodeAuth} {
 		reg.RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
 		authID := auth.ID
@@ -134,8 +188,8 @@ func TestSelectAuthHonorsPoolScopeEndToEnd(t *testing.T) {
 		t.Fatalf("SelectAuth(loomy scope) selected %q, want pool-loomy", selected.ID)
 	}
 
-	// A zcode-bigmodel-scoped caller cannot reach the zcode credential through the
-	// loomy provider, and vice versa: the provider name is not a pool alias.
+	// A zcode-bigmodel-scoped caller cannot reach the loomy credential: the pool
+	// table lists only pool-zcode, so there is nothing to select.
 	if _, errWrong := manager.SelectAuth(context.Background(), "loomy", model, cliproxyexecutor.Options{
 		Metadata: map[string]any{cliproxyexecutor.AllowedPoolsMetadataKey: "zcode-bigmodel"},
 	}); errWrong == nil {

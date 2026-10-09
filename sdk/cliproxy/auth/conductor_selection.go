@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net/http"
+	"path/filepath"
 	"reflect"
-	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -121,10 +121,48 @@ func (e authSelectionEligibility) allows(auth *Auth) bool {
 	if e.credentialPolicy != "" && !credentialPolicyAllows(e.credentialPolicy, auth) {
 		return false
 	}
-	if !authMatchesAllowedPools(auth, e.allowedPools) {
+	if !e.allowsCredential(auth) {
 		return false
 	}
 	return !e.disallowFreeAuth || !isFreeCodexAuth(auth)
+}
+
+// allowsCredential reports whether an auth may serve a caller scoped to a set of
+// credential pools. An empty scope imposes no restriction. A scoped caller may
+// only use credentials the pools explicitly list, so a restricted key never
+// silently falls back onto an unrelated credential.
+//
+// Membership comes from the config's credential-pools table. It is deliberately
+// not inferred from a credential's provider: that inference made "why did this
+// key route here" unanswerable, because the same credential could belong to a
+// pool purely by virtue of its provider name.
+func (e authSelectionEligibility) allowsCredential(auth *Auth) bool {
+	if len(e.allowedPools) == 0 {
+		return true
+	}
+	name := credentialName(auth)
+	if name == "" {
+		return false
+	}
+	for _, pool := range e.allowedPools {
+		if credentialContains(pool, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// credentialName is the identifier a credential is addressed by in
+// credential-pools: the backing auth file's base name without the .json suffix.
+func credentialName(auth *Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.FileName != "" {
+		base := filepath.Base(auth.FileName)
+		return strings.TrimSuffix(base, filepath.Ext(base))
+	}
+	return strings.TrimSpace(auth.ID)
 }
 
 // allowedPoolsFromMetadata reads the caller's pool scope from execution metadata.
@@ -155,40 +193,6 @@ func splitPoolList(raw string) []string {
 		return nil
 	}
 	return pools
-}
-
-// authMatchesAllowedPools reports whether an auth may serve a caller scoped to
-// the given pools. An empty allowed set imposes no restriction. A restricted
-// caller may only use credentials that expose the requested pool, so restricted
-// keys never silently fall back onto an unclassified credential.
-func authMatchesAllowedPools(auth *Auth, allowed []string) bool {
-	if len(allowed) == 0 {
-		return true
-	}
-	pools := authPools(auth)
-	for _, pool := range pools {
-		if slices.Contains(allowed, pool) {
-			return true
-		}
-	}
-	return false
-}
-
-// authPools lists the pool names a credential belongs to. An explicit "pool"
-// attribute (comma-separated for multiple pools) wins; a credential without one
-// belongs to the pool named after its provider, so a provider-scoped key keeps
-// working without every plugin having to tag its credentials.
-func authPools(auth *Auth) []string {
-	if auth == nil {
-		return nil
-	}
-	if pools := splitPoolList(auth.Attributes[cliproxyexecutor.AuthPoolAttribute]); len(pools) > 0 {
-		return pools
-	}
-	if provider := strings.ToLower(strings.TrimSpace(auth.Provider)); provider != "" {
-		return []string{provider}
-	}
-	return nil
 }
 
 func (m *Manager) syncSchedulerFromSnapshot(auths []*Auth) {

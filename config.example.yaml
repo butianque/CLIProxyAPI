@@ -100,14 +100,24 @@ access:
     - "your-api-key-2"
     - "your-api-key-3"
 
-  # Optional per-key credential pools. Each credential may carry a "pool"
-  # attribute (plugins tag their own credentials); a key listed here only routes
-  # to credentials tagged with one of the listed pools. Keys omitted from this
-  # map are unrestricted, so leaving it out preserves the default behavior.
+  # Optional per-key credential pools. A key listed here only routes to
+  # credentials that belong to one of the listed pools; keys omitted from this map
+  # are unrestricted, so leaving it out preserves the default behavior.
   # key-pools:
   #   "your-api-key-1":
   #     - "loomy"
   #     - "zcode-bigmodel"
+
+  # Declares credential-pool membership explicitly: a pool name maps to the auth
+  # file base names (without the .json suffix) that belong to it. This is the only
+  # source of membership — it is never inferred from a credential's provider, so
+  # "why did this key route here" is answerable from one table.
+  # credential-pools:
+  #   "loomy":
+  #     - "loomy-main"
+  #     - "own-7598"
+  #   "zcode-bigmodel":
+  #     - "zcode-25851791396987104"
 
 # Optional credential concurrency and observation contracts.
 

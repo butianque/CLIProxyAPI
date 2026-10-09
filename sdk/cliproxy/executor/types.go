@@ -18,13 +18,19 @@ const RequestPathMetadataKey = "request_path"
 // DisallowFreeAuthMetadataKey instructs auth selection to skip known free-tier credentials.
 const DisallowFreeAuthMetadataKey = "disallow_free_auth"
 
-// AllowedPoolsMetadataKey restricts auth selection to credentials tagged with one
-// of the listed pools. An empty or absent value leaves selection unrestricted.
-// The value is a comma-separated pool list (see cfg.KeyPools) so it survives the
-// string-typed access metadata channel.
+// AllowedPoolsMetadataKey restricts auth selection to credentials named by one of
+// the listed credential pools. An empty or absent value leaves selection
+// unrestricted. The value is a comma-separated pool list (see cfg.KeyPools) so it
+// survives the string-typed access metadata channel; the pool-to-credential
+// mapping itself comes from cfg.CredentialPools.
 const AllowedPoolsMetadataKey = "allowed_pools"
 
-// AuthPoolAttribute is the credential attribute name carrying a credential's pool tag.
+// AuthPoolAttribute is retained for compatibility with plugins built against an
+// earlier ABI. Pool membership is no longer read from a credential attribute:
+// it is declared explicitly in configuration (cfg.CredentialPools), so a
+// credential is never classified by its provider name.
+//
+// Deprecated: use cfg.CredentialPools; this constant is scheduled for removal.
 const AuthPoolAttribute = "pool"
 
 // AuthSelectionModelMetadataKey overrides the model used only for auth selection.
