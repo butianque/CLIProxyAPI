@@ -61,7 +61,8 @@ func initSupply(cfg *config.Config, configPath string) {
 // installSupply (re)builds and installs the process-wide supply service.
 func installSupply(cfg *config.Config, configPath string) {
 	registry := supply.NewRegistry()
-	if provider, errPhone := buildPhoneProvider(cfg, configPath); errPhone != nil {
+	registry.SetLedger(loadSupplyLedger(cfg, configPath))
+	if provider, errPhone := buildPhoneProvider(cfg, configPath, registry.Ledger()); errPhone != nil {
 		log.Warnf("phone supply kind disabled: %v", errPhone)
 	} else if provider != nil {
 		if errRegister := registry.Register(provider); errRegister != nil {
@@ -72,13 +73,39 @@ func installSupply(cfg *config.Config, configPath string) {
 	log.Infof("account supply ready at %s", supplyStateSummary(registry))
 }
 
+// supplyStateDir resolves where the supply service keeps its on-disk state.
+func supplyStateDir(cfg *config.Config, configPath string) string {
+	if cfg != nil {
+		if dir := strings.TrimSpace(cfg.Supply.WithDefaults().StorageDir); dir != "" {
+			return dir
+		}
+	}
+	return filepath.Join(filepath.Dir(configPath), "supply")
+}
+
+// loadSupplyLedger reads the cross-kind identity ledger.
+//
+// It is loaded here, once, and injected into the registry and every provider:
+// the ledger is one document shared by all kinds, so a provider that loaded its
+// own copy would drift from the others. A decode failure is reported but not
+// fatal — a corrupt ledger must not stop the server from starting, and the next
+// write rewrites it.
+func loadSupplyLedger(cfg *config.Config, configPath string) *supply.Ledger {
+	ledger, errLoad := supply.LoadLedger(supply.LedgerPath(supplyStateDir(cfg, configPath)))
+	if errLoad != nil {
+		log.Warnf("supply ledger unreadable, starting empty: %v", errLoad)
+		return supply.NewLedger()
+	}
+	return ledger
+}
+
 // buildPhoneProvider assembles the phone provider from configuration and the
 // host secret store.
 //
 // It returns (nil, nil) when the kind is disabled or no platform credential is
 // stored, which is the not-configured state. A locked store is treated the same
 // way: the credential cannot be read, so the kind is not offered until unlock.
-func buildPhoneProvider(cfg *config.Config, configPath string) (*phone.ProviderImpl, error) {
+func buildPhoneProvider(cfg *config.Config, configPath string, ledger *supply.Ledger) (*phone.ProviderImpl, error) {
 	if cfg == nil {
 		return nil, nil
 	}
@@ -121,6 +148,7 @@ func buildPhoneProvider(cfg *config.Config, configPath string) (*phone.ProviderI
 		Provider: supplyCfg.Phone.Provider,
 		Secret:   secret,
 		Store:    phone.Store{Dir: stateDir},
+		Ledger:   ledger,
 		Budget: phone.Budget{
 			MaxPerNumberCNY: supplyCfg.Phone.MaxPerNumberCNY,
 			MaxTotalCNY:     supplyCfg.Phone.MaxTotalCNY,

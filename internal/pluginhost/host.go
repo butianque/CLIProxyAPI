@@ -86,6 +86,8 @@ type Host struct {
 	commandLineHits        map[string]struct{}
 	managementRoutes       map[string]managementRouteRecord
 	resourceRoutes         map[string]resourceRouteRecord
+	managementActions      map[string]managementActionRecord
+	jobs                   *jobManager
 	streams                *streamBridge
 	httpStreams            *hostHTTPStreamBridge
 	httpOperations         *hostHTTPOperationBridge
@@ -117,6 +119,8 @@ func New() *Host {
 		commandLineHits:        make(map[string]struct{}),
 		managementRoutes:       make(map[string]managementRouteRecord),
 		resourceRoutes:         make(map[string]resourceRouteRecord),
+		managementActions:      make(map[string]managementActionRecord),
+		jobs:                   newJobManager(),
 		streams:                newStreamBridge(),
 		httpStreams:            newHostHTTPStreamBridge(),
 		httpOperations:         newHostHTTPOperationBridge(),
@@ -908,6 +912,11 @@ func (h *Host) removePluginRuntimeStateLocked(id string) {
 	for key, record := range h.resourceRoutes {
 		if record.pluginID == id {
 			delete(h.resourceRoutes, key)
+		}
+	}
+	for key, record := range h.managementActions {
+		if record.pluginID == id {
+			delete(h.managementActions, key)
 		}
 	}
 	for name, record := range h.commandLineFlags {

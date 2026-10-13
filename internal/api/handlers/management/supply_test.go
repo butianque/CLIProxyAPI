@@ -27,8 +27,10 @@ func (s stubKindProvider) Read(context.Context, string, string) (supply.Message,
 	return supply.Message{}, nil
 }
 
-func (s stubKindProvider) Link(context.Context, string, string, string) error { return nil }
-func (s stubKindProvider) Release(context.Context, string, string) error      { return nil }
+func (s stubKindProvider) Link(context.Context, string, string, string, string) error {
+	return nil
+}
+func (s stubKindProvider) Release(context.Context, string, string) error { return nil }
 
 // TestSupplyStatusReportsConfiguredKinds checks the management payload reflects
 // the registered kinds and reports nothing configured when the service is

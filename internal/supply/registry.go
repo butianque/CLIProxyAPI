@@ -30,9 +30,9 @@ type Provider interface {
 	Grab(ctx context.Context, opts GrabOptions) (Identity, error)
 	// Read reads one identity's inbox once.
 	Read(ctx context.Context, purpose, address string) (Message, error)
-	// Link associates an identity with the account it registered. Providers
-	// without a ledger may treat it as a no-op.
-	Link(ctx context.Context, address, account, authIndex string) error
+	// Link associates an identity with the platform and the account it
+	// registered. Providers without a ledger may treat it as a no-op.
+	Link(ctx context.Context, address, target, account, authIndex string) error
 	// Release returns an identity to its source when the kind has a pool.
 	Release(ctx context.Context, address, outcome string) error
 }
@@ -54,11 +54,37 @@ type KindLookup interface {
 type Registry struct {
 	mu        sync.RWMutex
 	providers map[Kind]Provider
+	ledger    *Ledger
+}
+
+// LedgerProvider exposes a supply service's cross-kind identity ledger.
+type LedgerProvider interface {
+	// Ledger returns the identity ledger, or nil when none is kept.
+	Ledger() *Ledger
 }
 
 // NewRegistry returns an empty registry.
 func NewRegistry() *Registry {
 	return &Registry{providers: map[Kind]Provider{}}
+}
+
+// SetLedger installs the identity ledger shared by every kind.
+//
+// The ledger is owned here, not by a provider, because it is cross-kind: one
+// in-memory document backing one file is what lets a phone number and an email
+// address be read as a single list. A per-provider ledger would give each kind
+// its own copy of the same file and let them drift apart.
+func (r *Registry) SetLedger(ledger *Ledger) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.ledger = ledger
+}
+
+// Ledger returns the shared identity ledger, or nil when none is installed.
+func (r *Registry) Ledger() *Ledger {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.ledger
 }
 
 // Register installs the provider for its kind, replacing any previous one.
@@ -139,13 +165,13 @@ func (r *Registry) Read(ctx context.Context, kind Kind, purpose, address string)
 	return provider.Read(ctx, purpose, address)
 }
 
-// Link associates an identity with the account it registered.
-func (r *Registry) Link(ctx context.Context, kind Kind, address, account, authIndex string) error {
+// Link associates an identity with the platform and the account it registered.
+func (r *Registry) Link(ctx context.Context, kind Kind, address, target, account, authIndex string) error {
 	provider, errProvider := r.providerFor(kind)
 	if errProvider != nil {
 		return errProvider
 	}
-	return provider.Link(ctx, address, account, authIndex)
+	return provider.Link(ctx, address, target, account, authIndex)
 }
 
 // Release returns an identity to its source. A kind whose provider has no pool
@@ -163,3 +189,6 @@ var _ Supply = (*Registry)(nil)
 
 // Registry implements KindLookup.
 var _ KindLookup = (*Registry)(nil)
+
+// Registry implements LedgerProvider.
+var _ LedgerProvider = (*Registry)(nil)

@@ -31,7 +31,7 @@ func (s *stubProvider) Read(context.Context, string, string) (Message, error) {
 	return s.read, nil
 }
 
-func (s *stubProvider) Link(context.Context, string, string, string) error { return nil }
+func (s *stubProvider) Link(context.Context, string, string, string, string) error { return nil }
 
 func (s *stubProvider) Release(context.Context, string, string) error { return nil }
 
@@ -46,8 +46,8 @@ func (plainSupply) Grab(context.Context, Kind, GrabOptions) (Identity, error) {
 func (plainSupply) Read(context.Context, Kind, string, string) (Message, error) {
 	return Message{}, nil
 }
-func (plainSupply) Link(context.Context, Kind, string, string, string) error { return nil }
-func (plainSupply) Release(context.Context, Kind, string, string) error      { return nil }
+func (plainSupply) Link(context.Context, Kind, string, string, string, string) error { return nil }
+func (plainSupply) Release(context.Context, Kind, string, string) error              { return nil }
 
 // TestRegistryRoutesByKind checks that a call reaches the provider registered
 // for its kind and that an unconfigured kind is reported as unavailable.

@@ -51,6 +51,10 @@ type Config struct {
 	// ones on every grab, so a blind rental can only land on an affordable
 	// channel. It is the host's equivalent of the plugin's sms_guardrail.
 	Guardrail bool
+	// Ledger is the cross-kind identity ledger, owned by the supply registry
+	// and shared with every other kind. It is injected rather than loaded here
+	// so one in-memory document backs the one file.
+	Ledger *supply.Ledger
 }
 
 // ProviderImpl is the base-side supply provider for the phone kind. It adapts
@@ -82,6 +86,9 @@ func New(cfg Config) (*ProviderImpl, error) {
 	}
 	service := NewService(platform, cfg.Store, cfg.Budget)
 	service.Strategy = cfg.Strategy
+	if cfg.Ledger != nil {
+		service.shared = cfg.Ledger
+	}
 	if cfg.CoolDownSeconds > 0 {
 		service.CoolDownSeconds = cfg.CoolDownSeconds
 	}
@@ -131,7 +138,7 @@ func (p *ProviderImpl) Grab(ctx context.Context, opts supply.GrabOptions) (suppl
 		project.SID = strings.TrimSpace(opts.Purpose)
 	}
 	address := strings.TrimSpace(opts.Address)
-	if address != "" && !p.service.Ledger().Knows(address) {
+	if address != "" && !p.service.Ledger().Knows(supply.KindPhone, address) {
 		return supply.Identity{}, supply.ErrUnknownIdentity
 	}
 
@@ -227,11 +234,11 @@ func (p *ProviderImpl) recordDelivery(address string) {
 	if address == "" {
 		return
 	}
-	// Look the channel up first: if the ledger has no entry yet there is
+	// Look the channel up first: if the ledger has no record yet there is
 	// nothing to credit, and the flag must stay unset so a later poll can try
 	// again.
-	entry, ok := p.service.Ledger().Get(address)
-	if !ok || strings.TrimSpace(entry.Code) == "" {
+	record, ok := p.service.Ledger().Get(supply.KindPhone, address)
+	if !ok || strings.TrimSpace(record.MetaString("channel")) == "" {
 		return
 	}
 	p.deliveredMu.Lock()
@@ -241,13 +248,13 @@ func (p *ProviderImpl) recordDelivery(address string) {
 	}
 	p.delivered[address] = true
 	p.deliveredMu.Unlock()
-	p.service.RecordDelivery(entry.Code, entry.Price)
+	p.service.RecordDelivery(record.MetaString("channel"), record.Price)
 }
 
-// Link records which account a number registered, so a later re-authentication
-// can get back onto the exact same number.
-func (p *ProviderImpl) Link(_ context.Context, address, account, authIndex string) error {
-	return p.service.LinkAccount(strings.TrimSpace(address), strings.TrimSpace(account), strings.TrimSpace(authIndex))
+// Link records which account a number registered, and on which platform, so a
+// later re-authentication can get back onto the exact same number.
+func (p *ProviderImpl) Link(_ context.Context, address, target, account, authIndex string) error {
+	return p.service.LinkAccount(strings.TrimSpace(address), strings.TrimSpace(target), strings.TrimSpace(account), strings.TrimSpace(authIndex))
 }
 
 // Release returns a number to the platform's pool.
@@ -270,9 +277,9 @@ func (p *ProviderImpl) Release(ctx context.Context, address, outcome string) err
 	// at rental time.
 	var price float64
 	var channel string
-	if entry, ok := p.service.Ledger().Get(address); ok {
-		price = entry.Price
-		channel = strings.TrimSpace(entry.Code)
+	if record, ok := p.service.Ledger().Get(supply.KindPhone, address); ok {
+		price = record.Price
+		channel = strings.TrimSpace(record.MetaString("channel"))
 	}
 	errRelease := p.service.ReleaseUnused(ctxRelease, project, address, price, channelOutcome)
 	if errRelease != nil {

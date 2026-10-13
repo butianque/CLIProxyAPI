@@ -201,6 +201,12 @@ func (l *Ledger) Record(kind Kind, address, source string, price float64, meta m
 // registered on. It is the step that makes a record traceable: before it, the
 // ledger knows an identity was handed out; after it, the ledger knows which
 // account and which platform it belongs to.
+//
+// It records the outcome and state of a successful registration, overwriting
+// whatever a previous attempt left. Registration is the most recent fact and a
+// definitive success, so a record that was marked timed-out or released by an
+// earlier attempt must not keep saying so once an account is bound to it: the
+// identity is held by that account now.
 func (l *Ledger) Link(kind Kind, address, target, account, authIndex string, now int64) {
 	i := l.find(kind, address)
 	if i < 0 {
@@ -216,9 +222,8 @@ func (l *Ledger) Link(kind Kind, address, target, account, authIndex string, now
 	if authIndex = strings.TrimSpace(authIndex); authIndex != "" {
 		record.AuthIndex = authIndex
 	}
-	if record.Outcome == "" {
-		record.Outcome = "registered"
-	}
+	record.Outcome = "registered"
+	record.State = "held"
 	record.LastUsed = now
 }
 

@@ -37,6 +37,21 @@ const (
 	OutcomeReleased
 )
 
+// String names the outcome. It is used where the outcome is recorded outside the
+// health store, such as the ledger, so the value stays readable there.
+func (o ChannelOutcome) String() string {
+	switch o {
+	case OutcomeDelivered:
+		return "delivered"
+	case OutcomeTimeout:
+		return "timeout"
+	case OutcomeReleased:
+		return "released"
+	default:
+		return "unknown"
+	}
+}
+
 // ChannelStat is the running record for one channel.
 type ChannelStat struct {
 	// UID is the channel (对接码), the key this record is stored under.

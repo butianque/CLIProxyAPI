@@ -24,6 +24,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/supply"
 )
 
 // Project identifies the upstream service a number is rented for.
@@ -352,31 +354,14 @@ func (c *ChannelCache) Save(path string) error {
 	return saveJSON(path, c)
 }
 
-// LoadLedger reads the phone ledger; a missing file yields an empty one.
-func LoadLedger(path string) (*Ledger, error) {
-	ledger := NewLedger()
-	if errLoad := loadJSON(path, ledger); errLoad != nil {
-		return NewLedger(), errLoad
-	}
-	if ledger.Version == 0 {
-		ledger.Version = ledgerVersion
-	}
-	return ledger, nil
-}
-
-// Save writes the phone ledger.
-func (l *Ledger) Save(path string) error {
-	if l.Version == 0 {
-		l.Version = ledgerVersion
-	}
-	return saveJSON(path, l)
-}
-
 // -- location ----------------------------------------------------------------
 
-// Store owns the on-disk state: the channel cache and the phone ledger.
+// Store owns the phone kind's on-disk state: the channel cache. The identity
+// ledger is deliberately not here — it is cross-kind and owned by
+// internal/supply, so a phone number and an email address land in the same file
+// and the management surface can read them as one list.
 //
-// Both files live beside the auth directory rather than inside it: the host
+// The cache lives beside the auth directory rather than inside it: the host
 // watches that directory for credential files and treats every new *.json in it
 // as one, so plugin state written there is misparsed.
 type Store struct {
@@ -401,35 +386,24 @@ func NewStore(authPath, override string) Store {
 // ChannelsPath is where the channel cache lives.
 func (s Store) ChannelsPath() string { return filepath.Join(s.Dir, "loomy-sms-channels.json") }
 
-// LedgerPath is where the phone ledger lives.
-func (s Store) LedgerPath() string { return filepath.Join(s.Dir, "loomy-phone-ledger.json") }
+// LedgerPath is where the cross-kind identity ledger lives.
+func (s Store) LedgerPath() string { return supply.LedgerPath(s.Dir) }
 
-// Load reads both documents, falling back to empty ones on a decode error.
-func (s Store) Load() (*ChannelCache, *Ledger) {
+// Load reads the channel cache, falling back to an empty one on a decode error.
+func (s Store) Load() *ChannelCache {
 	cache, errCache := LoadChannelCache(s.ChannelsPath())
 	if errCache != nil {
 		cache = NewChannelCache()
 	}
-	ledger, errLedger := LoadLedger(s.LedgerPath())
-	if errLedger != nil {
-		ledger = NewLedger()
-	}
-	return cache, ledger
+	return cache
 }
 
-// Save writes both documents and returns the first failure.
-func (s Store) Save(cache *ChannelCache, ledger *Ledger) error {
-	if cache != nil {
-		if errCache := cache.Save(s.ChannelsPath()); errCache != nil {
-			return errCache
-		}
+// Save writes the channel cache.
+func (s Store) Save(cache *ChannelCache) error {
+	if cache == nil {
+		return nil
 	}
-	if ledger != nil {
-		if errLedger := ledger.Save(s.LedgerPath()); errLedger != nil {
-			return errLedger
-		}
-	}
-	return nil
+	return cache.Save(s.ChannelsPath())
 }
 
 // SaveHealth writes the channel health store.
@@ -500,10 +474,14 @@ type Service struct {
 
 	mu       sync.Mutex
 	cache    *ChannelCache
-	ledger   *Ledger
+	ledger   *supply.Ledger
 	health   *ChannelHealth
 	cooldown *CoolDown
 	loaded   bool
+	// shared is the cross-kind ledger owned by the supply registry. When set,
+	// stateAll uses it instead of loading its own copy, so every kind reads and
+	// writes one document.
+	shared *supply.Ledger
 }
 
 // NewService builds a service over one provider.
@@ -517,17 +495,26 @@ func NewService(provider Provider, store Store, budget Budget) *Service {
 }
 
 // state lazily loads the on-disk documents once.
-func (s *Service) state() (*ChannelCache, *Ledger) {
+func (s *Service) state() (*ChannelCache, *supply.Ledger) {
 	cache, ledger, _ := s.stateAll()
 	return cache, ledger
 }
 
 // stateAll lazily loads every on-disk document once, health included.
-func (s *Service) stateAll() (*ChannelCache, *Ledger, *ChannelHealth) {
+func (s *Service) stateAll() (*ChannelCache, *supply.Ledger, *ChannelHealth) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.loaded {
-		s.cache, s.ledger = s.Store.Load()
+		s.cache = s.Store.Load()
+		if s.shared != nil {
+			s.ledger = s.shared
+		} else {
+			ledger, errLedger := supply.LoadLedger(s.Store.LedgerPath())
+			if errLedger != nil {
+				ledger = supply.NewLedger()
+			}
+			s.ledger = ledger
+		}
 		health, errHealth := LoadChannelHealth(s.Store.HealthPath())
 		if errHealth != nil {
 			health = NewChannelHealth()
@@ -553,18 +540,65 @@ func (s *Service) Channels() *ChannelCache {
 	return cache
 }
 
-// Ledger returns the phone ledger.
-func (s *Service) Ledger() *Ledger {
+// Ledger returns the cross-kind identity ledger.
+func (s *Service) Ledger() *supply.Ledger {
 	_, ledger := s.state()
 	return ledger
 }
 
+// -- phone ledger views ------------------------------------------------------
+//
+// The ledger itself is cross-kind (internal/supply). These helpers read and
+// write the phone kind's records, keeping the phone-specific details (channel,
+// carrier, region) in the record's Meta bag so the shared shape never grows a
+// field for one kind.
+
+// ledgerRecordMeta builds the Meta bag for one phone record.
+func ledgerRecordMeta(number Number) map[string]any {
+	meta := map[string]any{}
+	if number.Code != "" {
+		meta["channel"] = number.Code
+	}
+	if number.SID != "" {
+		meta["sid"] = number.SID
+	}
+	if number.Carrier != "" {
+		meta["carrier"] = number.Carrier
+	}
+	if number.Region != "" {
+		meta["region"] = number.Region
+	}
+	if len(meta) == 0 {
+		return nil
+	}
+	return meta
+}
+
+// ledgerPhone returns one number's ledger record.
+func ledgerPhone(ledger *supply.Ledger, phone string) (supply.Record, bool) {
+	return ledger.Get(supply.KindPhone, phone)
+}
+
+// ledgerChannel returns the channel a number was rented from, as recorded.
+func ledgerChannel(ledger *supply.Ledger, phone string) string {
+	record, ok := ledgerPhone(ledger, phone)
+	if !ok {
+		return ""
+	}
+	return record.MetaString("channel")
+}
+
+// ledgerMarkBlacklisted records a number we asked the platform to stop returning.
+func ledgerMarkBlacklisted(ledger *supply.Ledger, phone string, now int64) {
+	ledger.Mark(supply.KindPhone, phone, "blacklisted", "blacklisted", now)
+}
+
 // ReplaceChannels installs a freshly read channel list and persists it.
 func (s *Service) ReplaceChannels(sid string, channels []Quote, now int64) error {
-	cache, ledger := s.state()
+	cache, _ := s.state()
 	s.mu.Lock()
 	cache.Replace(sid, channels, now)
-	errSave := s.Store.Save(cache, ledger)
+	errSave := s.Store.Save(cache)
 	s.mu.Unlock()
 	return errSave
 }
@@ -643,7 +677,7 @@ func projectKeyword(cache *ChannelCache) string {
 // A cold cache still tries one auto-join first, but only because joining is free
 // and narrows the platform's choice to channels at or below the ceiling; a
 // missing web session is not an error.
-func (s *Service) Acquire(ctx context.Context, project Project) (Number, LedgerEntry, error) {
+func (s *Service) Acquire(ctx context.Context, project Project) (Number, supply.Record, error) {
 	cache, ledger, health := s.stateAll()
 
 	s.mu.Lock()
@@ -680,7 +714,7 @@ func (s *Service) Acquire(ctx context.Context, project Project) (Number, LedgerE
 	var lastErr error
 	for _, quote := range candidates {
 		if errBudget := s.Budget.Allows(quote.Price, spent); errBudget != nil {
-			return Number{}, LedgerEntry{}, errBudget
+			return Number{}, supply.Record{}, errBudget
 		}
 		// An unpinned rental has no list price, so the platform's own charge is
 		// unknown until it happens. Read the balance first and price the rental
@@ -717,7 +751,7 @@ func (s *Service) Acquire(ctx context.Context, project Project) (Number, LedgerE
 		}
 		lastErr = errRent
 		if IsFatal(errRent) {
-			return Number{}, LedgerEntry{}, errRent
+			return Number{}, supply.Record{}, errRent
 		}
 		// The channel refused: remember it so the next call does not retry it.
 		s.mu.Lock()
@@ -727,7 +761,7 @@ func (s *Service) Acquire(ctx context.Context, project Project) (Number, LedgerE
 	if lastErr == nil {
 		lastErr = ErrNoStock
 	}
-	return Number{}, LedgerEntry{}, lastErr
+	return Number{}, supply.Record{}, lastErr
 }
 
 // recordAttempt marks that a number was rented from a channel, so the later
@@ -770,7 +804,7 @@ func (s *Service) EnsureChannels(ctx context.Context, sid, keyword string) (int,
 		return 0, fmt.Errorf("sms: provider %s cannot join channels", s.Provider.ID())
 	}
 
-	cache, ledger := s.state()
+	cache, _ := s.state()
 	hash := strings.TrimSpace(cache.ProjectHash)
 	if strings.TrimSpace(keyword) == "" {
 		keyword = projectKeyword(cache)
@@ -844,7 +878,7 @@ func (s *Service) EnsureChannels(ctx context.Context, sid, keyword string) (int,
 	s.mu.Lock()
 	cache.Replace(sid, kept, nowUnix())
 	cache.SetProjectHash(hash)
-	errSave := s.Store.Save(cache, ledger)
+	errSave := s.Store.Save(cache)
 	s.mu.Unlock()
 	return len(kept), errSave
 }
@@ -898,9 +932,12 @@ func (s *Service) LedgerChannels() map[string]bool {
 	if ledger == nil {
 		return out
 	}
-	for _, entry := range ledger.All() {
-		if entry.Code != "" {
-			out[entry.Code] = true
+	for _, record := range ledger.All() {
+		if record.Kind != supply.KindPhone {
+			continue
+		}
+		if channel := record.MetaString("channel"); channel != "" {
+			out[channel] = true
 		}
 	}
 	return out
@@ -1000,7 +1037,7 @@ func (s *Service) GuardChannels(ctx context.Context, sid string) (int, error) {
 	// Load the on-disk documents up front: a guardrail pass can be the first
 	// call on a fresh service (the panel route builds one and calls this
 	// directly), and the cache must not be nil when it is rewritten below.
-	_, ledger, health := s.stateAll()
+	_, _, health := s.stateAll()
 	joined, errList := s.joinedQuotesFor(ctx, sid)
 	if errList != nil {
 		return 0, errList
@@ -1114,7 +1151,7 @@ func (s *Service) GuardChannels(ctx context.Context, sid string) (int, error) {
 	}
 	s.mu.Lock()
 	s.cache.Replace(sid, updated, nowUnix())
-	errSave := s.Store.Save(s.cache, ledger)
+	errSave := s.Store.Save(s.cache)
 	if errHealth := s.Store.SaveHealth(health); errHealth != nil && errSave == nil {
 		errSave = errHealth
 	}
@@ -1141,40 +1178,40 @@ func (s *Service) joinedUIDs(ctx context.Context) (map[string]bool, error) {
 
 // Reacquire re-occupies one exact number, which is how a re-authentication gets
 // back onto the number an account registered with.
-func (s *Service) Reacquire(ctx context.Context, project Project, phone string) (Number, LedgerEntry, error) {
+func (s *Service) Reacquire(ctx context.Context, project Project, phone string) (Number, supply.Record, error) {
 	_, ledger := s.state()
 
 	price := 0.0
-	if entry, ok := ledger.Get(phone); ok && entry.Price > 0 {
-		price = entry.Price
+	if record, ok := ledgerPhone(ledger, phone); ok && record.Price > 0 {
+		price = record.Price
 	}
 	if errBudget := s.Budget.Allows(price, ledger.Spent()); errBudget != nil {
-		return Number{}, LedgerEntry{}, errBudget
+		return Number{}, supply.Record{}, errBudget
 	}
 	number, errRent := s.Provider.AcquirePhone(ctx, project, phone)
 	if errRent != nil {
-		return Number{}, LedgerEntry{}, errRent
+		return Number{}, supply.Record{}, errRent
 	}
 	return s.commitRental(number, price, project)
 }
 
 // commitRental folds one successful rental into the ledger and persists it.
-func (s *Service) commitRental(number Number, price float64, project Project) (Number, LedgerEntry, error) {
+func (s *Service) commitRental(number Number, price float64, project Project) (Number, supply.Record, error) {
 	if number.SID == "" {
 		number.SID = project.SID
 	}
 	now := time.Now().Unix()
 	_, ledger := s.state()
 	s.mu.Lock()
-	entry := ledger.Record(number, price, s.Provider.ID(), now)
-	errSave := s.Store.Save(s.cache, ledger)
+	record := ledger.Record(supply.KindPhone, number.Phone, s.Provider.ID(), price, ledgerRecordMeta(number), now)
+	errSave := ledger.Save(s.Store.LedgerPath())
 	s.mu.Unlock()
 	if errSave != nil {
 		// The number is already rented; a failed write must not lose it for the
-		// caller, so the error is reported alongside the entry.
-		return number, entry, fmt.Errorf("sms: rented %s but ledger write failed: %w", number.Phone, errSave)
+		// caller, so the error is reported alongside the record.
+		return number, record, fmt.Errorf("sms: rented %s but ledger write failed: %w", number.Phone, errSave)
 	}
-	return number, entry, nil
+	return number, record, nil
 }
 
 // Read reads a number's inbox once.
@@ -1199,7 +1236,7 @@ func (s *Service) Release(ctx context.Context, project Project, phone string) er
 // The outcome says which of the two it was, because they mean opposite things to
 // the channel: OutcomeTimeout is the channel's own failure and is counted against
 // it, while OutcomeReleased means no verdict was reached and must not be. The
-// channel is taken from the ledger entry for the number.
+// channel is taken from the ledger record for the number.
 func (s *Service) ReleaseUnused(ctx context.Context, project Project, phone string, price float64, outcome ChannelOutcome) error {
 	errRelease := s.Provider.Release(ctx, project, phone)
 	if errRelease != nil {
@@ -1210,18 +1247,16 @@ func (s *Service) ReleaseUnused(ctx context.Context, project Project, phone stri
 	}
 	_, ledger, health := s.stateAll()
 	s.mu.Lock()
-	channel := ""
-	if entry, ok := ledger.Get(phone); ok {
-		channel = entry.Code
-	}
-	refunded := ledger.Refund(phone, price, nowUnix())
+	channel := ledgerChannel(ledger, phone)
+	refunded := ledger.Refund(supply.KindPhone, phone, price, nowUnix())
+	ledger.Mark(supply.KindPhone, phone, outcome.String(), "released", nowUnix())
 	if channel != "" {
 		health.Record(channel, outcome, price, nowUnix())
 		if outcome == OutcomeTimeout {
 			s.cooldown.Mark(channel, nowUnix(), s.CoolDownSeconds)
 		}
 	}
-	errSave := s.Store.Save(s.cache, ledger)
+	errSave := ledger.Save(s.Store.LedgerPath())
 	if channel != "" {
 		if errHealth := s.Store.SaveHealth(health); errHealth != nil && errSave == nil {
 			errSave = errHealth
@@ -1242,18 +1277,20 @@ func (s *Service) Blacklist(ctx context.Context, project Project, phone string) 
 		return errBlacklist
 	}
 	s.mu.Lock()
-	ledger.MarkBlacklisted(phone, time.Now().Unix())
-	errSave := s.Store.Save(s.cache, ledger)
+	ledgerMarkBlacklisted(ledger, phone, time.Now().Unix())
+	errSave := ledger.Save(s.Store.LedgerPath())
 	s.mu.Unlock()
 	return errSave
 }
 
-// LinkAccount records which service account a number registered.
-func (s *Service) LinkAccount(phone, account, authIndex string) error {
+// LinkAccount records which service account a number registered, and on which
+// platform. The platform is the phone kind's target: the account it registered
+// was a Loomy account.
+func (s *Service) LinkAccount(phone, target, account, authIndex string) error {
 	_, ledger := s.state()
 	s.mu.Lock()
-	ledger.SetAccount(phone, account, authIndex, time.Now().Unix())
-	errSave := s.Store.Save(s.cache, ledger)
+	ledger.Link(supply.KindPhone, phone, target, account, authIndex, time.Now().Unix())
+	errSave := ledger.Save(s.Store.LedgerPath())
 	s.mu.Unlock()
 	return errSave
 }

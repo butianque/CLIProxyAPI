@@ -30,7 +30,7 @@ import (
 type phoneOps interface {
 	Balance(ctx context.Context) (float64, error)
 	Channels() *phone.ChannelCache
-	Ledger() *phone.Ledger
+	Ledger() *supply.Ledger
 	Health() *phone.ChannelHealth
 	RefreshChannels(ctx context.Context, join bool) (int, error)
 	Guardrail(ctx context.Context) (int, error)
@@ -110,7 +110,7 @@ func (h *Handler) GetSupplyPhoneStatus(c *gin.Context) {
 	// The channel cache, ledger and health are plain documents on disk, not
 	// secrets, so they are reported whether or not the store is unlocked.
 	if provider != nil {
-		reportPhoneRecords(payload, provider)
+		reportPhoneRecords(payload, provider, h.authIndexByName())
 	}
 
 	if provider == nil {
@@ -140,18 +140,51 @@ func (h *Handler) GetSupplyPhoneStatus(c *gin.Context) {
 
 // reportPhoneRecords adds the cached channels, the ledger and the channel
 // health to a status payload. It reads only documents, never credentials.
-func reportPhoneRecords(payload gin.H, provider phoneOps) {
+func reportPhoneRecords(payload gin.H, provider phoneOps, index map[string]string) {
 	if cache := provider.Channels(); cache != nil {
 		payload["channels"] = cache.Channels
 		payload["channels_updated_at"] = cache.UpdatedAt
 	}
 	if ledger := provider.Ledger(); ledger != nil {
-		payload["ledger"] = ledger.Entries
+		payload["ledger"] = phoneRecords(ledger, index)
 		payload["spent_cny"] = ledger.Spent()
 	}
 	if health := provider.Health(); health != nil {
 		payload["channel_health"] = health.Stats
 	}
+}
+
+// phoneRecords renders the phone kind's slice of the cross-kind ledger for the
+// phone view. The record's kind-specific details live in Meta, so the channel a
+// number was rented from is read from there rather than from a phone-only field.
+func phoneRecords(ledger *supply.Ledger, index map[string]string) []gin.H {
+	if ledger == nil {
+		return nil
+	}
+	records := ledger.All()
+	out := make([]gin.H, 0, len(records))
+	for _, record := range records {
+		if record.Kind != supply.KindPhone {
+			continue
+		}
+		authIndex, _ := resolveAuthIndex(record, index)
+		out = append(out, gin.H{
+			"phone":      record.Address,
+			"sid":        record.MetaString("sid"),
+			"code":       record.MetaString("channel"),
+			"account":    record.Account,
+			"target":     record.Target,
+			"auth_index": authIndex,
+			"price":      record.Price,
+			"rents":      record.Rents,
+			"spend":      record.Spend,
+			"first_seen": record.FirstSeen,
+			"last_used":  record.LastUsed,
+			"outcome":    record.Outcome,
+			"state":      record.State,
+		})
+	}
+	return out
 }
 
 // PostSupplyPhoneRefresh re-reads the joined channels and rewrites the cache.

@@ -44,3 +44,17 @@ func ProviderFor(kind Kind) (Provider, error) {
 	}
 	return lookup.Provider(kind)
 }
+
+// DefaultLedger returns the process-wide cross-kind identity ledger, or nil when
+// no supply service is installed. It is the one document every kind shares.
+func DefaultLedger() *Ledger {
+	service := Default()
+	if service == nil {
+		return nil
+	}
+	provider, ok := service.(LedgerProvider)
+	if !ok {
+		return nil
+	}
+	return provider.Ledger()
+}

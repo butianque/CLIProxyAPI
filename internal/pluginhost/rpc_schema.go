@@ -130,8 +130,9 @@ type rpcManagementRequest struct {
 }
 
 type rpcManagementRegistrationResponse struct {
-	Routes    []pluginapi.ManagementRoute `json:"routes,omitempty"`
-	Resources []pluginapi.ResourceRoute   `json:"resources,omitempty"`
+	Routes    []pluginapi.ManagementRoute  `json:"routes,omitempty"`
+	Resources []pluginapi.ResourceRoute    `json:"resources,omitempty"`
+	Actions   []pluginapi.ManagementAction `json:"actions,omitempty"`
 }
 
 type rpcQuotaFetchRequest struct {

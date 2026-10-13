@@ -175,7 +175,7 @@ func (h *Host) callHostSupplyLink(ctx context.Context, request []byte) ([]byte, 
 	if service == nil {
 		return nil, supply.ErrUnavailable
 	}
-	if errLink := service.Link(ctx, kind, address, strings.TrimSpace(req.Account), strings.TrimSpace(req.AuthIndex)); errLink != nil {
+	if errLink := service.Link(ctx, kind, address, strings.TrimSpace(req.Target), strings.TrimSpace(req.Account), strings.TrimSpace(req.AuthIndex)); errLink != nil {
 		return nil, fmt.Errorf("host supply link: %w", errLink)
 	}
 	return marshalRPCResult(pluginapi.HostSupplyLinkResponse{Linked: true})

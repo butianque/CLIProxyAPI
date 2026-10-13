@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"unicode"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/htmlsanitize"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
@@ -35,7 +36,8 @@ type resourceRouteRecord struct {
 	route    pluginapi.ResourceRoute
 }
 
-// RegisterManagementRoutes rebuilds the plugin-owned Management API and resource route tables.
+// RegisterManagementRoutes rebuilds the plugin-owned Management API route,
+// resource route and action tables.
 func (h *Host) RegisterManagementRoutes(ctx context.Context, reserved map[string]struct{}) {
 	if h == nil {
 		return
@@ -43,6 +45,7 @@ func (h *Host) RegisterManagementRoutes(ctx context.Context, reserved map[string
 
 	nextRoutes := make(map[string]managementRouteRecord)
 	nextResources := make(map[string]resourceRouteRecord)
+	nextActions := make(map[string]managementActionRecord)
 	for _, record := range h.activeRecords() {
 		plugin := record.plugin.Capabilities.ManagementAPI
 		if plugin == nil || h.isPluginFused(record.id) {
@@ -54,6 +57,9 @@ func (h *Host) RegisterManagementRoutes(ctx context.Context, reserved map[string
 			continue
 		}
 
+		// An action may only point at a route the same plugin registered, so
+		// track this plugin's accepted route keys as they are added.
+		pluginRoutes := make(map[string]struct{})
 		for _, item := range resp.Routes {
 			method, path, okRoute := normalizeManagementRoute(item)
 			if !okRoute {
@@ -77,6 +83,7 @@ func (h *Host) RegisterManagementRoutes(ctx context.Context, reserved map[string
 			}
 			item.Method = method
 			item.Path = path
+			pluginRoutes[key] = struct{}{}
 			nextRoutes[key] = managementRouteRecord{
 				pluginID:      record.id,
 				path:          record.path,
@@ -91,11 +98,16 @@ func (h *Host) RegisterManagementRoutes(ctx context.Context, reserved map[string
 				log.Warnf("pluginhost: plugin %s declared invalid resource route %s", record.id, item.Path)
 			}
 		}
+
+		for _, item := range resp.Actions {
+			registerManagementAction(nextActions, nextRoutes, pluginRoutes, record, item)
+		}
 	}
 
 	h.mu.Lock()
 	h.managementRoutes = nextRoutes
 	h.resourceRoutes = nextResources
+	h.managementActions = nextActions
 	h.mu.Unlock()
 }
 
@@ -121,17 +133,38 @@ func normalizeManagementRoute(item pluginapi.ManagementRoute) (string, string, b
 	if item.Handler == nil {
 		return "", "", false
 	}
-	method := strings.ToUpper(strings.TrimSpace(item.Method))
-	if method == "" {
-		method = http.MethodGet
-	}
-	if strings.ContainsAny(method, " \t\r\n") {
+	method, okMethod := normalizeManagementMethod(item.Method, http.MethodGet)
+	if !okMethod {
 		return "", "", false
 	}
 
-	path := strings.TrimSpace(item.Path)
-	if path == "" {
+	path, okPath := normalizeManagementPath(item.Path)
+	if !okPath {
 		return "", "", false
+	}
+	return method, path, true
+}
+
+// normalizeManagementMethod validates a declared method, defaulting to fallback
+// when the plugin left it empty.
+func normalizeManagementMethod(raw string, fallback string) (string, bool) {
+	method := strings.ToUpper(strings.TrimSpace(raw))
+	if method == "" {
+		method = fallback
+	}
+	if strings.ContainsFunc(method, unicode.IsSpace) {
+		return "", false
+	}
+	return method, true
+}
+
+// normalizeManagementPath resolves a plugin-declared management path to its
+// absolute form under the management base path. Routes and actions share it so
+// an action always addresses the same path a route was registered under.
+func normalizeManagementPath(raw string) (string, bool) {
+	path := strings.TrimSpace(raw)
+	if path == "" {
+		return "", false
 	}
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
@@ -141,16 +174,16 @@ func normalizeManagementRoute(item pluginapi.ManagementRoute) (string, string, b
 	}
 	path = strings.TrimRight(path, "/")
 	if path == "" {
-		return "", "", false
+		return "", false
 	}
 	fullPath := managementBasePath + path
 	if !strings.HasPrefix(fullPath, managementBasePath+"/") {
-		return "", "", false
+		return "", false
 	}
-	if strings.ContainsAny(fullPath, " \t\r\n") || strings.Contains(fullPath, ":") || strings.Contains(fullPath, "*") {
-		return "", "", false
+	if strings.ContainsFunc(fullPath, unicode.IsSpace) || strings.Contains(fullPath, ":") || strings.Contains(fullPath, "*") {
+		return "", false
 	}
-	return method, fullPath, true
+	return fullPath, true
 }
 
 func routeDeclaresLegacyMenuResource(method string, item pluginapi.ManagementRoute) bool {

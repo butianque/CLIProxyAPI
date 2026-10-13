@@ -45,7 +45,9 @@ func (s stubSupplyProvider) Read(context.Context, string, string) (supply.Messag
 	return supply.Message{Ready: true, Code: "123456", Text: "your code is 123456"}, nil
 }
 
-func (s stubSupplyProvider) Link(context.Context, string, string, string) error { return nil }
+func (s stubSupplyProvider) Link(context.Context, string, string, string, string) error {
+	return nil
+}
 
 func (s stubSupplyProvider) Release(context.Context, string, string) error { return nil }
 

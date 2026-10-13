@@ -1082,6 +1082,10 @@ type HostSupplyLinkRequest struct {
 	Kind string `json:"kind"`
 	// Address is the identity.
 	Address string `json:"address"`
+	// Target names the platform the identity registered, e.g. "loomy". It is
+	// what makes a ledger record traceable to a platform rather than only to an
+	// account name.
+	Target string `json:"target,omitempty"`
 	// Account names the service account it registered.
 	Account string `json:"account,omitempty"`
 	// AuthIndex is the host credential index backing Account, when known.
@@ -1108,6 +1112,37 @@ type HostSupplyReleaseRequest struct {
 type HostSupplyReleaseResponse struct {
 	// Released reports that the identity was returned to its source.
 	Released bool `json:"released"`
+}
+
+// HostJobProgressRequest reports how far the job a long-running action is
+// running as has progressed.
+type HostJobProgressRequest struct {
+	// JobID is the job the host started for this action.
+	JobID string `json:"job_id"`
+	// Progress is the completion fraction, 0 to 1.
+	Progress float64 `json:"progress"`
+	// Message is an optional human-readable status line.
+	Message string `json:"message,omitempty"`
+}
+
+// HostJobProgressResponse reports whether the progress update was accepted.
+type HostJobProgressResponse struct {
+	// Recorded reports that the job's progress was updated.
+	Recorded bool `json:"recorded"`
+}
+
+// HostJobLogRequest appends one line to a job's log.
+type HostJobLogRequest struct {
+	// JobID is the job the host started for this action.
+	JobID string `json:"job_id"`
+	// Line is the log line to append.
+	Line string `json:"line"`
+}
+
+// HostJobLogResponse reports whether the log line was accepted.
+type HostJobLogResponse struct {
+	// Logged reports that the line was appended.
+	Logged bool `json:"logged"`
 }
 
 // HTTPWireProfile configures transport-level wire representation for plugin HTTP requests.
@@ -1635,6 +1670,56 @@ type ManagementRegistrationResponse struct {
 	Routes []ManagementRoute
 	// Resources contains browser-navigable plugin resources exposed under /v0/resource/plugins/<pluginID>/.
 	Resources []ResourceRoute
+	// Actions contains the named, user-triggerable operations this plugin
+	// exposes. An action is the business-level unit ("register an account",
+	// "scan rewards"); the route it points at is only the transport it runs
+	// over, which is why the host can aggregate actions across plugins and
+	// render them uniformly while each plugin still implements its own
+	// behaviour behind an ordinary ManagementRoute.
+	Actions []ManagementAction
+}
+
+// ManagementAction describes one named, user-triggerable operation a plugin
+// exposes through the host's action surface.
+//
+// Path must name a route the same plugin declared, so triggering an action
+// reuses that route's handler and its panic fuse rather than opening a second
+// dispatch path.
+type ManagementAction struct {
+	// Key is the globally unique action identifier. Prefix it with the plugin
+	// id (for example "loomy.rewards-scan") so two plugins cannot collide.
+	Key string `json:"key"`
+	// Title is the label the management UI shows.
+	Title string `json:"title"`
+	// Description explains what the action does and any irreversible effect.
+	Description string `json:"description,omitempty"`
+	// Method is the HTTP method forwarded to the plugin route. Empty means POST.
+	Method string `json:"method,omitempty"`
+	// Path is the plugin ManagementRoute path this action runs over.
+	Path string `json:"path"`
+	// Params describes the action's inputs so the UI can render a form.
+	Params []ActionParam `json:"params,omitempty"`
+	// Destructive marks an action that irreversibly changes state (deleting a
+	// credential, binding an invitation code). The UI must confirm it first.
+	Destructive bool `json:"destructive,omitempty"`
+	// LongRunning marks an action the host must run as a job: triggering it
+	// returns a job id immediately and the caller polls for progress instead of
+	// holding the request open.
+	LongRunning bool `json:"long_running,omitempty"`
+}
+
+// ActionParam describes one input of a ManagementAction.
+type ActionParam struct {
+	// Name is the request field name, for example "auth_index".
+	Name string `json:"name"`
+	// Title is the label the management UI shows.
+	Title string `json:"title"`
+	// Type is the input kind: string, int, bool or select.
+	Type string `json:"type"`
+	// Required marks an input the caller must supply.
+	Required bool `json:"required,omitempty"`
+	// Options lists the allowed values when Type is select.
+	Options []string `json:"options,omitempty"`
 }
 
 // ManagementRoute describes one plugin-owned Management API route.
@@ -1680,6 +1765,10 @@ type ManagementRequest struct {
 	Query url.Values
 	// Body contains the raw request body.
 	Body []byte
+	// JobID identifies the job this request runs as, when the host started it
+	// for a long-running action. The plugin echoes it back in host.job.progress
+	// and host.job.log; it is empty for an ordinary request.
+	JobID string `json:"job_id,omitempty"`
 }
 
 // ManagementResponse describes a plugin Management API response.

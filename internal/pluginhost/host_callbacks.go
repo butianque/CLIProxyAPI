@@ -205,6 +205,10 @@ func (h *Host) callFromPlugin(ctx context.Context, method string, request []byte
 		return h.callHostSupplyLink(ctx, request)
 	case pluginabi.MethodHostSupplyRelease:
 		return h.callHostSupplyRelease(ctx, request)
+	case pluginabi.MethodHostJobProgress:
+		return h.callHostJobProgress(ctx, request)
+	case pluginabi.MethodHostJobLog:
+		return h.callHostJobLog(ctx, request)
 	default:
 		return nil, fmt.Errorf("unsupported host callback %s", method)
 	}

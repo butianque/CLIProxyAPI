@@ -402,10 +402,11 @@ func TestRegisteredPluginsIncludesResourceMenus(t *testing.T) {
 type managementPluginDouble struct {
 	routes    []pluginapi.ManagementRoute
 	resources []pluginapi.ResourceRoute
+	actions   []pluginapi.ManagementAction
 }
 
 func (p *managementPluginDouble) RegisterManagement(context.Context, pluginapi.ManagementRegistrationRequest) (pluginapi.ManagementRegistrationResponse, error) {
-	return pluginapi.ManagementRegistrationResponse{Routes: p.routes, Resources: p.resources}, nil
+	return pluginapi.ManagementRegistrationResponse{Routes: p.routes, Resources: p.resources, Actions: p.actions}, nil
 }
 
 type managementHandlerFunc func(context.Context, pluginapi.ManagementRequest) (pluginapi.ManagementResponse, error)

@@ -3,6 +3,8 @@ package phone
 import (
 	"context"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/supply"
 )
 
 // This file exposes the platform's management operations on the provider, so
@@ -24,7 +26,7 @@ func (p *ProviderImpl) Balance(ctx context.Context) (float64, error) {
 func (p *ProviderImpl) Channels() *ChannelCache { return p.service.Channels() }
 
 // Ledger returns the phone ledger.
-func (p *ProviderImpl) Ledger() *Ledger { return p.service.Ledger() }
+func (p *ProviderImpl) Ledger() *supply.Ledger { return p.service.Ledger() }
 
 // Health returns the channel health record.
 func (p *ProviderImpl) Health() *ChannelHealth { return p.service.Health() }

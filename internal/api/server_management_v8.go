@@ -73,6 +73,9 @@ func (s *Server) registerManagementV8Routes() {
 	v8.DELETE("/secrets/:name", s.mgmt.DeleteSecret)
 
 	v8.GET("/supply/status", s.mgmt.GetSupplyStatus)
+	// The cross-kind identity ledger: which identity is behind a credential,
+	// and which platform it registered on.
+	v8.GET("/supply/ledger", s.mgmt.GetSupplyLedger)
 
 	// The phone kind's management surface. The panel drives the platform
 	// through these instead of reaching into the plugin.
@@ -85,4 +88,13 @@ func (s *Server) registerManagementV8Routes() {
 	v8.POST("/supply/phone/web-login", s.mgmt.PostSupplyPhoneWebLogin)
 	v8.POST("/supply/phone/web-credential", s.mgmt.PostSupplyPhoneWebCredential)
 	v8.POST("/supply/phone/blacklist", s.mgmt.PostSupplyPhoneBlacklist)
+
+	// The action surface: every plugin's named operations, plus the jobs their
+	// long-running actions run as. The panel triggers actions by key instead of
+	// reaching into a plugin's own routes or HTML.
+	v8.GET("/actions", s.mgmt.ListPluginActions)
+	v8.POST("/actions/:key", s.mgmt.TriggerPluginAction)
+	v8.GET("/jobs", s.mgmt.ListPluginJobs)
+	v8.GET("/jobs/:id", s.mgmt.GetPluginJob)
+	v8.DELETE("/jobs/:id", s.mgmt.CancelPluginJob)
 }

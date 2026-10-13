@@ -5,6 +5,8 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/supply"
 )
 
 // fakeProvider records what it was asked and answers from a scripted plan, so
@@ -185,8 +187,8 @@ func TestAcquireFallsBackToUnpinnedWhenCacheEmpty(t *testing.T) {
 	if len(provider.rented) != 1 || provider.rented[0] != "" {
 		t.Fatalf("provider calls = %v, want one unpinned rental", provider.rented)
 	}
-	if entry.Phone != "13800000006" {
-		t.Fatalf("ledger entry = %+v, want the rented number recorded", entry)
+	if entry.Address != "13800000006" {
+		t.Fatalf("ledger record = %+v, want the rented number recorded", entry)
 	}
 }
 
@@ -254,18 +256,21 @@ func TestLedgerRecordsSpendAndAccount(t *testing.T) {
 	if errAcquire != nil {
 		t.Fatalf("Acquire: %v", errAcquire)
 	}
-	if errLink := service.LinkAccount(number.Phone, "loomy-"+number.Phone, "idx-1"); errLink != nil {
+	if errLink := service.LinkAccount(number.Phone, "loomy", "loomy-"+number.Phone, "idx-1"); errLink != nil {
 		t.Fatalf("LinkAccount: %v", errLink)
 	}
 
 	// A fresh service over the same directory must see the same ledger.
 	reloaded := NewService(provider, service.Store, Budget{})
-	entry, ok := reloaded.Ledger().Get(number.Phone)
+	entry, ok := reloaded.Ledger().Get(supply.KindPhone, number.Phone)
 	if !ok {
 		t.Fatalf("ledger lost %s after reload", number.Phone)
 	}
 	if entry.Account != "loomy-"+number.Phone || entry.AuthIndex != "idx-1" {
 		t.Fatalf("entry = %+v, want the linked account", entry)
+	}
+	if entry.Target != "loomy" {
+		t.Fatalf("target = %q, want the platform the number registered on", entry.Target)
 	}
 	if reloaded.Ledger().Spent() != 0.13 {
 		t.Fatalf("spent = %v, want 0.13", reloaded.Ledger().Spent())
@@ -323,23 +328,6 @@ func TestReleaseUnusedSkipsRefundWhenReleaseFails(t *testing.T) {
 	}
 }
 
-// A refund must never drive the ledger negative, even if asked to reverse more
-// than the entry ever booked.
-func TestLedgerRefundNeverGoesNegative(t *testing.T) {
-	ledger := NewLedger()
-	ledger.Record(Number{Phone: "13800000010", SID: "21614"}, 0.13, "fake", 1)
-
-	if !ledger.Refund("13800000010", 5.0, 2) {
-		t.Fatalf("refund of an over-large amount should still be applied (capped)")
-	}
-	if got := ledger.Spent(); got != 0 {
-		t.Fatalf("spent = %v, want 0 after a capped refund", got)
-	}
-	if ledger.Refund("13800000010", 0.13, 3) {
-		t.Fatalf("a second refund with nothing left to reverse must be a no-op")
-	}
-}
-
 // The channel cache is persisted and reloaded beside the ledger.
 func TestChannelCachePersists(t *testing.T) {
 	provider := &fakeProvider{phone: "13800000005"}
@@ -353,7 +341,9 @@ func TestChannelCachePersists(t *testing.T) {
 	if len(cheapest) != 2 || cheapest[0].UID != "21614-a" {
 		t.Fatalf("reloaded cheapest = %+v, want 21614-a first", cheapest)
 	}
-	if filepath.Base(reloaded.Store.LedgerPath()) != "loomy-phone-ledger.json" {
+	// The ledger is cross-kind now, so its file is the shared one rather than a
+	// phone-only name.
+	if filepath.Base(reloaded.Store.LedgerPath()) != "ledger.json" {
 		t.Fatalf("ledger path = %s", reloaded.Store.LedgerPath())
 	}
 }

@@ -642,7 +642,7 @@ func (a *rpcPluginAdapter) RegisterManagement(ctx context.Context, req pluginapi
 		route.Handler = a
 		resources = append(resources, route)
 	}
-	return pluginapi.ManagementRegistrationResponse{Routes: routes, Resources: resources}, nil
+	return pluginapi.ManagementRegistrationResponse{Routes: routes, Resources: resources, Actions: resp.Actions}, nil
 }
 
 func (a *rpcPluginAdapter) HandleManagement(ctx context.Context, req pluginapi.ManagementRequest) (pluginapi.ManagementResponse, error) {

@@ -140,6 +140,12 @@ const (
 	MethodHostSupplyLink = "host.supply.link"
 	// MethodHostSupplyRelease returns an identity to its source.
 	MethodHostSupplyRelease = "host.supply.release"
+
+	// MethodHostJobProgress reports the progress of the job a long-running
+	// plugin action is running as.
+	MethodHostJobProgress = "host.job.progress"
+	// MethodHostJobLog appends one line to a long-running action's job log.
+	MethodHostJobLog = "host.job.log"
 )
 
 type Envelope struct {
