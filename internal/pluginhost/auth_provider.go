@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"time"
 
@@ -87,6 +88,54 @@ func normalizeProviderID(provider string) string {
 	return strings.ToLower(strings.TrimSpace(provider))
 }
 
+// declaredProviderKeys returns the explicit provider-key set a plugin declares
+// in its registration, normalized and de-duplicated. It is empty for plugins
+// that own a single provider key.
+func declaredProviderKeys(record capabilityRecord) []string {
+	return normalizeProviderKeys(record.plugin.Capabilities.ProviderKeys)
+}
+
+func normalizeProviderKeys(raw []string) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	seen := make(map[string]struct{}, len(raw))
+	for _, item := range raw {
+		key := normalizeProviderID(item)
+		if key == "" {
+			continue
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, key)
+	}
+	return out
+}
+
+// authProviderKeys returns the provider keys a plugin serves for auth parsing,
+// login, and refresh. A plugin that declares ProviderKeys owns all of them;
+// otherwise it owns the single AuthProvider identifier.
+func (h *Host) authProviderKeys(record capabilityRecord) []string {
+	if keys := declaredProviderKeys(record); len(keys) > 0 {
+		return keys
+	}
+	authProvider := record.plugin.Capabilities.AuthProvider
+	if authProvider == nil {
+		return nil
+	}
+	identifier, okIdentifier := h.callAuthProviderIdentifier(record.id, authProvider)
+	if !okIdentifier {
+		return nil
+	}
+	if key := normalizeProviderID(identifier); key != "" {
+		return []string{key}
+	}
+	return nil
+}
+
 func authIDForPath(path, authDir string) string {
 	path = strings.TrimSpace(path)
 	if path == "" {
@@ -115,9 +164,10 @@ func (h *Host) AuthProviderIdentifiers() []string {
 		if provider == nil || h.isPluginFused(record.id) {
 			continue
 		}
-		identifier, okIdentifier := h.callAuthProviderIdentifier(record.id, provider)
-		if okIdentifier && identifier != "" {
-			out = append(out, identifier)
+		for _, key := range h.authProviderKeys(record) {
+			if key != "" {
+				out = append(out, key)
+			}
 		}
 	}
 	return out
@@ -137,11 +187,11 @@ func (h *Host) authProviderRecord(provider string) *capabilityRecord {
 		if authProvider == nil || h.isPluginFused(record.id) {
 			continue
 		}
-		identifier, okIdentifier := h.callAuthProviderIdentifier(record.id, authProvider)
-		if okIdentifier && identifier == provider {
-			copyRecord := record
-			return &copyRecord
+		if !slices.Contains(h.authProviderKeys(record), provider) {
+			continue
 		}
+		copyRecord := record
+		return &copyRecord
 	}
 	return nil
 }

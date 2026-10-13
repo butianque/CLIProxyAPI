@@ -77,7 +77,7 @@ type Host struct {
 	modelExecutor          modelExecutor
 	modelClientIDs         map[string]struct{}
 	executorModelClientIDs map[string]struct{}
-	modelProviders         map[string]string
+	modelProviders         map[string][]string
 	modelRegistrations     map[string]pluginModelRegistration
 	providerModels         map[string][]*registryModelInfo
 	executorProviders      map[string]struct{}
@@ -108,7 +108,7 @@ func New() *Host {
 		cleanupFilesPending:    true,
 		modelClientIDs:         make(map[string]struct{}),
 		executorModelClientIDs: make(map[string]struct{}),
-		modelProviders:         make(map[string]string),
+		modelProviders:         make(map[string][]string),
 		modelRegistrations:     make(map[string]pluginModelRegistration),
 		providerModels:         make(map[string][]*registryModelInfo),
 		executorProviders:      make(map[string]struct{}),
@@ -764,7 +764,7 @@ func (h *Host) ShutdownAllContext(ctx context.Context) {
 	h.retired = make(map[string][]*loadedPlugin)
 	h.modelClientIDs = make(map[string]struct{})
 	h.executorModelClientIDs = make(map[string]struct{})
-	h.modelProviders = make(map[string]string)
+	h.modelProviders = make(map[string][]string)
 	h.modelRegistrations = make(map[string]pluginModelRegistration)
 	h.providerModels = make(map[string][]*registryModelInfo)
 	h.executorProviders = make(map[string]struct{})
@@ -917,7 +917,9 @@ func (h *Host) removePluginRuntimeStateLocked(id string) {
 		}
 	}
 	if registration, ok := h.modelRegistrations[id]; ok {
-		delete(h.providerModels, registration.provider)
+		for _, provider := range registration.providerKeys() {
+			delete(h.providerModels, provider)
+		}
 	}
 	delete(h.modelProviders, id)
 	delete(h.modelRegistrations, id)

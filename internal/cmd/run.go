@@ -7,13 +7,18 @@ import (
 	"context"
 	"errors"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/api/handlers/management"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/secretstore"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/supply"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/supply/phone"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy"
 	log "github.com/sirupsen/logrus"
 )
@@ -40,6 +45,111 @@ func initSecretStore(configPath string) {
 	}
 }
 
+// initSupply installs the process-wide account-supply service used by plugins
+// through the host.supply.* callbacks.
+//
+// A kind is registered only when its configuration opts it in and its platform
+// credential is readable from the host secret store. A locked or empty store,
+// or a kind left disabled, leaves the kind out rather than failing startup: an
+// unconfigured kind is the honest state, and the management surface reports it
+// as such.
+func initSupply(cfg *config.Config, configPath string) {
+	installSupply(cfg, configPath)
+	management.SetSupplyReloader(func() { installSupply(cfg, configPath) })
+}
+
+// installSupply (re)builds and installs the process-wide supply service.
+func installSupply(cfg *config.Config, configPath string) {
+	registry := supply.NewRegistry()
+	if provider, errPhone := buildPhoneProvider(cfg, configPath); errPhone != nil {
+		log.Warnf("phone supply kind disabled: %v", errPhone)
+	} else if provider != nil {
+		if errRegister := registry.Register(provider); errRegister != nil {
+			log.Warnf("phone supply kind not registered: %v", errRegister)
+		}
+	}
+	supply.SetDefault(registry)
+	log.Infof("account supply ready at %s", supplyStateSummary(registry))
+}
+
+// buildPhoneProvider assembles the phone provider from configuration and the
+// host secret store.
+//
+// It returns (nil, nil) when the kind is disabled or no platform credential is
+// stored, which is the not-configured state. A locked store is treated the same
+// way: the credential cannot be read, so the kind is not offered until unlock.
+func buildPhoneProvider(cfg *config.Config, configPath string) (*phone.ProviderImpl, error) {
+	if cfg == nil {
+		return nil, nil
+	}
+	supplyCfg := cfg.Supply.WithDefaults()
+	if supplyCfg.Phone.Disabled {
+		return nil, nil
+	}
+	store := secretstore.Default()
+	if store == nil || !store.Unlocked() {
+		return nil, nil
+	}
+	raw, errGet := store.Get(supplyCfg.Phone.APISecret)
+	if errGet != nil {
+		// Absent is not-configured; anything else is a real read failure.
+		if errors.Is(errGet, secretstore.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, errGet
+	}
+	secret, errParse := phone.ParseHaozhumaSecret(raw)
+	if errParse != nil {
+		return nil, errParse
+	}
+	if cookieRaw, errCookie := store.Get(supplyCfg.Phone.CookieSecret); errCookie == nil {
+		if cookie, errCookieParse := phone.ParseHaozhumaCookie(cookieRaw); errCookieParse == nil {
+			if cookie.Cookie != "" {
+				secret.Cookie = cookie.Cookie
+			}
+			if cookie.WebBase != "" {
+				secret.WebBase = cookie.WebBase
+			}
+		}
+	}
+
+	stateDir := strings.TrimSpace(supplyCfg.StorageDir)
+	if stateDir == "" {
+		stateDir = filepath.Join(filepath.Dir(configPath), "supply")
+	}
+	return phone.New(phone.Config{
+		Provider: supplyCfg.Phone.Provider,
+		Secret:   secret,
+		Store:    phone.Store{Dir: stateDir},
+		Budget: phone.Budget{
+			MaxPerNumberCNY: supplyCfg.Phone.MaxPerNumberCNY,
+			MaxTotalCNY:     supplyCfg.Phone.MaxTotalCNY,
+		},
+		Project: phone.Project{
+			SID:  supplyCfg.Phone.Project,
+			Name: supplyCfg.Phone.ProjectName,
+		},
+		CoolDownSeconds: supplyCfg.Phone.CooldownSeconds,
+		Guardrail:       supplyCfg.Phone.GuardrailEnabled(),
+	})
+}
+
+// supplyStateSummary renders the supply service's kind set for one log line.
+func supplyStateSummary(service supply.Supply) string {
+	status, errStatus := service.Status(context.Background())
+	if errStatus != nil {
+		return "status unavailable: " + errStatus.Error()
+	}
+	if !status.Enabled {
+		return "no supply kind configured"
+	}
+	kinds := make([]string, 0, len(status.Kinds))
+	for _, kind := range status.Kinds {
+		kinds = append(kinds, string(kind))
+	}
+	return "kinds " + strings.Join(kinds, ",")
+}
+
 // StartService builds and runs the proxy service using the exported SDK.
 // It creates a new proxy service instance, sets up signal handling for graceful shutdown,
 // and starts the service with the provided configuration.
@@ -55,6 +165,7 @@ func StartService(cfg *config.Config, configPath string, localPassword string) {
 // StartServiceWithPluginHost builds and runs the proxy service with a shared plugin host.
 func StartServiceWithPluginHost(cfg *config.Config, configPath string, localPassword string, host *pluginhost.Host, serverOptions ...api.ServerOption) {
 	initSecretStore(configPath)
+	initSupply(cfg, configPath)
 	builder := cliproxy.NewBuilder().
 		WithConfig(cfg).
 		WithConfigPath(configPath).
@@ -100,6 +211,7 @@ func StartServiceBackground(cfg *config.Config, configPath string, localPassword
 // StartServiceBackgroundWithPluginHost starts the proxy service with a shared plugin host.
 func StartServiceBackgroundWithPluginHost(cfg *config.Config, configPath string, localPassword string, host *pluginhost.Host, serverOptions ...api.ServerOption) (cancel func(), done <-chan struct{}) {
 	initSecretStore(configPath)
+	initSupply(cfg, configPath)
 	builder := cliproxy.NewBuilder().
 		WithConfig(cfg).
 		WithConfigPath(configPath).

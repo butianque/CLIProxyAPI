@@ -128,6 +128,12 @@ type Capabilities struct {
 	ManagementAPI ManagementAPI
 	// QuotaProvider surfaces credential quota and billing information for management clients.
 	QuotaProvider QuotaProvider
+	// ProviderKeys declares the full set of provider keys this plugin owns for
+	// auth parsing, login, refresh, model registration, and execution. When set,
+	// each key routes independently to this plugin (for example one plugin that
+	// serves both a mainland and an international origin under separate keys).
+	// Empty keeps the default one-key-per-plugin behavior.
+	ProviderKeys []string
 }
 
 // ExecutorModelScope declares which model-registration paths a plugin executor supports.
@@ -998,6 +1004,110 @@ type HostSecretDeleteResponse struct {
 	Locked bool `json:"locked"`
 	// Deleted reports that the secret no longer exists.
 	Deleted bool `json:"deleted"`
+}
+
+// HostSupplyStatusRequest asks the host for the state of its account-supply
+// service.
+type HostSupplyStatusRequest struct{}
+
+// HostSupplyStatusResponse reports whether the supply service is usable and
+// which kinds are configured. Locked is reported separately because a locked
+// credential store means "unknown", not "not configured".
+type HostSupplyStatusResponse struct {
+	// Enabled reports whether any supply kind is configured.
+	Enabled bool `json:"enabled"`
+	// Kinds lists the configured supply kinds ("phone", "email").
+	Kinds []string `json:"kinds,omitempty"`
+	// Locked reports that the host credential store is unavailable.
+	Locked bool `json:"locked,omitempty"`
+}
+
+// HostSupplyGrabRequest asks the host to hand out one identity.
+type HostSupplyGrabRequest struct {
+	// Kind selects the supply category: "phone" or "email".
+	Kind string `json:"kind"`
+	// Purpose names the upstream service the identity is rented for.
+	Purpose string `json:"purpose,omitempty"`
+	// UID addresses one specific source channel or domain.
+	UID string `json:"uid,omitempty"`
+	// Address re-occupies one exact identity (the re-authentication path).
+	Address string `json:"address,omitempty"`
+}
+
+// HostSupplyGrabResponse returns the handed-out identity. Kind-specific extras
+// (a phone channel handle, the operator, the region, an email domain) travel in
+// Meta so the wire contract stays stable as supply kinds grow.
+type HostSupplyGrabResponse struct {
+	// Kind echoes the requested supply kind.
+	Kind string `json:"kind"`
+	// Address is the phone number or email address.
+	Address string `json:"address"`
+	// Price is the rental cost in CNY; zero for free sources.
+	Price float64 `json:"price,omitempty"`
+	// Meta carries kind-specific extras that callers may display but must not
+	// depend on for control flow.
+	Meta map[string]any `json:"meta,omitempty"`
+}
+
+// HostSupplyInboxRequest asks the host to read one identity's inbox once.
+type HostSupplyInboxRequest struct {
+	// Kind selects the supply category: "phone" or "email".
+	Kind string `json:"kind"`
+	// Purpose names the upstream service, needed by some phone providers.
+	Purpose string `json:"purpose,omitempty"`
+	// Address is the identity whose inbox is read.
+	Address string `json:"address"`
+}
+
+// HostSupplyInboxResponse reports one read of an identity's inbox. A missing
+// message is reported as Ready=false, not as an error: it is the ordinary
+// outcome of polling.
+type HostSupplyInboxResponse struct {
+	// Ready reports whether a message has arrived.
+	Ready bool `json:"ready"`
+	// Code is the extracted verification code, when one was found.
+	Code string `json:"code,omitempty"`
+	// Text is the full message body.
+	Text string `json:"text,omitempty"`
+	// Subject is the mail subject for the email kind; empty for phone.
+	Subject string `json:"subject,omitempty"`
+	// From is the mail sender for the email kind; empty for phone.
+	From string `json:"from,omitempty"`
+}
+
+// HostSupplyLinkRequest asks the host to bind one identity to the account it
+// registered, so a later re-authentication can get back onto the same identity.
+type HostSupplyLinkRequest struct {
+	// Kind selects the supply category: "phone" or "email".
+	Kind string `json:"kind"`
+	// Address is the identity.
+	Address string `json:"address"`
+	// Account names the service account it registered.
+	Account string `json:"account,omitempty"`
+	// AuthIndex is the host credential index backing Account, when known.
+	AuthIndex string `json:"auth_index,omitempty"`
+}
+
+// HostSupplyLinkResponse reports whether the binding was recorded.
+type HostSupplyLinkResponse struct {
+	// Linked reports that the binding was stored.
+	Linked bool `json:"linked"`
+}
+
+// HostSupplyReleaseRequest asks the host to return one identity to its source.
+type HostSupplyReleaseRequest struct {
+	// Kind selects the supply category: "phone" or "email".
+	Kind string `json:"kind"`
+	// Address is the identity.
+	Address string `json:"address"`
+	// Outcome describes why it is being released ("released", "timeout", ...).
+	Outcome string `json:"outcome,omitempty"`
+}
+
+// HostSupplyReleaseResponse reports whether the identity was returned.
+type HostSupplyReleaseResponse struct {
+	// Released reports that the identity was returned to its source.
+	Released bool `json:"released"`
 }
 
 // HTTPWireProfile configures transport-level wire representation for plugin HTTP requests.

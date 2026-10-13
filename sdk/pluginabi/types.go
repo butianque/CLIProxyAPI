@@ -126,6 +126,20 @@ const (
 	MethodHostSecretSetPassphrase = "host.secret.set_passphrase"
 	// MethodHostSecretDelete removes one named secret.
 	MethodHostSecretDelete = "host.secret.delete"
+
+	// MethodHostSupplyStatus reports the account-supply service's readiness and
+	// which kinds are configured.
+	MethodHostSupplyStatus = "host.supply.status"
+	// MethodHostSupplyGrab hands out one identity (a phone number or an email
+	// address) for a caller that is registering an account.
+	MethodHostSupplyGrab = "host.supply.grab"
+	// MethodHostSupplyInbox reads one identity's inbox once (an SMS code or a
+	// verification mail).
+	MethodHostSupplyInbox = "host.supply.inbox"
+	// MethodHostSupplyLink associates an identity with the account it registered.
+	MethodHostSupplyLink = "host.supply.link"
+	// MethodHostSupplyRelease returns an identity to its source.
+	MethodHostSupplyRelease = "host.supply.release"
 )
 
 type Envelope struct {

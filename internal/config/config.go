@@ -38,6 +38,10 @@ type Config struct {
 	// Plugins configures dynamic plugin discovery and per-plugin settings.
 	Plugins PluginsConfig `yaml:"plugins" json:"plugins"`
 
+	// Supply configures the host account-supply service: the source of phone
+	// numbers and email addresses used when registering accounts.
+	Supply SupplyConfig `yaml:"supply" json:"supply"`
+
 	// AuthDir is the directory where authentication token files are stored.
 	AuthDir string `yaml:"auth-dir" json:"-"`
 

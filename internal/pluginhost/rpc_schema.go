@@ -46,6 +46,7 @@ type rpcCapabilities struct {
 	CommandLinePlugin             bool                         `json:"command_line_plugin"`
 	ManagementAPI                 bool                         `json:"management_api"`
 	QuotaProvider                 bool                         `json:"quota_provider"`
+	ProviderKeys                  []string                     `json:"provider_keys,omitempty"`
 }
 
 type rpcIdentifierResponse struct {

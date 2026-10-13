@@ -392,7 +392,7 @@ func (h *Host) HasRequestInterceptors() bool {
 	return false
 }
 
-func (h *Host) commitModelClients(snap *Snapshot, modelRegistry modelRegistry, registrations []modelClientRegistration, nextClients map[string]struct{}, nextProviders map[string]string, nextModelRegistrations map[string]pluginModelRegistration) {
+func (h *Host) commitModelClients(snap *Snapshot, modelRegistry modelRegistry, registrations []modelClientRegistration, nextClients map[string]struct{}, nextProviders map[string][]string, nextModelRegistrations map[string]pluginModelRegistration) {
 	if h == nil || modelRegistry == nil {
 		return
 	}

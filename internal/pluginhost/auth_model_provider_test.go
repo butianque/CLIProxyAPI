@@ -40,7 +40,7 @@ func TestHasAuthModelProviderDoesNotRunDiscovery(t *testing.T) {
 			}
 			host := newHostWithRecords(capabilityRecord{id: "ownership", plugin: pluginapi.Plugin{Capabilities: caps}})
 			if mode == "registered" {
-				host.modelProviders["ownership"] = "antigravity"
+				host.modelProviders["ownership"] = []string{"antigravity"}
 			}
 			if mode == "fused" {
 				host.fused["ownership"] = "test"

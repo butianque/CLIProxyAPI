@@ -71,4 +71,18 @@ func (s *Server) registerManagementV8Routes() {
 	v8.DELETE("/secrets/machine-unlock", s.mgmt.DeleteSecretMachineUnlock)
 	v8.PUT("/secrets/:name", s.mgmt.PutSecret)
 	v8.DELETE("/secrets/:name", s.mgmt.DeleteSecret)
+
+	v8.GET("/supply/status", s.mgmt.GetSupplyStatus)
+
+	// The phone kind's management surface. The panel drives the platform
+	// through these instead of reaching into the plugin.
+	v8.GET("/supply/phone/status", s.mgmt.GetSupplyPhoneStatus)
+	v8.POST("/supply/phone/refresh", s.mgmt.PostSupplyPhoneRefresh)
+	v8.POST("/supply/phone/guardrail", s.mgmt.PostSupplyPhoneGuardrail)
+	v8.POST("/supply/phone/channel", s.mgmt.PostSupplyPhoneChannel)
+	v8.POST("/supply/phone/api", s.mgmt.PostSupplyPhoneAPI)
+	v8.POST("/supply/phone/cookie", s.mgmt.PostSupplyPhoneCookie)
+	v8.POST("/supply/phone/web-login", s.mgmt.PostSupplyPhoneWebLogin)
+	v8.POST("/supply/phone/web-credential", s.mgmt.PostSupplyPhoneWebCredential)
+	v8.POST("/supply/phone/blacklist", s.mgmt.PostSupplyPhoneBlacklist)
 }

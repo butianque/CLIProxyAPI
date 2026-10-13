@@ -41,6 +41,9 @@ type rpcThinkingApplier struct {
 type rpcQuotaProvider struct {
 	*rpcPluginAdapter
 	identifier string
+	// supportedProviders carries the plugin's declared provider keys for a
+	// multi-key plugin; empty for a single-key plugin.
+	supportedProviders []string
 }
 
 type rpcError struct {
@@ -90,6 +93,7 @@ func registerRPCPlugin(ctx context.Context, host *Host, id string, client plugin
 			ExecutorModelScope:            resp.Capabilities.ExecutorModelScope,
 			ExecutorInputFormats:          append([]string(nil), resp.Capabilities.ExecutorInputFormats...),
 			ExecutorOutputFormats:         append([]string(nil), resp.Capabilities.ExecutorOutputFormats...),
+			ProviderKeys:                  append([]string(nil), resp.Capabilities.ProviderKeys...),
 		},
 	}
 	if resp.Capabilities.ModelRegistrar {
@@ -174,10 +178,17 @@ func registerRPCPlugin(ctx context.Context, host *Host, id string, client plugin
 		if err := ctx.Err(); err != nil {
 			return pluginapi.Plugin{}, err
 		}
-		plugin.Capabilities.QuotaProvider = rpcQuotaProvider{
+		quotaProvider := rpcQuotaProvider{
 			rpcPluginAdapter: adapter,
 			identifier:       identifier,
 		}
+		// Prefer the plugin's declared provider keys so a multi-key plugin's
+		// quota capability resolves under each key it owns.
+		if keys := normalizeProviderKeys(resp.Capabilities.ProviderKeys); len(keys) > 0 {
+			quotaProvider.identifier = keys[0]
+			quotaProvider.supportedProviders = keys
+		}
+		plugin.Capabilities.QuotaProvider = quotaProvider
 	}
 	return plugin, nil
 }
@@ -648,7 +659,16 @@ func (a rpcQuotaProvider) Identifier() string {
 }
 
 func (a rpcQuotaProvider) DescribeQuota(ctx context.Context, req pluginapi.QuotaDescribeRequest) (pluginapi.QuotaDescribeResponse, error) {
-	return callPlugin[pluginapi.QuotaDescribeResponse](ctx, a.client, pluginabi.MethodQuotaDescribe, req)
+	desc, errDescribe := callPlugin[pluginapi.QuotaDescribeResponse](ctx, a.client, pluginabi.MethodQuotaDescribe, req)
+	if errDescribe != nil {
+		return desc, errDescribe
+	}
+	// A multi-key plugin serves quota under every provider key it declares, even
+	// if the plugin's own description lists none.
+	if len(a.supportedProviders) > 0 && len(desc.SupportedProviders) == 0 {
+		desc.SupportedProviders = append([]string(nil), a.supportedProviders...)
+	}
+	return desc, nil
 }
 
 func (a rpcQuotaProvider) FetchQuota(ctx context.Context, req pluginapi.QuotaFetchRequest) (pluginapi.QuotaFetchResponse, error) {

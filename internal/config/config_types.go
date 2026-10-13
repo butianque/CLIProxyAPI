@@ -285,6 +285,114 @@ type PprofConfig struct {
 	Addr string `yaml:"addr" json:"addr"`
 }
 
+// SupplyConfig configures the host account-supply service (docs/ops/25).
+//
+// Supply hands out a receivable identity — a phone number for SMS codes, an
+// email address for verification mail — and reads the message it receives.
+// Credentials are never held here: they live in the host secret store, named by
+// Phone.APISecret / Phone.CookieSecret and read through host.secret.*.
+type SupplyConfig struct {
+	// StorageDir is where supply state documents live (the phone ledger and the
+	// channel cache). Empty means "<config dir>/supply".
+	StorageDir string `yaml:"storage-dir" json:"storage-dir"`
+
+	// Phone configures the phone supply kind.
+	Phone SupplyPhoneConfig `yaml:"phone" json:"phone"`
+}
+
+// SupplyPhoneConfig configures the phone supply kind.
+type SupplyPhoneConfig struct {
+	// Disabled turns the phone kind off. It is an opt-out, not an opt-in: the
+	// kind is served whenever the platform credential is readable from the
+	// secret store, which is how the plugin behaved before the move. An install
+	// that never wrote a supply section keeps working.
+	Disabled bool `yaml:"disabled" json:"disabled"`
+
+	// Guardrail keeps the platform's own channel picker cheap: after joining the
+	// affordable channels, the over-ceiling and out-of-stock ones are switched
+	// off upstream and the affordable in-stock ones back on. Nil means on, which
+	// is how the plugin behaved before the move.
+	Guardrail *bool `yaml:"guardrail" json:"guardrail"`
+
+	// Provider names the platform implementation. Empty means the built-in
+	// "haozhuma".
+	Provider string `yaml:"provider" json:"provider"`
+
+	// Project is the platform project id numbers are rented for, e.g. Loomy's
+	// relay project "21614".
+	Project string `yaml:"project" json:"project"`
+
+	// ProjectName is the project's display name, used only when the platform
+	// has to be searched for the project.
+	ProjectName string `yaml:"project-name" json:"project-name"`
+
+	// APISecret is the secret-store name holding the fixed API credential.
+	// Empty means "haozhuma".
+	APISecret string `yaml:"api-secret" json:"api-secret"`
+
+	// CookieSecret is the secret-store name holding the web session cookie.
+	// Empty means "haozhuma-ck".
+	CookieSecret string `yaml:"cookie-secret" json:"cookie-secret"`
+
+	// MaxPerNumberCNY skips channels priced above this. 0 disables the cap.
+	MaxPerNumberCNY float64 `yaml:"max-per-number-cny" json:"max-per-number-cny"`
+
+	// MaxTotalCNY caps lifetime spend. 0 disables the cap.
+	MaxTotalCNY float64 `yaml:"max-total-cny" json:"max-total-cny"`
+
+	// CooldownSeconds holds a just-failed channel out of the preferred order.
+	// 0 disables the cool-down.
+	CooldownSeconds int64 `yaml:"cooldown-seconds" json:"cooldown-seconds"`
+}
+
+// Defaults for the phone supply kind, kept in one place so configuration and
+// runtime agree.
+const (
+	DefaultSupplyPhoneProvider     = "haozhuma"
+	DefaultSupplyPhoneProject      = "21614"
+	DefaultSupplyPhoneAPISecret    = "haozhuma"
+	DefaultSupplyPhoneCookieSecret = "haozhuma-ck"
+	DefaultSupplyPhoneMaxPerNumber = 0.5
+	DefaultSupplyPhoneMaxTotal     = 20.0
+	DefaultSupplyPhoneCooldownSecs = 300
+)
+
+// GuardrailEnabled reports whether the channel guardrail should run. It is on
+// by default, matching how the phone kind behaved before it moved into the
+// host; only an explicit false turns it off.
+func (c SupplyPhoneConfig) GuardrailEnabled() bool {
+	return c.Guardrail == nil || *c.Guardrail
+}
+
+// WithDefaults fills the phone supply kind's unset fields with the built-in
+// defaults, so an operator only writes the values they actually change.
+func (c SupplyConfig) WithDefaults() SupplyConfig {
+	phone := c.Phone
+	if strings.TrimSpace(phone.Provider) == "" {
+		phone.Provider = DefaultSupplyPhoneProvider
+	}
+	if strings.TrimSpace(phone.Project) == "" {
+		phone.Project = DefaultSupplyPhoneProject
+	}
+	if strings.TrimSpace(phone.APISecret) == "" {
+		phone.APISecret = DefaultSupplyPhoneAPISecret
+	}
+	if strings.TrimSpace(phone.CookieSecret) == "" {
+		phone.CookieSecret = DefaultSupplyPhoneCookieSecret
+	}
+	if phone.MaxPerNumberCNY == 0 {
+		phone.MaxPerNumberCNY = DefaultSupplyPhoneMaxPerNumber
+	}
+	if phone.MaxTotalCNY == 0 {
+		phone.MaxTotalCNY = DefaultSupplyPhoneMaxTotal
+	}
+	if phone.CooldownSeconds == 0 {
+		phone.CooldownSeconds = DefaultSupplyPhoneCooldownSecs
+	}
+	c.Phone = phone
+	return c
+}
+
 // DiscoveryInterfacesConfig specifies interface inclusion and exclusion rules.
 type DiscoveryInterfacesConfig struct {
 	Include []string `yaml:"include" json:"include"`

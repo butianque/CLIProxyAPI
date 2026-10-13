@@ -71,6 +71,7 @@ func (h *Handler) PostSecretInitialize(c *gin.Context) {
 		c.JSON(errStatus(errInit), gin.H{"error": errInit.Error()})
 		return
 	}
+	reloadSupply()
 	c.JSON(http.StatusOK, secretStatus())
 }
 
@@ -92,6 +93,9 @@ func (h *Handler) PostSecretUnlock(c *gin.Context) {
 		c.JSON(errStatus(errUnlock), gin.H{"error": errUnlock.Error()})
 		return
 	}
+	// The supply service is built from credentials that only become readable now
+	// that the store is unlocked, so rebuild it before reporting.
+	reloadSupply()
 	c.JSON(http.StatusOK, secretStatus())
 }
 
@@ -109,6 +113,7 @@ func (h *Handler) PostSecretMachineUnlock(c *gin.Context) {
 		c.JSON(errStatus(errEnable), gin.H{"error": errEnable.Error()})
 		return
 	}
+	reloadSupply()
 	c.JSON(http.StatusOK, secretStatus())
 }
 
@@ -125,6 +130,7 @@ func (h *Handler) DeleteSecretMachineUnlock(c *gin.Context) {
 		c.JSON(errStatus(errDisable), gin.H{"error": errDisable.Error()})
 		return
 	}
+	reloadSupply()
 	c.JSON(http.StatusOK, secretStatus())
 }
 
@@ -136,6 +142,10 @@ func (h *Handler) PostSecretLock(c *gin.Context) {
 		return
 	}
 	store.Lock()
+	// The credentials are no longer readable, so the built provider is stale;
+	// rebuild so the supply surface reports the locked state rather than a
+	// provider holding a key it should no longer have.
+	reloadSupply()
 	c.JSON(http.StatusOK, secretStatus())
 }
 
@@ -218,6 +228,8 @@ func (h *Handler) PutSecret(c *gin.Context) {
 		c.JSON(errStatus(errSet), gin.H{"error": errSet.Error()})
 		return
 	}
+	// A written credential may be the one the supply service needs, so rebuild.
+	reloadSupply()
 	c.JSON(http.StatusOK, secretStatus())
 }
 

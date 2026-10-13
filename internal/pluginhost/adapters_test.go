@@ -341,7 +341,7 @@ func TestRegisterModelsDropsResultsWhenSnapshotChangesDuringRegistration(t *test
 		}},
 	}
 	setHostSnapshotForTest(host, true, oldRecord)
-	host.modelProviders["alpha"] = "existing-provider"
+	host.modelProviders["alpha"] = []string{"existing-provider"}
 
 	host.RegisterModels(context.Background(), modelRegistry)
 
@@ -867,7 +867,7 @@ func TestRegisterExecutorsPrunesStaleProviderAfterMigration(t *testing.T) {
 			Executor:       exec,
 		}},
 	})
-	host.modelProviders["alpha"] = "provider-a"
+	host.modelProviders["alpha"] = []string{"provider-a"}
 	host.modelRegistrations["alpha"] = pluginModelRegistration{
 		pluginID:    "alpha",
 		provider:    "provider-a",
@@ -876,7 +876,7 @@ func TestRegisterExecutorsPrunesStaleProviderAfterMigration(t *testing.T) {
 	}
 	host.RegisterExecutors(manager, modelRegistry)
 
-	host.modelProviders["alpha"] = "provider-b"
+	host.modelProviders["alpha"] = []string{"provider-b"}
 	host.modelRegistrations["alpha"] = pluginModelRegistration{
 		pluginID:    "alpha",
 		provider:    "provider-b",
@@ -932,12 +932,12 @@ func TestRegisterExecutorsDoesNotUnregisterStaleProviderOwnedExternally(t *testi
 			Executor: exec,
 		}},
 	})
-	host.modelProviders["alpha"] = "provider-a"
+	host.modelProviders["alpha"] = []string{"provider-a"}
 	host.RegisterExecutors(manager, nil)
 
 	external := &fakeProviderExecutor{provider: "provider-a"}
 	manager.executors["provider-a"] = external
-	host.modelProviders["alpha"] = "provider-b"
+	host.modelProviders["alpha"] = []string{"provider-b"}
 	host.RegisterExecutors(manager, nil)
 
 	if len(manager.unregisters) != 0 {
@@ -4152,5 +4152,56 @@ func TestExecutorAdapterRefresh_MergesAttributesAndPreservesPath_Issue6119(t *te
 	}
 	if got := refreshed.Attributes["priority"]; got != "2" {
 		t.Errorf("refreshed priority attribute = %q, want 2", got)
+	}
+}
+
+// A plugin that declares ProviderKeys owns every declared key: each key resolves
+// the plugin for auth parsing, registers its own executor, and routes models
+// independently.
+func TestMultiKeyPluginFansOutAcrossProviderKeys(t *testing.T) {
+	modelRegistry := newFakeModelRegistry()
+	manager := newFakeExecutorManager()
+	exec := &fakeExecutor{identifier: "ignored-single-identifier"}
+	host := newHostWithRecords(capabilityRecord{
+		id: "multi",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			AuthProvider:  fakeAuthProvider{identifier: "multi"},
+			ModelProvider: modelProviderFunc{staticModels: staticModelsFor("multi-model")},
+			Executor:      exec,
+			ProviderKeys:  []string{"multi-cn", "multi-intl"},
+		}},
+	})
+
+	host.RegisterModels(context.Background(), modelRegistry)
+	host.RegisterExecutors(manager, modelRegistry)
+
+	for _, key := range []string{"multi-cn", "multi-intl"} {
+		if _, okExecutor := manager.executors[key]; !okExecutor {
+			t.Fatalf("executor %q was not registered", key)
+		}
+		if _, okClient := modelRegistry.clients[pluginExecutorModelClientID("multi", key)]; !okClient {
+			t.Fatalf("executor model client for %q was not registered", key)
+		}
+		if !host.HasAuthProvider(key) {
+			t.Fatalf("provider key %q does not resolve the plugin for auth", key)
+		}
+		if !host.HasExecutorCandidateProvider(key) {
+			t.Fatalf("provider key %q is not an executor candidate", key)
+		}
+		if !host.HasAuthModelProvider(key) {
+			t.Fatalf("provider key %q does not match the auth model provider", key)
+		}
+	}
+	if host.modelProvider("multi") != "multi-cn" {
+		t.Fatalf("primary provider = %q, want multi-cn", host.modelProvider("multi"))
+	}
+	if host.HasAuthProvider("multi") {
+		t.Fatal("undeclared identifier must not resolve once ProviderKeys is declared")
+	}
+}
+
+func staticModelsFor(modelID string) func(context.Context, pluginapi.StaticModelRequest) (pluginapi.ModelResponse, error) {
+	return func(context.Context, pluginapi.StaticModelRequest) (pluginapi.ModelResponse, error) {
+		return pluginapi.ModelResponse{Provider: "multi", Models: []pluginapi.ModelInfo{{ID: modelID}}}, nil
 	}
 }

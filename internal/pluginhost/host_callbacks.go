@@ -195,6 +195,16 @@ func (h *Host) callFromPlugin(ctx context.Context, method string, request []byte
 		return h.callHostSecretSetPassphrase(ctx, request)
 	case pluginabi.MethodHostSecretDelete:
 		return h.callHostSecretDelete(ctx, request)
+	case pluginabi.MethodHostSupplyStatus:
+		return h.callHostSupplyStatus(ctx, request)
+	case pluginabi.MethodHostSupplyGrab:
+		return h.callHostSupplyGrab(ctx, request)
+	case pluginabi.MethodHostSupplyInbox:
+		return h.callHostSupplyInbox(ctx, request)
+	case pluginabi.MethodHostSupplyLink:
+		return h.callHostSupplyLink(ctx, request)
+	case pluginabi.MethodHostSupplyRelease:
+		return h.callHostSupplyRelease(ctx, request)
 	default:
 		return nil, fmt.Errorf("unsupported host callback %s", method)
 	}

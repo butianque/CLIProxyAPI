@@ -585,6 +585,63 @@ some-concurrent-legacy-block:
 	wg.Wait()
 }
 
+func TestV8SupplySectionSurvivesMigrationAndValidation(t *testing.T) {
+	// "supply" is a v8-only root (docs/ops/25): it has no legacy spelling, so it
+	// is not in v8Paths and can only be known from the base allowed set. When it
+	// was missing there, the first v8 config write commented the whole section
+	// out and the phone kind silently fell back to its defaults.
+	raw := `supply:
+  storage-dir: /var/lib/cpa/supply
+  phone:
+    project: "21614"
+    project-name: 讯飞
+    max-per-number-cny: 0.35
+`
+	if err := ValidateV8Config([]byte(raw)); err != nil {
+		t.Fatalf("v8 rejected the supply section: %v", err)
+	}
+	migrated, changed, err := NormalizeConfigLayout([]byte(raw), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("expected migration to record the v8 layout")
+	}
+	var doc yaml.Node
+	if err = yaml.Unmarshal(migrated, &doc); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"supply.storage-dir", "supply.phone.project", "supply.phone.project-name", "supply.phone.max-per-number-cny"} {
+		if yamlPath(doc.Content[0], path) == nil {
+			t.Fatalf("supply field %s was commented out during migration:\n%s", path, migrated)
+		}
+	}
+	if strings.Contains(string(migrated), "# supply:") {
+		t.Fatalf("supply section was archived as a comment:\n%s", migrated)
+	}
+	if err = ValidateV8Config(migrated); err != nil {
+		t.Fatalf("migrated supply document is invalid: %v", err)
+	}
+	cfg, err := ParseConfigBytes(migrated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	phone := cfg.Supply.WithDefaults().Phone
+	if phone.Project != "21614" || phone.MaxPerNumberCNY != 0.35 {
+		t.Fatalf("migration changed effective supply settings: %+v", phone)
+	}
+	// A nested field the struct does not declare is still archived, so the base
+	// allowed set does not make the section an unvalidated free-for-all.
+	retired := []byte(raw + "    retired-setting: true\n")
+	commented, _, err := NormalizeConfigLayout(retired, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(commented), "# supply.phone.retired-setting:") {
+		t.Fatalf("unknown nested supply field was not archived:\n%s", commented)
+	}
+}
+
 func TestV8SaveCommentsObsoleteSections(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	raw := `auth: {old: true}

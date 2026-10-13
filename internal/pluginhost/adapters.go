@@ -3,6 +3,7 @@ package pluginhost
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
@@ -26,11 +27,28 @@ type modelProviderRegistry interface {
 }
 
 type pluginModelRegistration struct {
-	pluginID    string
+	pluginID string
+	// provider is the plugin's primary provider key; providers holds every key
+	// the plugin owns. A plugin that declares Capabilities.ProviderKeys owns all
+	// of them, and each key registers independently; otherwise the two are the
+	// same single key.
 	provider    string
+	providers   []string
 	priority    int
 	models      []*registry.ModelInfo
 	hasExecutor bool
+}
+
+// providerKeys returns every provider key this registration covers, falling back
+// to the primary key for registrations built before multi-key support.
+func (r pluginModelRegistration) providerKeys() []string {
+	if len(r.providers) > 0 {
+		return r.providers
+	}
+	if r.provider != "" {
+		return []string{r.provider}
+	}
+	return nil
 }
 
 func normalizedExecutorModelScope(caps pluginapi.Capabilities) pluginapi.ExecutorModelScope {
@@ -234,7 +252,7 @@ func (h *Host) RegisterModels(ctx context.Context, modelRegistry modelRegistry) 
 	records := h.activeRecordsFromSnapshot(snap)
 	registrations := make([]modelClientRegistration, 0)
 	nextClients := make(map[string]struct{})
-	nextProviders := make(map[string]string)
+	nextProviders := make(map[string][]string)
 	nextModelRegistrations := make(map[string]pluginModelRegistration)
 	for _, record := range records {
 		modelProvider := record.plugin.Capabilities.ModelProvider
@@ -262,8 +280,15 @@ func (h *Host) RegisterModels(ctx context.Context, modelRegistry modelRegistry) 
 			continue
 		}
 
-		provider := strings.ToLower(strings.TrimSpace(resp.Provider))
-		if provider == "" || len(resp.Models) == 0 {
+		providers := declaredProviderKeys(record)
+		if len(providers) == 0 {
+			provider := normalizeProviderID(resp.Provider)
+			if provider == "" {
+				continue
+			}
+			providers = []string{provider}
+		}
+		if len(resp.Models) == 0 {
 			continue
 		}
 
@@ -282,20 +307,23 @@ func (h *Host) RegisterModels(ctx context.Context, modelRegistry modelRegistry) 
 
 		nextModelRegistrations[record.id] = pluginModelRegistration{
 			pluginID:    record.id,
-			provider:    provider,
+			provider:    providers[0],
+			providers:   providers,
 			priority:    record.priority,
 			models:      cloneRegistryModels(models),
 			hasExecutor: record.plugin.Capabilities.Executor != nil,
 		}
-		nextProviders[record.id] = provider
+		nextProviders[record.id] = providers
 		if record.plugin.Capabilities.Executor == nil {
-			clientID := "plugin:" + record.id + ":" + provider
-			registrations = append(registrations, modelClientRegistration{
-				clientID: clientID,
-				provider: provider,
-				models:   models,
-			})
-			nextClients[clientID] = struct{}{}
+			for _, provider := range providers {
+				clientID := "plugin:" + record.id + ":" + provider
+				registrations = append(registrations, modelClientRegistration{
+					clientID: clientID,
+					provider: provider,
+					models:   models,
+				})
+				nextClients[clientID] = struct{}{}
+			}
 		}
 	}
 	h.commitModelClients(snap, modelRegistry, registrations, nextClients, nextProviders, nextModelRegistrations)
@@ -325,14 +353,25 @@ func (h *Host) authModelProviderMatches(record capabilityRecord, provider string
 		return false
 	}
 	if caps.AuthProvider != nil {
-		identifier, ok := h.callAuthProviderIdentifier(record.id, caps.AuthProvider)
-		return ok && normalizeProviderID(identifier) == provider
+		return slices.Contains(h.authProviderKeys(record), normalizeProviderID(provider))
 	}
-	candidate := normalizeProviderID(h.modelProvider(record.id))
-	if candidate == "" && caps.Executor != nil {
-		candidate, _ = h.executorProvider(record, caps.Executor)
+	return slices.Contains(h.pluginProviderKeys(record), normalizeProviderID(provider))
+}
+
+// pluginProviderKeys returns every provider key a plugin owns, whether declared
+// explicitly (Capabilities.ProviderKeys), derived from its model registration, or
+// taken from its executor identifier. Multi-key plugins own each declared key.
+func (h *Host) pluginProviderKeys(record capabilityRecord) []string {
+	if keys := declaredProviderKeys(record); len(keys) > 0 {
+		return keys
 	}
-	return candidate == provider
+	if keys := h.modelProviderKeys(record.id); len(keys) > 0 {
+		return keys
+	}
+	if record.plugin.Capabilities.Executor != nil {
+		return h.executorProviderKeys(record, record.plugin.Capabilities.Executor)
+	}
+	return nil
 }
 
 func (h *Host) ModelsForAuth(ctx context.Context, auth *coreauth.Auth) AuthModelResult {
@@ -353,10 +392,15 @@ func (h *Host) ModelsForAuth(ctx context.Context, auth *coreauth.Auth) AuthModel
 			return AuthModelResult{Handled: true, Err: errModels}
 		}
 		respProvider := normalizeProviderID(resp.Provider)
-		if respProvider != "" && respProvider != providerKey {
-			continue
-		}
 		if respProvider == "" {
+			respProvider = providerKey
+		} else if respProvider != providerKey {
+			// A multi-key plugin may report a canonical provider name that
+			// differs from the per-key provider; accept it when this record
+			// declares the requested key.
+			if !slices.Contains(declaredProviderKeys(record), providerKey) {
+				continue
+			}
 			respProvider = providerKey
 		}
 		models := make([]*registry.ModelInfo, 0, len(resp.Models))

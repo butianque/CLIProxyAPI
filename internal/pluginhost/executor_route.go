@@ -38,11 +38,11 @@ func (h *Host) executorPluginReady(pluginID string, routeReq pluginapi.ModelRout
 		if !executorScopeAllowsStaticModels(record.plugin.Capabilities) {
 			return false
 		}
-		provider, okProvider := h.executorProvider(record, executor)
-		if !okProvider {
+		providers := h.executorProviderKeys(record, executor)
+		if len(providers) == 0 {
 			return false
 		}
-		adapter := newExecutorAdapterRegistration(h, record, provider, executor).adapter
+		adapter := newExecutorAdapterRegistration(h, record, providers[0], executor).adapter
 		return adapter.supportsExecutorFormats(
 			coreexecutor.Request{Model: routeReq.RequestedModel, Payload: routeReq.Body},
 			coreexecutor.Options{
@@ -128,11 +128,11 @@ func (h *Host) executorAdapterForPlugin(pluginID string) (*executorAdapter, erro
 		if executor == nil {
 			return nil, fmt.Errorf("plugin %s does not declare an executor", pluginID)
 		}
-		provider, okProvider := h.executorProvider(record, executor)
-		if !okProvider {
+		providers := h.executorProviderKeys(record, executor)
+		if len(providers) == 0 {
 			return nil, fmt.Errorf("plugin executor %s has no provider identifier", pluginID)
 		}
-		registration := newExecutorAdapterRegistration(h, record, provider, executor)
+		registration := newExecutorAdapterRegistration(h, record, providers[0], executor)
 		return registration.adapter, nil
 	}
 	return nil, fmt.Errorf("plugin executor %s not found", pluginID)

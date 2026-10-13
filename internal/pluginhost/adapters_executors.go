@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -45,7 +46,9 @@ func (h *Host) RegisterExecutors(manager executorManager, modelRegistry modelPro
 	claimedProviders := make(map[string]string)
 	for _, registration := range registrations {
 		if !registration.hasExecutor {
-			appendModelsForProvider(providerModels, registration.provider, registration.models)
+			for _, provider := range registration.providerKeys() {
+				appendModelsForProvider(providerModels, provider, registration.models)
+			}
 		}
 	}
 	for _, record := range records {
@@ -53,35 +56,37 @@ func (h *Host) RegisterExecutors(manager executorManager, modelRegistry modelPro
 		if executor == nil || h.isPluginFused(record.id) {
 			continue
 		}
-		provider, okProvider := h.executorProvider(record, executor)
-		if !okProvider {
+		providers := h.executorProviderKeys(record, executor)
+		if len(providers) == 0 {
 			continue
 		}
 		registration := h.modelRegistration(record.id)
-		if h.providerHasNativeExecutor(manager, provider) {
-			appendModelsForProvider(providerModels, provider, registration.models)
-			continue
-		}
-		if len(registration.models) == 0 {
-			continue
-		}
-		if owner := claimedProviders[provider]; owner != "" && owner != record.id {
-			continue
-		}
-		for _, model := range registration.models {
-			modelID := strings.TrimSpace(model.ID)
-			if modelID == "" {
+		for _, provider := range providers {
+			if h.providerHasNativeExecutor(manager, provider) {
+				appendModelsForProvider(providerModels, provider, registration.models)
 				continue
 			}
-			if _, claimed := claimedModels[modelID]; claimed {
+			if len(registration.models) == 0 {
 				continue
 			}
-			if h.modelHasNativeExecutor(manager, modelRegistry, modelID) {
+			if owner := claimedProviders[provider]; owner != "" && owner != record.id {
 				continue
 			}
-			claimedModels[modelID] = struct{}{}
-			claimedProviders[provider] = record.id
-			selectedModels[record.id] = append(selectedModels[record.id], model)
+			for _, model := range registration.models {
+				modelID := strings.TrimSpace(model.ID)
+				if modelID == "" {
+					continue
+				}
+				if _, claimed := claimedModels[modelID]; claimed {
+					continue
+				}
+				if h.modelHasNativeExecutor(manager, modelRegistry, modelID) {
+					continue
+				}
+				claimedModels[modelID] = struct{}{}
+				claimedProviders[provider] = record.id
+				selectedModels[record.id] = append(selectedModels[record.id], model)
+			}
 		}
 	}
 
@@ -96,33 +101,35 @@ func (h *Host) RegisterExecutors(manager executorManager, modelRegistry modelPro
 			continue
 		}
 
-		provider, okProvider := h.executorProvider(record, executor)
-		if !okProvider {
+		providers := h.executorProviderKeys(record, executor)
+		if len(providers) == 0 {
 			continue
 		}
 		registration := h.modelRegistration(record.id)
 		if len(registration.models) > 0 && len(selectedModels[record.id]) == 0 {
 			continue
 		}
-		if _, seenProvider := seenProviders[provider]; seenProvider {
-			continue
-		}
-		seenProviders[provider] = struct{}{}
-		if h.providerHasNativeExecutor(manager, provider) {
-			continue
-		}
+		for _, provider := range providers {
+			if _, seenProvider := seenProviders[provider]; seenProvider {
+				continue
+			}
+			seenProviders[provider] = struct{}{}
+			if h.providerHasNativeExecutor(manager, provider) {
+				continue
+			}
 
-		nextProviders[provider] = struct{}{}
-		executorRegistrations = append(executorRegistrations, newExecutorAdapterRegistration(h, record, provider, executor))
-		appendModelsForProvider(providerModels, provider, selectedModels[record.id])
-		if len(selectedModels[record.id]) > 0 {
-			clientID := pluginExecutorModelClientID(record.id, provider)
-			modelClientRegistrations = append(modelClientRegistrations, modelClientRegistration{
-				clientID: clientID,
-				provider: provider,
-				models:   selectedModels[record.id],
-			})
-			nextModelClients[clientID] = struct{}{}
+			nextProviders[provider] = struct{}{}
+			executorRegistrations = append(executorRegistrations, newExecutorAdapterRegistration(h, record, provider, executor))
+			appendModelsForProvider(providerModels, provider, selectedModels[record.id])
+			if len(selectedModels[record.id]) > 0 {
+				clientID := pluginExecutorModelClientID(record.id, provider)
+				modelClientRegistrations = append(modelClientRegistrations, modelClientRegistration{
+					clientID: clientID,
+					provider: provider,
+					models:   selectedModels[record.id],
+				})
+				nextModelClients[clientID] = struct{}{}
+			}
 		}
 	}
 	h.commitExecutorState(snap, manager, modelRegistry, providerModels, executorRegistrations, nextProviders, modelClientRegistrations, nextModelClients)
@@ -239,20 +246,43 @@ func (h *Host) modelRegistration(pluginID string) pluginModelRegistration {
 	return registration
 }
 
-func (h *Host) executorProvider(record capabilityRecord, executor pluginapi.ProviderExecutor) (string, bool) {
-	if h == nil || !h.recordCurrent(record) {
-		return "", false
+func (h *Host) modelProviderKeys(pluginID string) []string {
+	if h == nil {
+		return nil
 	}
-	provider := h.modelProvider(record.id)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if keys := h.modelProviders[pluginID]; len(keys) > 0 {
+		return append([]string(nil), keys...)
+	}
+	if registration, ok := h.modelRegistrations[pluginID]; ok {
+		return registration.providerKeys()
+	}
+	return nil
+}
+
+// executorProviders returns every provider key a plugin's executor serves. A
+// plugin that declares Capabilities.ProviderKeys serves all of them; otherwise
+// it serves its model-registration provider or its executor identifier.
+func (h *Host) executorProviderKeys(record capabilityRecord, executor pluginapi.ProviderExecutor) []string {
+	if h == nil || !h.recordCurrent(record) {
+		return nil
+	}
+	if keys := declaredProviderKeys(record); len(keys) > 0 {
+		return keys
+	}
+	provider := normalizeProviderID(h.modelProvider(record.id))
 	if provider == "" {
 		identifier, okIdentifier := h.callExecutorIdentifier(record.id, executor)
 		if !okIdentifier {
-			return "", false
+			return nil
 		}
-		provider = identifier
+		provider = normalizeProviderID(identifier)
 	}
-	provider = strings.ToLower(strings.TrimSpace(provider))
-	return provider, provider != ""
+	if provider == "" {
+		return nil
+	}
+	return []string{provider}
 }
 
 func (h *Host) callExecutorIdentifier(pluginID string, executor pluginapi.ProviderExecutor) (provider string, ok bool) {
@@ -342,8 +372,7 @@ func (h *Host) HasExecutorCandidateProvider(provider string) bool {
 		if executor == nil || h.isPluginFused(record.id) {
 			continue
 		}
-		candidate, okCandidate := h.executorProvider(record, executor)
-		if okCandidate && candidate == provider {
+		if slices.Contains(h.executorProviderKeys(record, executor), provider) {
 			return true
 		}
 	}
@@ -361,12 +390,11 @@ func (h *Host) ownsExecutor(executor coreauth.ProviderExecutor) bool {
 }
 
 func (h *Host) modelProvider(pluginID string) string {
-	if h == nil {
+	keys := h.modelProviderKeys(pluginID)
+	if len(keys) == 0 {
 		return ""
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.modelProviders[pluginID]
+	return keys[0]
 }
 
 type executorAdapter struct {
