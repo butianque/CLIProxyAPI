@@ -75,12 +75,11 @@ func installSupply(cfg *config.Config, configPath string) {
 
 // supplyStateDir resolves where the supply service keeps its on-disk state.
 func supplyStateDir(cfg *config.Config, configPath string) string {
+	configured := ""
 	if cfg != nil {
-		if dir := strings.TrimSpace(cfg.Supply.WithDefaults().StorageDir); dir != "" {
-			return dir
-		}
+		configured = cfg.Supply.WithDefaults().StorageDir
 	}
-	return filepath.Join(filepath.Dir(configPath), "supply")
+	return supply.StateDir(filepath.Dir(configPath), configured)
 }
 
 // loadSupplyLedger reads the cross-kind identity ledger.

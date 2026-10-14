@@ -74,8 +74,16 @@ func (s *Server) registerManagementV8Routes() {
 
 	v8.GET("/supply/status", s.mgmt.GetSupplyStatus)
 	// The cross-kind identity ledger: which identity is behind a credential,
-	// and which platform it registered on.
+	// and which platform it registered on. It is also the pool view: ?kind=
+	// narrows it to one kind's handed-out identities.
 	v8.GET("/supply/ledger", s.mgmt.GetSupplyLedger)
+
+	// The configured sources of identities. A channel is a label plus a nature
+	// plus the connection details that nature implies; the nature is what the
+	// host switches on.
+	v8.GET("/supply/channels", s.mgmt.GetSupplyChannels)
+	v8.POST("/supply/channels", s.mgmt.PostSupplyChannel)
+	v8.DELETE("/supply/channels/:id", s.mgmt.DeleteSupplyChannel)
 
 	// The phone kind's management surface. The panel drives the platform
 	// through these instead of reaching into the plugin.
