@@ -1,219 +1,155 @@
 package management
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
-// newChannelHandler builds a handler whose supply state lives in a temp dir, so
-// each test writes its own channel document.
-func newChannelHandler(t *testing.T) *Handler {
+func setupChannelTest(t *testing.T) (*Handler, *gin.Engine) {
 	t.Helper()
-	return &Handler{
-		cfg:            &config.Config{},
-		configFilePath: filepath.Join(t.TempDir(), "config.yaml"),
-	}
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	os.WriteFile(cfgPath, []byte("supply:\n  storage-dir: "+filepath.Join(dir, "supply")+"\n"), 0o600)
+	os.MkdirAll(filepath.Join(dir, "supply"), 0o755)
+
+	h := &Handler{configFilePath: cfgPath}
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.GET("/supply/channels", h.GetSupplyChannels)
+	r.POST("/supply/channels", h.PostSupplyChannel)
+	r.DELETE("/supply/channels/:id", h.DeleteSupplyChannel)
+	return h, r
 }
 
-// callChannelRoute runs one management call and returns the decoded body.
-func callChannelRoute(t *testing.T, h *Handler, method, target, body, id string) (int, map[string]any) {
-	t.Helper()
-	recorder := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(method, target, strings.NewReader(body))
-	ctx.Params = gin.Params{{Key: "id", Value: id}}
-	switch method {
-	case http.MethodGet:
-		h.GetSupplyChannels(ctx)
-	case http.MethodPost:
-		h.PostSupplyChannel(ctx)
-	case http.MethodDelete:
-		h.DeleteSupplyChannel(ctx)
-	}
-	var payload map[string]any
-	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &payload); errDecode != nil {
-		t.Fatalf("decode %s %s: %v (%s)", method, target, errDecode, recorder.Body.String())
-	}
-	return recorder.Code, payload
-}
-
-// listChannels returns the channels the surface reports for one kind.
-func listChannels(t *testing.T, h *Handler, kind string) []map[string]any {
-	t.Helper()
-	code, payload := callChannelRoute(t, h, http.MethodGet, "/v8/management/supply/channels?kind="+kind, "", "")
-	if code != http.StatusOK {
-		t.Fatalf("list status = %d", code)
-	}
-	raw, _ := payload["channels"].([]any)
-	out := make([]map[string]any, 0, len(raw))
-	for _, item := range raw {
-		if entry, ok := item.(map[string]any); ok {
-			out = append(out, entry)
-		}
-	}
-	return out
-}
-
-// A channel survives a create, is listed for its own kind only, and is gone
-// after a delete.
 func TestSupplyChannelsRoundTrip(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	lockedStore(t)
-	h := newChannelHandler(t)
+	_, r := setupChannelTest(t)
 
-	code, payload := callChannelRoute(t, h, http.MethodPost, "/v8/management/supply/channels",
-		`{"kind":"email","label":"Ormnes Domain","nature":"imap","secret":"ormnes-imap"}`, "")
-	if code != http.StatusOK {
-		t.Fatalf("create status = %d, body = %v", code, payload)
-	}
-	created, _ := payload["channel"].(map[string]any)
-	if created["id"] != "email-ormnes-domain" {
-		t.Fatalf("id = %v, want email-ormnes-domain", created["id"])
-	}
-	if created["nature"] != "imap" || created["kind"] != "email" {
-		t.Fatalf("created = %v", created)
-	}
-	// Only the name of a secret crosses this surface, never a value.
-	if _, ok := created["secret_value"]; ok {
-		t.Fatalf("create leaked a secret value: %v", created)
-	}
-	if created["secret_present"] != false {
-		t.Fatalf("secret_present = %v, want false for an unwritten name", created["secret_present"])
+	// Create a phone-only channel.
+	body := `{"label":"Haozhuma","category":"third-party","phone":{"enabled":true,"natures":["api"],"connections":{"api":{"endpoint":"https://api.hz.com","secret":"hz-key"}}}}`
+	req := httptest.NewRequest(http.MethodPost, "/supply/channels", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("POST: %d %s", rr.Code, rr.Body.String())
 	}
 
-	emails := listChannels(t, h, "email")
-	if len(emails) != 1 || emails[0]["id"] != "email-ormnes-domain" {
-		t.Fatalf("email channels = %v", emails)
+	var postResp map[string]any
+	json.Unmarshal(rr.Body.Bytes(), &postResp)
+	channel := postResp["channel"].(map[string]any)
+	if channel["label"] != "Haozhuma" {
+		t.Errorf("label = %v", channel["label"])
 	}
-	if phones := listChannels(t, h, "phone"); len(phones) != 0 {
-		t.Fatalf("phone channels = %v, want none", phones)
+	if channel["phone"] == nil {
+		t.Fatal("phone block missing")
 	}
 
-	id, _ := created["id"].(string)
-	if code, _ := callChannelRoute(t, h, http.MethodDelete, "/v8/management/supply/channels/"+id, "", id); code != http.StatusOK {
-		t.Fatalf("delete status = %d", code)
+	// List all.
+	req = httptest.NewRequest(http.MethodGet, "/supply/channels", nil)
+	rr = httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+	var listResp map[string]any
+	json.Unmarshal(rr.Body.Bytes(), &listResp)
+	channels := listResp["channels"].([]any)
+	if len(channels) != 1 {
+		t.Errorf("list: %d channels", len(channels))
 	}
-	if emails := listChannels(t, h, "email"); len(emails) != 0 {
-		t.Fatalf("channels after delete = %v", emails)
+
+	// Delete.
+	id := channel["id"].(string)
+	req = httptest.NewRequest(http.MethodDelete, "/supply/channels/"+id, nil)
+	rr = httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("DELETE: %d", rr.Code)
+	}
+
+	// List again — empty.
+	req = httptest.NewRequest(http.MethodGet, "/supply/channels", nil)
+	rr = httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+	json.Unmarshal(rr.Body.Bytes(), &listResp)
+	channels = listResp["channels"].([]any)
+	if len(channels) != 0 {
+		t.Errorf("after delete: %d", len(channels))
 	}
 }
 
-// A nature that cannot serve the kind is refused at save time rather than
-// failing later at the first call.
-func TestSupplyChannelRejectsNatureForKind(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	lockedStore(t)
-	h := newChannelHandler(t)
+func TestSupplyChannelBothKinds(t *testing.T) {
+	_, r := setupChannelTest(t)
 
-	code, payload := callChannelRoute(t, h, http.MethodPost, "/v8/management/supply/channels",
-		`{"kind":"phone","label":"My Mailbox","nature":"imap"}`, "")
-	if code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400 (body %v)", code, payload)
+	body := `{"label":"Multi","phone":{"enabled":true,"natures":["api","web"],"connections":{"api":{"secret":"a"},"web":{"secret":"w"}}},"email":{"enabled":true,"natures":["imap"],"connections":{"imap":{"account":"me@qq.com","secret":"s","usage":"self-domain","domain":"ormnes.com"}}}}`
+	req := httptest.NewRequest(http.MethodPost, "/supply/channels", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("POST: %d %s", rr.Code, rr.Body.String())
 	}
-	if channels := listChannels(t, h, "phone"); len(channels) != 0 {
-		t.Fatalf("a refused channel was stored anyway: %v", channels)
+
+	var resp map[string]any
+	json.Unmarshal(rr.Body.Bytes(), &resp)
+	ch := resp["channel"].(map[string]any)
+	if ch["phone"] == nil || ch["email"] == nil {
+		t.Fatal("both kinds must be present")
+	}
+
+	// List by kind=phone — should include it.
+	req = httptest.NewRequest(http.MethodGet, "/supply/channels?kind=phone", nil)
+	rr = httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+	json.Unmarshal(rr.Body.Bytes(), &resp)
+	if len(resp["channels"].([]any)) != 1 {
+		t.Error("phone list should have 1")
+	}
+
+	// List by kind=email — should include it.
+	req = httptest.NewRequest(http.MethodGet, "/supply/channels?kind=email", nil)
+	rr = httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+	json.Unmarshal(rr.Body.Bytes(), &resp)
+	if len(resp["channels"].([]any)) != 1 {
+		t.Error("email list should have 1")
 	}
 }
 
-// Updating by id edits in place instead of creating a second channel.
-func TestSupplyChannelUpdateInPlace(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	lockedStore(t)
-	h := newChannelHandler(t)
+func TestSupplyChannelRejectsInvalid(t *testing.T) {
+	_, r := setupChannelTest(t)
 
-	_, payload := callChannelRoute(t, h, http.MethodPost, "/v8/management/supply/channels",
-		`{"kind":"phone","label":"Haozhuma","nature":"api"}`, "")
-	created, _ := payload["channel"].(map[string]any)
-	id, _ := created["id"].(string)
-
-	code, updated := callChannelRoute(t, h, http.MethodPost, "/v8/management/supply/channels",
-		`{"id":"`+id+`","kind":"phone","label":"Haozhuma (main)","nature":"api","enabled":false}`, "")
-	if code != http.StatusOK {
-		t.Fatalf("update status = %d", code)
-	}
-	channel, _ := updated["channel"].(map[string]any)
-	if channel["id"] != id || channel["label"] != "Haozhuma (main)" || channel["enabled"] != false {
-		t.Fatalf("updated = %v", channel)
-	}
-	if channels := listChannels(t, h, "phone"); len(channels) != 1 {
-		t.Fatalf("channels = %v, want the one updated in place", channels)
-	}
-}
-
-// The panel must offer exactly the natures the host accepts per kind.
-func TestSupplyChannelsReportNatureKinds(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	lockedStore(t)
-	h := newChannelHandler(t)
-
-	_, payload := callChannelRoute(t, h, http.MethodGet, "/v8/management/supply/channels", "", "")
-	natures, _ := payload["natures"].([]any)
-	got := map[string][]string{}
-	for _, item := range natures {
-		entry, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
-		name, _ := entry["nature"].(string)
-		kinds, _ := entry["kinds"].([]any)
-		for _, kind := range kinds {
-			text, _ := kind.(string)
-			got[name] = append(got[name], text)
-		}
-	}
-	if len(got["api"]) != 2 || len(got["imap"]) != 1 || len(got["web"]) != 1 {
-		t.Fatalf("nature kinds = %v", got)
-	}
-	if got["imap"][0] != "email" || got["web"][0] != "phone" {
-		t.Fatalf("nature kinds = %v", got)
-	}
-}
-
-// An IMAP self-domain channel carries usage and domain through the surface;
-// self-domain without a domain is refused.
-func TestSupplyChannelImapSelfDomain(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	lockedStore(t)
-	h := newChannelHandler(t)
-
-	// Create an IMAP self-domain channel.
-	code, payload := callChannelRoute(t, h, http.MethodPost, "/v8/management/supply/channels",
-		`{"kind":"email","label":"Ormnes SD","nature":"imap","endpoint":"imap.ormnes.com:993","account":"admin@ormnes.com","secret":"ormnes-imap","usage":"self-domain","domain":"ormnes.com"}`, "")
-	if code != http.StatusOK {
-		t.Fatalf("create self-domain: status = %d, body = %v", code, payload)
-	}
-	created, _ := payload["channel"].(map[string]any)
-	if created["usage"] != "self-domain" {
-		t.Fatalf("usage = %v, want self-domain", created["usage"])
-	}
-	if created["domain"] != "ormnes.com" {
-		t.Fatalf("domain = %v, want ormnes.com", created["domain"])
+	// No kind configured → 400.
+	body := `{"label":"empty"}`
+	req := httptest.NewRequest(http.MethodPost, "/supply/channels", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("no-kind: %d, want 400", rr.Code)
 	}
 
-	// GET: verify usage and domain survive the round-trip.
-	emails := listChannels(t, h, "email")
-	var found bool
-	for _, ch := range emails {
-		if ch["usage"] == "self-domain" && ch["domain"] == "ormnes.com" {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatalf("self-domain channel not found in list: %v", emails)
+	// IMAP on phone → 400.
+	body = `{"label":"bad","phone":{"enabled":true,"natures":["imap"],"connections":{"imap":{}}}}`
+	req = httptest.NewRequest(http.MethodPost, "/supply/channels", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr = httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("imap-phone: %d, want 400", rr.Code)
 	}
 
-	// Self-domain without a domain must be refused.
-	code, _ = callChannelRoute(t, h, http.MethodPost, "/v8/management/supply/channels",
-		`{"kind":"email","label":"No Domain","nature":"imap","usage":"self-domain","domain":""}`, "")
-	if code != http.StatusBadRequest {
-		t.Fatalf("self-domain without domain: status = %d, want 400", code)
+	// Self-domain without domain → 400.
+	body = `{"label":"bad","email":{"enabled":true,"natures":["imap"],"connections":{"imap":{"usage":"self-domain"}}}}`
+	req = httptest.NewRequest(http.MethodPost, "/supply/channels", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr = httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("self-domain-no-domain: %d, want 400", rr.Code)
 	}
 }

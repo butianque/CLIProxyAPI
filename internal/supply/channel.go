@@ -62,11 +62,6 @@ func (n Nature) Valid() bool {
 }
 
 // SupportsKind reports whether a channel of this nature can serve kind.
-//
-// A phone identity comes from a platform (over its API) or from that platform's
-// website session; mail is read over an API or over IMAP. A nature that cannot
-// serve a kind is rejected when the channel is saved, rather than failing later
-// at the first call.
 func (n Nature) SupportsKind(kind Kind) bool {
 	switch kind {
 	case KindPhone:
@@ -77,83 +72,156 @@ func (n Nature) SupportsKind(kind Kind) bool {
 	return false
 }
 
-// Channel is one configured source of identities.
-//
-// Label is what a person reads and picks from; Nature is what the host switches
-// on. Keeping them separate is what lets a channel be renamed without changing
-// how it is reached — the id, not the label, is the durable key.
-type Channel struct {
-	// ID is stable for the channel's lifetime; renaming a label never changes
-	// it, because the ledger attributes identities by id.
-	ID string `json:"id"`
-	// Kind is the identity kind this channel hands out.
-	Kind Kind `json:"kind"`
-	// Label is the free-text name a person sees and selects by.
-	Label string `json:"label"`
-	// Nature is the transport, which selects the implementation and the
-	// connection form.
-	Nature Nature `json:"nature"`
-	// Endpoint is the service address for a network nature, when the operator
-	// needs one. It never holds a credential.
+// Connection holds the per-nature details for reaching a channel.
+type Connection struct {
 	Endpoint string `json:"endpoint,omitempty"`
-	// Account is the non-secret sign-in name, when the nature has one. A
-	// password, token or authorization code is never held here.
-	Account string `json:"account,omitempty"`
-	// Secret names the credential in the host secret store. It is a name, not a
-	// value: the value is only ever read through the store at call time.
-	Secret string `json:"secret,omitempty"`
-	// Enabled turns the channel off without deleting it.
-	Enabled bool `json:"enabled"`
-	// Usage distinguishes IMAP sub-modes: "self-domain" means the channel
-	// receives mail for freely generated addresses under a domain; "personal"
-	// means the mailbox address itself is the identity. Empty for non-IMAP.
-	Usage string `json:"usage,omitempty"`
-	// Domain is the self-hosted domain (e.g. "ormnes.com") when Usage is
-	// "self-domain". Empty otherwise.
+	Account  string `json:"account,omitempty"`
+	Secret   string `json:"secret,omitempty"`
+	// IMAP-only fields.
+	Usage  string `json:"usage,omitempty"`
 	Domain string `json:"domain,omitempty"`
-	// Created and Updated are unix seconds.
-	Created int64 `json:"created,omitempty"`
-	Updated int64 `json:"updated,omitempty"`
 }
 
-// Normalize trims a channel's text fields and validates it.
+// KindConfig is the per-kind block inside a channel: which natures it speaks
+// and the connection details for each.
+type KindConfig struct {
+	Enabled     bool                  `json:"enabled"`
+	Natures     []Nature              `json:"natures"`
+	Connections map[Nature]Connection `json:"connections"`
+}
+
+// Channel is one configured source of identities.
+//
+// A channel can serve phone, email, or both. Each kind has its own set of
+// natures (connection methods) and per-nature connection details. The label is
+// what a person reads and picks from; the id is the durable key.
+type Channel struct {
+	ID       string      `json:"id"`
+	Label    string      `json:"label"`
+	Category string      `json:"category,omitempty"`
+	Phone    *KindConfig `json:"phone,omitempty"`
+	Email    *KindConfig `json:"email,omitempty"`
+	Created  int64       `json:"created,omitempty"`
+	Updated  int64       `json:"updated,omitempty"`
+}
+
+// Kinds returns the identity kinds this channel serves.
+func (c Channel) Kinds() []Kind {
+	var out []Kind
+	if c.Phone != nil {
+		out = append(out, KindPhone)
+	}
+	if c.Email != nil {
+		out = append(out, KindEmail)
+	}
+	return out
+}
+
+// KindConfigFor returns the config block for a kind, or nil.
+func (c Channel) KindConfigFor(kind Kind) *KindConfig {
+	switch kind {
+	case KindPhone:
+		return c.Phone
+	case KindEmail:
+		return c.Email
+	}
+	return nil
+}
+
+// normalizeConnection trims text fields and validates IMAP-specific rules.
+func normalizeConnection(nature Nature, conn Connection) (Connection, error) {
+	conn.Endpoint = strings.TrimSpace(conn.Endpoint)
+	conn.Account = strings.TrimSpace(conn.Account)
+	conn.Secret = strings.TrimSpace(conn.Secret)
+	conn.Usage = strings.TrimSpace(conn.Usage)
+	conn.Domain = strings.TrimSpace(conn.Domain)
+	if nature != NatureIMAP {
+		conn.Usage = ""
+		conn.Domain = ""
+	} else {
+		if conn.Usage == "" {
+			conn.Usage = "personal"
+		}
+		switch conn.Usage {
+		case "self-domain":
+			if conn.Domain == "" {
+				return Connection{}, errors.New("supply: self-domain usage requires a domain")
+			}
+		case "personal":
+			conn.Domain = ""
+		default:
+			return Connection{}, fmt.Errorf("supply: unknown imap usage %q", conn.Usage)
+		}
+	}
+	return conn, nil
+}
+
+// normalizeKindConfig validates one kind block.
+func normalizeKindConfig(kind Kind, kc *KindConfig) error {
+	if len(kc.Natures) == 0 {
+		return fmt.Errorf("supply: %s config has no natures", kind)
+	}
+	if kc.Connections == nil {
+		kc.Connections = make(map[Nature]Connection)
+	}
+	seen := make(map[Nature]bool, len(kc.Natures))
+	for i, nature := range kc.Natures {
+		if !nature.Valid() {
+			return fmt.Errorf("supply: unknown nature %q in %s config", nature, kind)
+		}
+		if !nature.SupportsKind(kind) {
+			return fmt.Errorf("supply: nature %q cannot serve the %s kind", nature, kind)
+		}
+		if seen[nature] {
+			return fmt.Errorf("supply: duplicate nature %q in %s config", nature, kind)
+		}
+		seen[nature] = true
+		conn, errConn := normalizeConnection(nature, kc.Connections[nature])
+		if errConn != nil {
+			return errConn
+		}
+		kc.Connections[nature] = conn
+		_ = i
+	}
+	// Remove stale connection entries not in the nature list.
+	for key := range kc.Connections {
+		if !seen[key] {
+			delete(kc.Connections, key)
+		}
+	}
+	return nil
+}
+
+// Normalize trims text fields and validates the channel.
 func (c Channel) Normalize() (Channel, error) {
 	c.ID = strings.TrimSpace(c.ID)
 	c.Label = strings.TrimSpace(c.Label)
-	c.Endpoint = strings.TrimSpace(c.Endpoint)
-	c.Account = strings.TrimSpace(c.Account)
-	c.Secret = strings.TrimSpace(c.Secret)
-	c.Usage = strings.TrimSpace(c.Usage)
-	c.Domain = strings.TrimSpace(c.Domain)
-	if !c.Kind.Valid() {
-		return Channel{}, fmt.Errorf("supply: channel has unknown kind %q", c.Kind)
-	}
+	c.Category = strings.TrimSpace(c.Category)
 	if c.Label == "" {
 		return Channel{}, errors.New("supply: channel needs a label")
 	}
-	if !c.Nature.Valid() {
-		return Channel{}, fmt.Errorf("supply: channel has unknown nature %q", c.Nature)
+	// Category defaults to third-party.
+	if c.Category == "" {
+		c.Category = "third-party"
 	}
-	if !c.Nature.SupportsKind(c.Kind) {
-		return Channel{}, fmt.Errorf("supply: nature %q cannot serve the %s kind", c.Nature, c.Kind)
+	switch c.Category {
+	case "third-party", "self-owned", "self-built":
+		// ok
+	default:
+		return Channel{}, fmt.Errorf("supply: unknown category %q", c.Category)
 	}
-	// Usage and Domain only apply to IMAP.
-	if c.Nature != NatureIMAP {
-		c.Usage = ""
-		c.Domain = ""
-	} else {
-		if c.Usage == "" {
-			c.Usage = "personal"
+	// At least one kind must be configured.
+	if c.Phone == nil && c.Email == nil {
+		return Channel{}, errors.New("supply: channel must serve at least one kind")
+	}
+	if c.Phone != nil {
+		if err := normalizeKindConfig(KindPhone, c.Phone); err != nil {
+			return Channel{}, err
 		}
-		switch c.Usage {
-		case "self-domain":
-			if c.Domain == "" {
-				return Channel{}, errors.New("supply: self-domain usage requires a domain")
-			}
-		case "personal":
-			c.Domain = ""
-		default:
-			return Channel{}, fmt.Errorf("supply: unknown imap usage %q", c.Usage)
+	}
+	if c.Email != nil {
+		if err := normalizeKindConfig(KindEmail, c.Email); err != nil {
+			return Channel{}, err
 		}
 	}
 	return c, nil
@@ -172,10 +240,6 @@ const channelVersion = 1
 func ChannelPath(dir string) string { return filepath.Join(dir, "channels.json") }
 
 // ChannelStore is the configured-channel list.
-//
-// It is one document for every kind, for the same reason the ledger is: "which
-// sources exist" is one question, and a per-kind file would put the join back
-// on the reader.
 type ChannelStore struct {
 	mu   sync.RWMutex
 	path string
@@ -202,15 +266,13 @@ func LoadChannels(path string) (*ChannelStore, error) {
 // Path is where this store persists.
 func (s *ChannelStore) Path() string { return s.path }
 
-// List returns every channel of one kind. An unknown kind is not a filter, so
-// it returns every channel — the same "no filter" reading the identity ledger
-// gives an unknown kind, so the two surfaces agree.
+// List returns every channel that serves kind. An unknown kind returns all.
 func (s *ChannelStore) List(kind Kind) []Channel {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]Channel, 0, len(s.doc.Channels))
 	for _, channel := range s.doc.Channels {
-		if kind.Valid() && channel.Kind != kind {
+		if kind.Valid() && channel.KindConfigFor(kind) == nil {
 			continue
 		}
 		out = append(out, channel)
@@ -218,7 +280,7 @@ func (s *ChannelStore) List(kind Kind) []Channel {
 	return out
 }
 
-// All returns every channel, across kinds.
+// All returns every channel.
 func (s *ChannelStore) All() []Channel {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -244,16 +306,6 @@ func (s *ChannelStore) getLocked(id string) (Channel, bool) {
 }
 
 // Upsert creates or replaces a channel.
-//
-// An empty id creates one, deriving a stable id from the label; a known id
-// updates in place and keeps its creation time; an unknown id creates a channel
-// under that id, so a caller can pick its own key. A label that collides with
-// another channel is allowed — the id is the key, and two channels may share a
-// name — but the derived id is de-duplicated so a new channel never silently
-// takes over an existing one.
-//
-// Kind is immutable: a channel's identities were handed out under it, so
-// changing it would silently re-attribute them.
 func (s *ChannelStore) Upsert(channel Channel, now int64) (Channel, error) {
 	normalized, errNormalize := channel.Normalize()
 	if errNormalize != nil {
@@ -262,13 +314,10 @@ func (s *ChannelStore) Upsert(channel Channel, now int64) (Channel, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if normalized.ID == "" {
-		normalized.ID = s.nextIDLocked(normalized.Kind, normalized.Label)
+		normalized.ID = s.nextIDLocked(normalized.Label)
 		normalized.Created = now
 	} else if existing, ok := s.getLocked(normalized.ID); ok {
 		normalized.Created = existing.Created
-		if normalized.Kind != existing.Kind {
-			return Channel{}, errors.New("supply: a channel cannot change its kind")
-		}
 	} else {
 		normalized.Created = now
 	}
@@ -291,8 +340,7 @@ func (s *ChannelStore) Upsert(channel Channel, now int64) (Channel, error) {
 	return normalized, nil
 }
 
-// Delete removes one channel. A missing id is not an error: the caller wanted
-// it gone, and it is.
+// Delete removes one channel. A missing id is not an error.
 func (s *ChannelStore) Delete(id string) error {
 	id = strings.TrimSpace(id)
 	s.mu.Lock()
@@ -310,11 +358,11 @@ func (s *ChannelStore) Delete(id string) error {
 	return s.saveLocked()
 }
 
-// nextIDLocked derives an unused id for a new channel. Callers hold the lock.
-func (s *ChannelStore) nextIDLocked(kind Kind, label string) string {
-	base := string(kind) + "-" + slug(label)
-	if strings.HasSuffix(base, "-") {
-		base += "channel"
+// nextIDLocked derives an unused id for a new channel.
+func (s *ChannelStore) nextIDLocked(label string) string {
+	base := slug(label)
+	if base == "" {
+		base = "channel"
 	}
 	id := base
 	for n := 2; ; n++ {
@@ -325,30 +373,29 @@ func (s *ChannelStore) nextIDLocked(kind Kind, label string) string {
 	}
 }
 
-// saveLocked persists the document. Callers hold the lock.
 func (s *ChannelStore) saveLocked() error {
-	if s.doc.Version == 0 {
-		s.doc.Version = channelVersion
-	}
 	return saveJSON(s.path, s.doc)
 }
 
-// slug reduces a label to an id-safe token. Labels are free text and may be
-// entirely non-Latin, in which case there is no token to derive and the caller
-// falls back to a generic name.
+// slug reduces a label to a URL-safe ASCII identifier.
 func slug(label string) string {
 	var b strings.Builder
-	trailingDash := false
-	for _, r := range strings.ToLower(strings.TrimSpace(label)) {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+	for _, r := range strings.ToLower(label) {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
 			b.WriteRune(r)
-			trailingDash = false
-			continue
-		}
-		if b.Len() > 0 && !trailingDash {
+		} else if b.Len() > 0 && r == ' ' || r == '-' || r == '_' {
 			b.WriteByte('-')
-			trailingDash = true
 		}
 	}
 	return strings.Trim(b.String(), "-")
+}
+
+// contains reports whether the slice includes the value.
+func contains(slice []string, value string) bool {
+	for _, item := range slice {
+		if item == value {
+			return true
+		}
+	}
+	return false
 }

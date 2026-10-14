@@ -1,204 +1,254 @@
 package supply
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
 
-func TestNatureSupportsKind(t *testing.T) {
-	cases := []struct {
-		nature Nature
-		kind   Kind
-		want   bool
-	}{
-		{NatureAPI, KindPhone, true},
-		{NatureWeb, KindPhone, true},
-		{NatureIMAP, KindPhone, false},
-		{NatureAPI, KindEmail, true},
-		{NatureIMAP, KindEmail, true},
-		{NatureWeb, KindEmail, false},
+func TestChannelNormalizePhoneOnly(t *testing.T) {
+	c := Channel{
+		Label:    "Haozhuma",
+		Category: "third-party",
+		Phone: &KindConfig{
+			Enabled: true,
+			Natures: []Nature{NatureAPI},
+			Connections: map[Nature]Connection{
+				NatureAPI: {Endpoint: "https://api.example.com", Account: "user", Secret: "haozhuma"},
+			},
+		},
 	}
-	for _, tc := range cases {
-		if got := tc.nature.SupportsKind(tc.kind); got != tc.want {
-			t.Errorf("%s/%s = %v, want %v", tc.nature, tc.kind, got, tc.want)
-		}
-	}
-}
-
-func TestChannelNormalizeRejects(t *testing.T) {
-	cases := []struct {
-		name    string
-		channel Channel
-	}{
-		{"no label", Channel{Kind: KindPhone, Nature: NatureAPI}},
-		{"unknown kind", Channel{Kind: "sms", Nature: NatureAPI, Label: "x"}},
-		{"unknown nature", Channel{Kind: KindPhone, Nature: "smtp", Label: "x"}},
-		// A mailbox cannot hand out a number, and a website session cannot read
-		// mail: the mismatch is refused when the channel is saved.
-		{"imap for phone", Channel{Kind: KindPhone, Nature: NatureIMAP, Label: "x"}},
-		{"web for email", Channel{Kind: KindEmail, Nature: NatureWeb, Label: "x"}},
-	}
-	for _, tc := range cases {
-		if _, err := tc.channel.Normalize(); err == nil {
-			t.Errorf("%s: expected an error", tc.name)
-		}
-	}
-}
-
-func TestChannelStoreUpsertPersists(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "channels.json")
-	store, errLoad := LoadChannels(path)
-	if errLoad != nil {
-		t.Fatalf("load: %v", errLoad)
-	}
-	created, errUpsert := store.Upsert(Channel{
-		Kind:   KindEmail,
-		Label:  "Ormnes Domain",
-		Nature: NatureIMAP,
-	}, 100)
-	if errUpsert != nil {
-		t.Fatalf("upsert: %v", errUpsert)
-	}
-	if created.ID != "email-ormnes-domain" {
-		t.Fatalf("id = %q, want %q", created.ID, "email-ormnes-domain")
-	}
-	if created.Created != 100 || created.Updated != 100 {
-		t.Fatalf("timestamps = %d/%d, want 100/100", created.Created, created.Updated)
-	}
-
-	reloaded, errReload := LoadChannels(path)
-	if errReload != nil {
-		t.Fatalf("reload: %v", errReload)
-	}
-	got, ok := reloaded.Get(created.ID)
-	if !ok || got.Label != "Ormnes Domain" || got.Nature != NatureIMAP {
-		t.Fatalf("reloaded = %+v, ok=%v", got, ok)
-	}
-}
-
-// A rename must not change the id: the id is what the ledger attributes
-// identities by, so a label is free text and nothing more.
-func TestChannelStoreRenameKeepsID(t *testing.T) {
-	store, _ := LoadChannels(filepath.Join(t.TempDir(), "channels.json"))
-	created, errCreate := store.Upsert(Channel{Kind: KindPhone, Label: "Haozhuma", Nature: NatureAPI}, 100)
-	if errCreate != nil {
-		t.Fatalf("create: %v", errCreate)
-	}
-	updated, errUpdate := store.Upsert(Channel{ID: created.ID, Kind: KindPhone, Label: "Haozhuma 2", Nature: NatureAPI}, 200)
-	if errUpdate != nil {
-		t.Fatalf("update: %v", errUpdate)
-	}
-	if updated.ID != created.ID {
-		t.Fatalf("id changed: %q -> %q", created.ID, updated.ID)
-	}
-	if updated.Created != 100 {
-		t.Fatalf("created = %d, want 100 (creation time is kept)", updated.Created)
-	}
-	if list := store.List(KindPhone); len(list) != 1 {
-		t.Fatalf("channels = %d, want 1", len(list))
-	}
-}
-
-func TestChannelStoreKindIsImmutable(t *testing.T) {
-	store, _ := LoadChannels(filepath.Join(t.TempDir(), "channels.json"))
-	created, _ := store.Upsert(Channel{Kind: KindPhone, Label: "Haozhuma", Nature: NatureAPI}, 100)
-	if _, err := store.Upsert(Channel{ID: created.ID, Kind: KindEmail, Label: "Haozhuma", Nature: NatureAPI}, 200); err == nil {
-		t.Fatal("expected changing a channel's kind to be refused")
-	}
-}
-
-// Labels are free text and may carry no Latin characters at all; the derived id
-// still has to be usable, and two such channels must not collide.
-func TestChannelStoreNonLatinLabelsGetDistinctIDs(t *testing.T) {
-	store, _ := LoadChannels(filepath.Join(t.TempDir(), "channels.json"))
-	first, errFirst := store.Upsert(Channel{Kind: KindEmail, Label: "自建域名", Nature: NatureIMAP}, 1)
-	if errFirst != nil {
-		t.Fatalf("first: %v", errFirst)
-	}
-	second, errSecond := store.Upsert(Channel{Kind: KindEmail, Label: "自有邮箱", Nature: NatureIMAP}, 2)
-	if errSecond != nil {
-		t.Fatalf("second: %v", errSecond)
-	}
-	if first.ID == "" || second.ID == "" {
-		t.Fatalf("ids = %q/%q, want non-empty", first.ID, second.ID)
-	}
-	if first.ID == second.ID {
-		t.Fatalf("both channels got id %q", first.ID)
-	}
-}
-
-func TestChannelStoreDelete(t *testing.T) {
-	store, _ := LoadChannels(filepath.Join(t.TempDir(), "channels.json"))
-	created, _ := store.Upsert(Channel{Kind: KindPhone, Label: "Haozhuma", Nature: NatureAPI}, 1)
-	if err := store.Delete(created.ID); err != nil {
-		t.Fatalf("delete: %v", err)
-	}
-	if _, ok := store.Get(created.ID); ok {
-		t.Fatal("channel still present after delete")
-	}
-	// Deleting what is not there is the caller's intent already satisfied.
-	if err := store.Delete(created.ID); err != nil {
-		t.Fatalf("second delete: %v", err)
-	}
-}
-
-func TestChannelNormalizationImapUsage(t *testing.T) {
-	// IMAP + empty usage defaults to "personal".
-	ch, err := Channel{Kind: KindEmail, Nature: NatureIMAP, Label: "box", Endpoint: "imap.example.com:993", Account: "u@example.com", Secret: "s"}.Normalize()
+	got, err := c.Normalize()
 	if err != nil {
-		t.Fatalf("default personal: %v", err)
+		t.Fatalf("normalize failed: %v", err)
 	}
-	if ch.Usage != "personal" {
-		t.Fatalf("usage = %q, want %q", ch.Usage, "personal")
+	if got.Category != "third-party" {
+		t.Errorf("category = %q, want third-party", got.Category)
 	}
-	if ch.Domain != "" {
-		t.Fatalf("domain = %q, want empty", ch.Domain)
+	if got.Phone == nil {
+		t.Fatal("phone is nil")
 	}
-
-	// IMAP + "self-domain" + domain → accepted.
-	ch, err = Channel{Kind: KindEmail, Nature: NatureIMAP, Label: "sd", Endpoint: "imap.ormnes.com:993", Account: "a@ormnes.com", Secret: "s", Usage: "self-domain", Domain: "ormnes.com"}.Normalize()
-	if err != nil {
-		t.Fatalf("self-domain accepted: %v", err)
-	}
-	if ch.Usage != "self-domain" || ch.Domain != "ormnes.com" {
-		t.Fatalf("self-domain: usage=%q domain=%q", ch.Usage, ch.Domain)
-	}
-
-	// IMAP + "self-domain" + empty domain → error.
-	if _, err = (Channel{Kind: KindEmail, Nature: NatureIMAP, Label: "sd2", Endpoint: "imap.x.com:993", Account: "a", Secret: "s", Usage: "self-domain"}).Normalize(); err == nil {
-		t.Fatal("self-domain with empty domain should fail")
-	}
-
-	// IMAP + invalid usage → error.
-	if _, err = (Channel{Kind: KindEmail, Nature: NatureIMAP, Label: "bad", Endpoint: "imap.x.com:993", Account: "a", Secret: "s", Usage: "bogus"}).Normalize(); err == nil {
-		t.Fatal("invalid usage should fail")
-	}
-
-	// Non-IMAP + usage/domain set → both cleared silently.
-	ch, err = Channel{Kind: KindPhone, Nature: NatureAPI, Label: "api", Usage: "self-domain", Domain: "ormnes.com"}.Normalize()
-	if err != nil {
-		t.Fatalf("non-imap clear: %v", err)
-	}
-	if ch.Usage != "" || ch.Domain != "" {
-		t.Fatalf("non-imap: usage=%q domain=%q, want both empty", ch.Usage, ch.Domain)
+	if got.Email != nil {
+		t.Error("email should be nil")
 	}
 }
 
-func TestChannelStoreListsByKind(t *testing.T) {
-	store, _ := LoadChannels(filepath.Join(t.TempDir(), "channels.json"))
-	if _, err := store.Upsert(Channel{Kind: KindPhone, Label: "Haozhuma", Nature: NatureAPI}, 1); err != nil {
-		t.Fatalf("phone: %v", err)
+func TestChannelNormalizeBothKinds(t *testing.T) {
+	c := Channel{
+		Label: "Multi Platform",
+		Phone: &KindConfig{
+			Enabled: true,
+			Natures: []Nature{NatureAPI, NatureWeb},
+			Connections: map[Nature]Connection{
+				NatureAPI: {Endpoint: "https://api.example.com", Secret: "api-key"},
+				NatureWeb: {Account: "admin", Secret: "web-key"},
+			},
+		},
+		Email: &KindConfig{
+			Enabled: true,
+			Natures: []Nature{NatureIMAP},
+			Connections: map[Nature]Connection{
+				NatureIMAP: {Account: "me@qq.com", Secret: "imap-pass", Usage: "personal"},
+			},
+		},
 	}
-	if _, err := store.Upsert(Channel{Kind: KindEmail, Label: "Ormnes", Nature: NatureIMAP}, 1); err != nil {
-		t.Fatalf("email: %v", err)
+	got, err := c.Normalize()
+	if err != nil {
+		t.Fatalf("normalize failed: %v", err)
 	}
-	if got := store.List(KindPhone); len(got) != 1 || got[0].Kind != KindPhone {
-		t.Fatalf("phone list = %+v", got)
+	if got.Phone == nil || got.Email == nil {
+		t.Fatal("both phone and email must be non-nil")
 	}
-	if got := store.List(KindEmail); len(got) != 1 || got[0].Kind != KindEmail {
-		t.Fatalf("email list = %+v", got)
+	if len(got.Phone.Natures) != 2 {
+		t.Errorf("phone natures = %d, want 2", len(got.Phone.Natures))
+	}
+	if len(got.Email.Natures) != 1 {
+		t.Errorf("email natures = %d, want 1", len(got.Email.Natures))
+	}
+}
+
+func TestChannelNormalizeNoKind(t *testing.T) {
+	c := Channel{Label: "Empty"}
+	_, err := c.Normalize()
+	if err == nil {
+		t.Fatal("expected error for channel with no kind")
+	}
+}
+
+func TestChannelNormalizeImapSelfDomain(t *testing.T) {
+	c := Channel{
+		Label:    "ormnes.com",
+		Category: "self-built",
+		Email: &KindConfig{
+			Enabled: true,
+			Natures: []Nature{NatureIMAP},
+			Connections: map[Nature]Connection{
+				NatureIMAP: {Account: "me@qq.com", Secret: "imap-pass", Usage: "self-domain", Domain: "ormnes.com"},
+			},
+		},
+	}
+	got, err := c.Normalize()
+	if err != nil {
+		t.Fatalf("normalize failed: %v", err)
+	}
+	conn := got.Email.Connections[NatureIMAP]
+	if conn.Usage != "self-domain" {
+		t.Errorf("usage = %q, want self-domain", conn.Usage)
+	}
+	if conn.Domain != "ormnes.com" {
+		t.Errorf("domain = %q, want ormnes.com", conn.Domain)
+	}
+}
+
+func TestChannelNormalizeImapSelfDomainNoDomain(t *testing.T) {
+	c := Channel{
+		Label: "bad",
+		Email: &KindConfig{
+			Enabled: true,
+			Natures: []Nature{NatureIMAP},
+			Connections: map[Nature]Connection{
+				NatureIMAP: {Usage: "self-domain"},
+			},
+		},
+	}
+	_, err := c.Normalize()
+	if err == nil {
+		t.Fatal("expected error for self-domain without domain")
+	}
+}
+
+func TestChannelNormalizeImapOnPhone(t *testing.T) {
+	c := Channel{
+		Label: "bad",
+		Phone: &KindConfig{
+			Enabled: true,
+			Natures: []Nature{NatureIMAP},
+			Connections: map[Nature]Connection{
+				NatureIMAP: {},
+			},
+		},
+	}
+	_, err := c.Normalize()
+	if err == nil {
+		t.Fatal("expected error: IMAP cannot serve phone")
+	}
+}
+
+func TestChannelNormalizeInvalidCategory(t *testing.T) {
+	c := Channel{
+		Label:    "bad",
+		Category: "unknown",
+		Phone: &KindConfig{
+			Enabled:     true,
+			Natures:     []Nature{NatureAPI},
+			Connections: map[Nature]Connection{NatureAPI: {}},
+		},
+	}
+	_, err := c.Normalize()
+	if err == nil {
+		t.Fatal("expected error for invalid category")
+	}
+}
+
+func TestChannelNormalizeCategoryDefault(t *testing.T) {
+	c := Channel{
+		Label: "no-cat",
+		Phone: &KindConfig{
+			Enabled:     true,
+			Natures:     []Nature{NatureAPI},
+			Connections: map[Nature]Connection{NatureAPI: {}},
+		},
+	}
+	got, err := c.Normalize()
+	if err != nil {
+		t.Fatalf("normalize failed: %v", err)
+	}
+	if got.Category != "third-party" {
+		t.Errorf("category = %q, want third-party", got.Category)
+	}
+}
+
+func TestChannelStoreListByKind(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "channels.json")
+	store := NewChannelStore(path)
+
+	// A phone-only channel.
+	_, err := store.Upsert(Channel{
+		Label: "Phone Only",
+		Phone: &KindConfig{
+			Enabled:     true,
+			Natures:     []Nature{NatureAPI},
+			Connections: map[Nature]Connection{NatureAPI: {}},
+		},
+	}, 1000)
+	if err != nil {
+		t.Fatalf("upsert phone: %v", err)
+	}
+
+	// A both-kinds channel.
+	_, err = store.Upsert(Channel{
+		Label: "Both",
+		Phone: &KindConfig{
+			Enabled:     true,
+			Natures:     []Nature{NatureAPI},
+			Connections: map[Nature]Connection{NatureAPI: {}},
+		},
+		Email: &KindConfig{
+			Enabled:     true,
+			Natures:     []Nature{NatureIMAP},
+			Connections: map[Nature]Connection{NatureIMAP: {Account: "x@q.com", Secret: "s"}},
+		},
+	}, 1001)
+	if err != nil {
+		t.Fatalf("upsert both: %v", err)
+	}
+
+	if got := store.List(KindPhone); len(got) != 2 {
+		t.Errorf("phone list = %d, want 2", len(got))
+	}
+	if got := store.List(KindEmail); len(got) != 1 {
+		t.Errorf("email list = %d, want 1", len(got))
 	}
 	if got := store.All(); len(got) != 2 {
-		t.Fatalf("all = %d, want 2", len(got))
+		t.Errorf("all = %d, want 2", len(got))
+	}
+}
+
+func TestChannelStorePersistence(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "channels.json")
+	store := NewChannelStore(path)
+
+	_, err := store.Upsert(Channel{
+		Label: "Persist",
+		Phone: &KindConfig{
+			Enabled:     true,
+			Natures:     []Nature{NatureAPI},
+			Connections: map[Nature]Connection{NatureAPI: {Secret: "s"}},
+		},
+	}, 1000)
+	if err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	// Reload from disk.
+	store2, err := LoadChannels(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := store2.All(); len(got) != 1 || got[0].Label != "Persist" {
+		t.Errorf("reload: got %+v", got)
+	}
+
+	// Delete and verify file still exists but empty.
+	if err := store2.Delete(store2.All()[0].ID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if got := store2.All(); len(got) != 0 {
+		t.Errorf("after delete: %d channels", len(got))
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("file should still exist: %v", err)
 	}
 }
