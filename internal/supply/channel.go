@@ -104,6 +104,13 @@ type Channel struct {
 	Secret string `json:"secret,omitempty"`
 	// Enabled turns the channel off without deleting it.
 	Enabled bool `json:"enabled"`
+	// Usage distinguishes IMAP sub-modes: "self-domain" means the channel
+	// receives mail for freely generated addresses under a domain; "personal"
+	// means the mailbox address itself is the identity. Empty for non-IMAP.
+	Usage string `json:"usage,omitempty"`
+	// Domain is the self-hosted domain (e.g. "ormnes.com") when Usage is
+	// "self-domain". Empty otherwise.
+	Domain string `json:"domain,omitempty"`
 	// Created and Updated are unix seconds.
 	Created int64 `json:"created,omitempty"`
 	Updated int64 `json:"updated,omitempty"`
@@ -116,6 +123,8 @@ func (c Channel) Normalize() (Channel, error) {
 	c.Endpoint = strings.TrimSpace(c.Endpoint)
 	c.Account = strings.TrimSpace(c.Account)
 	c.Secret = strings.TrimSpace(c.Secret)
+	c.Usage = strings.TrimSpace(c.Usage)
+	c.Domain = strings.TrimSpace(c.Domain)
 	if !c.Kind.Valid() {
 		return Channel{}, fmt.Errorf("supply: channel has unknown kind %q", c.Kind)
 	}
@@ -127,6 +136,25 @@ func (c Channel) Normalize() (Channel, error) {
 	}
 	if !c.Nature.SupportsKind(c.Kind) {
 		return Channel{}, fmt.Errorf("supply: nature %q cannot serve the %s kind", c.Nature, c.Kind)
+	}
+	// Usage and Domain only apply to IMAP.
+	if c.Nature != NatureIMAP {
+		c.Usage = ""
+		c.Domain = ""
+	} else {
+		if c.Usage == "" {
+			c.Usage = "personal"
+		}
+		switch c.Usage {
+		case "self-domain":
+			if c.Domain == "" {
+				return Channel{}, errors.New("supply: self-domain usage requires a domain")
+			}
+		case "personal":
+			c.Domain = ""
+		default:
+			return Channel{}, fmt.Errorf("supply: unknown imap usage %q", c.Usage)
+		}
 	}
 	return c, nil
 }

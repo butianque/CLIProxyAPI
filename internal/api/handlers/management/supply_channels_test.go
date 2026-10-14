@@ -175,3 +175,45 @@ func TestSupplyChannelsReportNatureKinds(t *testing.T) {
 		t.Fatalf("nature kinds = %v", got)
 	}
 }
+
+// An IMAP self-domain channel carries usage and domain through the surface;
+// self-domain without a domain is refused.
+func TestSupplyChannelImapSelfDomain(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	lockedStore(t)
+	h := newChannelHandler(t)
+
+	// Create an IMAP self-domain channel.
+	code, payload := callChannelRoute(t, h, http.MethodPost, "/v8/management/supply/channels",
+		`{"kind":"email","label":"Ormnes SD","nature":"imap","endpoint":"imap.ormnes.com:993","account":"admin@ormnes.com","secret":"ormnes-imap","usage":"self-domain","domain":"ormnes.com"}`, "")
+	if code != http.StatusOK {
+		t.Fatalf("create self-domain: status = %d, body = %v", code, payload)
+	}
+	created, _ := payload["channel"].(map[string]any)
+	if created["usage"] != "self-domain" {
+		t.Fatalf("usage = %v, want self-domain", created["usage"])
+	}
+	if created["domain"] != "ormnes.com" {
+		t.Fatalf("domain = %v, want ormnes.com", created["domain"])
+	}
+
+	// GET: verify usage and domain survive the round-trip.
+	emails := listChannels(t, h, "email")
+	var found bool
+	for _, ch := range emails {
+		if ch["usage"] == "self-domain" && ch["domain"] == "ormnes.com" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("self-domain channel not found in list: %v", emails)
+	}
+
+	// Self-domain without a domain must be refused.
+	code, _ = callChannelRoute(t, h, http.MethodPost, "/v8/management/supply/channels",
+		`{"kind":"email","label":"No Domain","nature":"imap","usage":"self-domain","domain":""}`, "")
+	if code != http.StatusBadRequest {
+		t.Fatalf("self-domain without domain: status = %d, want 400", code)
+	}
+}

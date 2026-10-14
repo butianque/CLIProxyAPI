@@ -50,19 +50,29 @@ func (h *Handler) supplyStateDir() string {
 // value itself is never read here, let alone returned.
 func channelView(channel supply.Channel, secretNames []string, storeEnabled bool) gin.H {
 	view := gin.H{
-		"id":       channel.ID,
-		"kind":     string(channel.Kind),
-		"label":    channel.Label,
-		"nature":   string(channel.Nature),
-		"endpoint": channel.Endpoint,
-		"account":  channel.Account,
-		"secret":   channel.Secret,
-		"enabled":  channel.Enabled,
-		"created":  channel.Created,
-		"updated":  channel.Updated,
+		"id":      channel.ID,
+		"kind":    string(channel.Kind),
+		"label":   channel.Label,
+		"nature":  string(channel.Nature),
+		"enabled": channel.Enabled,
+		"created": channel.Created,
+		"updated": channel.Updated,
+	}
+	if channel.Endpoint != "" {
+		view["endpoint"] = channel.Endpoint
+	}
+	if channel.Account != "" {
+		view["account"] = channel.Account
 	}
 	if channel.Secret != "" {
+		view["secret"] = channel.Secret
 		view["secret_present"] = storeEnabled && contains(secretNames, channel.Secret)
+	}
+	if channel.Usage != "" {
+		view["usage"] = channel.Usage
+	}
+	if channel.Domain != "" {
+		view["domain"] = channel.Domain
 	}
 	return view
 }
@@ -124,6 +134,8 @@ func (h *Handler) PostSupplyChannel(c *gin.Context) {
 		Account  string `json:"account"`
 		Secret   string `json:"secret"`
 		Enabled  *bool  `json:"enabled"`
+		Usage    string `json:"usage"`
+		Domain   string `json:"domain"`
 	}
 	if errBind := c.ShouldBindJSON(&body); errBind != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid JSON body"})
@@ -142,6 +154,8 @@ func (h *Handler) PostSupplyChannel(c *gin.Context) {
 		Endpoint: body.Endpoint,
 		Account:  body.Account,
 		Secret:   body.Secret,
+		Usage:    body.Usage,
+		Domain:   body.Domain,
 		Enabled:  true,
 	}
 	if body.Enabled != nil {

@@ -142,6 +142,48 @@ func TestChannelStoreDelete(t *testing.T) {
 	}
 }
 
+func TestChannelNormalizationImapUsage(t *testing.T) {
+	// IMAP + empty usage defaults to "personal".
+	ch, err := Channel{Kind: KindEmail, Nature: NatureIMAP, Label: "box", Endpoint: "imap.example.com:993", Account: "u@example.com", Secret: "s"}.Normalize()
+	if err != nil {
+		t.Fatalf("default personal: %v", err)
+	}
+	if ch.Usage != "personal" {
+		t.Fatalf("usage = %q, want %q", ch.Usage, "personal")
+	}
+	if ch.Domain != "" {
+		t.Fatalf("domain = %q, want empty", ch.Domain)
+	}
+
+	// IMAP + "self-domain" + domain → accepted.
+	ch, err = Channel{Kind: KindEmail, Nature: NatureIMAP, Label: "sd", Endpoint: "imap.ormnes.com:993", Account: "a@ormnes.com", Secret: "s", Usage: "self-domain", Domain: "ormnes.com"}.Normalize()
+	if err != nil {
+		t.Fatalf("self-domain accepted: %v", err)
+	}
+	if ch.Usage != "self-domain" || ch.Domain != "ormnes.com" {
+		t.Fatalf("self-domain: usage=%q domain=%q", ch.Usage, ch.Domain)
+	}
+
+	// IMAP + "self-domain" + empty domain → error.
+	if _, err = (Channel{Kind: KindEmail, Nature: NatureIMAP, Label: "sd2", Endpoint: "imap.x.com:993", Account: "a", Secret: "s", Usage: "self-domain"}).Normalize(); err == nil {
+		t.Fatal("self-domain with empty domain should fail")
+	}
+
+	// IMAP + invalid usage → error.
+	if _, err = (Channel{Kind: KindEmail, Nature: NatureIMAP, Label: "bad", Endpoint: "imap.x.com:993", Account: "a", Secret: "s", Usage: "bogus"}).Normalize(); err == nil {
+		t.Fatal("invalid usage should fail")
+	}
+
+	// Non-IMAP + usage/domain set → both cleared silently.
+	ch, err = Channel{Kind: KindPhone, Nature: NatureAPI, Label: "api", Usage: "self-domain", Domain: "ormnes.com"}.Normalize()
+	if err != nil {
+		t.Fatalf("non-imap clear: %v", err)
+	}
+	if ch.Usage != "" || ch.Domain != "" {
+		t.Fatalf("non-imap: usage=%q domain=%q, want both empty", ch.Usage, ch.Domain)
+	}
+}
+
 func TestChannelStoreListsByKind(t *testing.T) {
 	store, _ := LoadChannels(filepath.Join(t.TempDir(), "channels.json"))
 	if _, err := store.Upsert(Channel{Kind: KindPhone, Label: "Haozhuma", Nature: NatureAPI}, 1); err != nil {
