@@ -385,9 +385,10 @@ func (h *Host) callQuotaFetch(ctx context.Context, record capabilityRecord, prov
 	}()
 	quotaResp, errFetch := provider.FetchQuota(ctx, req)
 	if errFetch != nil {
+		h.rememberQuotaSnapshotFailure(req.Provider, req.AuthIndex)
 		return pluginapi.QuotaFetchResponse{}, true, errFetch
 	}
-	return quotaResp, true, nil
+	return h.rememberQuotaSnapshot(req.Provider, req.AuthIndex, quotaResp), true, nil
 }
 
 func (h *Host) callQuotaReset(ctx context.Context, record capabilityRecord, provider pluginapi.QuotaProvider, req pluginapi.QuotaResetRequest) (resp pluginapi.QuotaResetResponse, handled bool, err error) {
@@ -431,5 +432,6 @@ func (h *Host) callQuotaReset(ctx context.Context, record capabilityRecord, prov
 	if errReset != nil {
 		return pluginapi.QuotaResetResponse{}, true, errReset
 	}
+	h.ForgetQuotaSnapshots(req.AuthIndex)
 	return resetResp, true, nil
 }

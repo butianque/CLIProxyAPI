@@ -21,6 +21,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/synthesizer"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -285,6 +286,10 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		return
 	}
 	delete(req, "name")
+	if errPolicy := validateAccountPolicyPatch(req); errPolicy != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errPolicy.Error()})
+		return
+	}
 	var errNormalize error
 	req, errNormalize = normalizeAuthFilePatchFields(req)
 	if errNormalize != nil {
@@ -459,6 +464,35 @@ func normalizeAuthFilePatchFields(fields map[string]json.RawMessage) (map[string
 		canonicalNames[canonicalPath] = originalRoot == parts[0]
 	}
 	return normalized, nil
+}
+
+// validateAccountPolicyPatch rejects an account routing policy the host does not
+// implement. A policy is a closed enum: accepting any string would let a typo
+// silently take a credential out of scheduling.
+func validateAccountPolicyPatch(fields map[string]json.RawMessage) error {
+	raw, ok := fields["policy"]
+	if !ok {
+		return nil
+	}
+	value, errDecode := decodeAuthFileFieldValue(raw)
+	if errDecode != nil {
+		return fmt.Errorf("policy must be a string")
+	}
+	if value == nil {
+		return nil
+	}
+	policy, okString := value.(string)
+	if !okString {
+		return fmt.Errorf("policy must be a string")
+	}
+	policy = strings.TrimSpace(policy)
+	if policy == "" {
+		return nil
+	}
+	if !pluginapi.ValidAccountPolicy(policy) {
+		return fmt.Errorf("policy must be one of %s", strings.Join(pluginapi.AccountPolicyValues(), ", "))
+	}
+	return nil
 }
 
 func decodeAuthFileRequestRetryPatch(fields map[string]json.RawMessage) (authFileRequestRetryPatch, error) {

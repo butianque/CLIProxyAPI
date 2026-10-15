@@ -2,6 +2,7 @@ package pluginhost
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
@@ -491,5 +492,75 @@ func TestRegisterRPCPlugin_ContextCancellation(t *testing.T) {
 	_, err := registerRPCPlugin(ctx, host, "cancel-register-plugin", lookup, pluginabi.MethodPluginRegister, nil)
 	if err == nil {
 		t.Fatal("expected error when registering with canceled context")
+	}
+}
+
+func TestQuotaSnapshotCache_RecordsFetchFailureAndReset(t *testing.T) {
+	failFetch := false
+	provider := &testQuotaProvider{
+		identifier: "snapshot-provider",
+		fetchFn: func(context.Context, pluginapi.QuotaFetchRequest) (pluginapi.QuotaFetchResponse, error) {
+			if failFetch {
+				return pluginapi.QuotaFetchResponse{}, errors.New("probe failed")
+			}
+			return pluginapi.QuotaFetchResponse{
+				Subscription: &pluginapi.QuotaSubscription{Plan: "Pro"},
+			}, nil
+		},
+	}
+	host := newHostWithRecords(capabilityRecord{
+		id: "snapshot-plugin",
+		plugin: pluginapi.Plugin{
+			Capabilities: pluginapi.Capabilities{QuotaProvider: provider},
+		},
+	})
+
+	if _, ok := host.CachedQuota("snapshot-provider", "auth-1"); ok {
+		t.Fatal("expected no snapshot before the first fetch")
+	}
+
+	resp, handled, errFetch := host.FetchQuota(context.Background(), pluginapi.QuotaFetchRequest{
+		Provider:  "snapshot-provider",
+		AuthIndex: "auth-1",
+	})
+	if errFetch != nil || !handled {
+		t.Fatalf("unexpected fetch result: handled=%v err=%v", handled, errFetch)
+	}
+	// The host stamps the reading, so an expired snapshot cannot pass for a live
+	// balance.
+	if resp.FetchedAt == "" {
+		t.Fatal("expected the host to stamp FetchedAt on the fetch response")
+	}
+	cached, ok := host.CachedQuota("snapshot-provider", "auth-1")
+	if !ok || cached.Failed || !cached.Fetched {
+		t.Fatalf("unexpected cached snapshot: %+v ok=%v", cached, ok)
+	}
+	if cached.FetchedAt.IsZero() || cached.Response.FetchedAt != resp.FetchedAt {
+		t.Fatalf("cached snapshot lost its timestamp: %+v", cached)
+	}
+
+	// A failed probe is recorded as a failure and keeps the last good reading,
+	// so a reader can still say when the credential was last known to have quota.
+	failFetch = true
+	if _, handled, errFetch = host.FetchQuota(context.Background(), pluginapi.QuotaFetchRequest{
+		Provider:  "snapshot-provider",
+		AuthIndex: "auth-1",
+	}); errFetch == nil || !handled {
+		t.Fatalf("expected the failing probe to be handled: handled=%v err=%v", handled, errFetch)
+	}
+	cached, ok = host.CachedQuota("snapshot-provider", "auth-1")
+	if !ok || !cached.Failed || !cached.Fetched {
+		t.Fatalf("expected a failed snapshot that keeps the last reading: %+v", cached)
+	}
+
+	// A reset drops the reading it just invalidated.
+	if _, handled, errReset := host.ResetQuota(context.Background(), pluginapi.QuotaResetRequest{
+		Provider:  "snapshot-provider",
+		AuthIndex: "auth-1",
+	}); errReset != nil || !handled {
+		t.Fatalf("unexpected reset result: handled=%v err=%v", handled, errReset)
+	}
+	if _, ok := host.CachedQuota("snapshot-provider", "auth-1"); ok {
+		t.Fatal("expected the reset to drop the cached snapshot")
 	}
 }

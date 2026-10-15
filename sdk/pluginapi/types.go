@@ -1969,12 +1969,62 @@ func (g *QuotaGroup) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// Account routing policies an operator assigns to a credential. A policy is
+// account metadata owned by the host, not a provider capability: the host
+// stores it and the plugin honors it when choosing a channel.
+const (
+	AccountPolicyStartPlanOnly  = "start-plan-only"
+	AccountPolicyAPIKeyOnly     = "api-key-only"
+	AccountPolicyStartPlanFirst = "start-plan-first"
+	AccountPolicyDisabled       = "disabled"
+)
+
+// AccountPolicyValues returns every accepted account routing policy.
+func AccountPolicyValues() []string {
+	return []string{
+		AccountPolicyStartPlanOnly,
+		AccountPolicyAPIKeyOnly,
+		AccountPolicyStartPlanFirst,
+		AccountPolicyDisabled,
+	}
+}
+
+// ValidAccountPolicy reports whether value is an accepted account routing policy.
+func ValidAccountPolicy(value string) bool {
+	switch value {
+	case AccountPolicyStartPlanOnly, AccountPolicyAPIKeyOnly, AccountPolicyStartPlanFirst, AccountPolicyDisabled:
+		return true
+	}
+	return false
+}
+
+// Quota states a credential's quota snapshot can be in. A query error is never
+// reported as exhausted, because "the probe failed" and "there is nothing left"
+// call for different remedies.
+const (
+	QuotaStateUnknown     = "unknown"
+	QuotaStateProbing     = "probing"
+	QuotaStateEntitled    = "entitled"
+	QuotaStateNotEntitled = "not-entitled"
+	QuotaStateExhausted   = "exhausted"
+	QuotaStateQueryError  = "query-error"
+)
+
 // QuotaBucket describes a single quota window or limit bucket.
 type QuotaBucket struct {
+	// Model is the model this bucket applies to. Empty means the bucket is not
+	// model-scoped.
+	Model string `json:"model,omitempty"`
+	// Window names the bucket's limit window (for example "hourly" or "plan").
 	Window            string  `json:"window,omitempty"`
 	RemainingFraction float64 `json:"remainingFraction"`
-	ResetTime         string  `json:"resetTime,omitempty"`
-	Description       string  `json:"description,omitempty"`
+	// Remaining and Total are absolute amounts when the provider reports them.
+	// Both are nil when the provider only reports a fraction, so an absent
+	// amount stays distinguishable from an amount that really is zero.
+	Remaining   *float64 `json:"remaining,omitempty"`
+	Total       *float64 `json:"total,omitempty"`
+	ResetTime   string   `json:"resetTime,omitempty"`
+	Description string   `json:"description,omitempty"`
 }
 
 // UnmarshalJSON supports both camelCase and snake_case field names.
@@ -2019,6 +2069,10 @@ type QuotaFetchResponse struct {
 	Summary            []QuotaMetric      `json:"summary,omitempty"`
 	ServerTimeOffsetMs int64              `json:"serverTimeOffsetMs,omitempty"`
 	Groups             []QuotaGroup       `json:"groups,omitempty"`
+	// FetchedAt is the RFC3339 time the host recorded this snapshot. The host
+	// stamps it so an expired reading cannot pass for a live balance; plugins
+	// leave it empty.
+	FetchedAt string `json:"fetchedAt,omitempty"`
 }
 
 // UnmarshalJSON supports both camelCase and snake_case field names.
@@ -2026,7 +2080,8 @@ func (r *QuotaFetchResponse) UnmarshalJSON(data []byte) error {
 	type Alias QuotaFetchResponse
 	aux := struct {
 		*Alias
-		AltServerTimeOffsetMs int64 `json:"server_time_offset_ms"`
+		AltServerTimeOffsetMs int64  `json:"server_time_offset_ms"`
+		AltFetchedAt          string `json:"fetched_at"`
 	}{
 		Alias: (*Alias)(r),
 	}
@@ -2035,6 +2090,9 @@ func (r *QuotaFetchResponse) UnmarshalJSON(data []byte) error {
 	}
 	if r.ServerTimeOffsetMs == 0 && aux.AltServerTimeOffsetMs != 0 {
 		r.ServerTimeOffsetMs = aux.AltServerTimeOffsetMs
+	}
+	if r.FetchedAt == "" && aux.AltFetchedAt != "" {
+		r.FetchedAt = aux.AltFetchedAt
 	}
 	return nil
 }

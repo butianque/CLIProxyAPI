@@ -93,6 +93,8 @@ type Host struct {
 	httpOperations         *hostHTTPOperationBridge
 	modelStreams           *modelStreamBridge
 	callbackContexts       *callbackContextRegistry
+	quotaMu                sync.Mutex
+	quotaSnapshots         map[string]quotaSnapshotRecord
 	snapshot               atomic.Value
 }
 
@@ -126,6 +128,7 @@ func New() *Host {
 		httpOperations:         newHostHTTPOperationBridge(),
 		modelStreams:           newModelStreamBridge(),
 		callbackContexts:       newCallbackContextRegistry(),
+		quotaSnapshots:         make(map[string]quotaSnapshotRecord),
 	}
 	h.snapshot.Store(emptySnapshot())
 	return h
