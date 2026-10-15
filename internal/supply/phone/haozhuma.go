@@ -3,6 +3,7 @@ package phone
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +13,34 @@ import (
 	"sync"
 	"time"
 )
+
+// ErrEndpoint reports that a configured address is not a usable http(s) URL.
+// It is a configuration error rather than a credential one: an address was
+// supplied, but it cannot be reached as written.
+var ErrEndpoint = errors.New("sms: provider endpoint invalid")
+
+// normalizeEndpoint trims a configured base address and gives it an explicit
+// scheme when the operator left it out, so "api.haozhuma.com" is reached as
+// "https://api.haozhuma.com" instead of failing later as a scheme-less URL. An
+// explicit http:// is kept: the choice is the operator's.
+//
+// An empty value returns "" with no error, so the caller can apply its own
+// default. A non-empty value that is not an http(s) URL with a host is rejected
+// here, while the configuration is being read, rather than at request time.
+func normalizeEndpoint(value string) (string, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return "", nil
+	}
+	if !strings.Contains(trimmed, "://") {
+		trimmed = "https://" + trimmed
+	}
+	parsed, errParse := url.Parse(trimmed)
+	if errParse != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return "", fmt.Errorf("%w: %q is not an http(s) address", ErrEndpoint, strings.TrimSpace(value))
+	}
+	return strings.TrimRight(trimmed, "/"), nil
+}
 
 // haozhumaDefaultEndpoint is the SMS API host. The vendor publishes three
 // equivalent hosts (api.haozhuma.cn, api.haozhuma.com and api.haozhuyun.com)
@@ -102,7 +131,10 @@ func NewHaozhuma(secret HaozhumaSecret, client *http.Client) (*Haozhuma, error) 
 	if secret.Token == "" && (secret.User == "" || secret.Pass == "") {
 		return nil, fmt.Errorf("%w: haozhuma needs a token, or a user and password to fetch one", ErrCredential)
 	}
-	endpoint := strings.TrimRight(strings.TrimSpace(secret.Endpoint), "/")
+	endpoint, errEndpoint := normalizeEndpoint(secret.Endpoint)
+	if errEndpoint != nil {
+		return nil, errEndpoint
+	}
 	if endpoint == "" {
 		endpoint = haozhumaDefaultEndpoint
 	}

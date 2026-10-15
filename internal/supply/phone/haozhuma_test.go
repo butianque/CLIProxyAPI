@@ -181,6 +181,80 @@ func TestBalanceParsesSummary(t *testing.T) {
 	}
 }
 
+// A base address written without a scheme is completed to https, so an operator
+// who pastes "api.haozhuma.com" reaches the API instead of failing later on a
+// scheme-less URL. An explicit scheme is respected, and a blank address still
+// falls back to the platform default.
+func TestNewHaozhumaNormalizesEndpoint(t *testing.T) {
+	cases := []struct {
+		name     string
+		endpoint string
+		want     string
+	}{
+		{name: "no scheme", endpoint: "api.haozhuma.com", want: "https://api.haozhuma.com"},
+		{name: "no scheme with trailing slash", endpoint: "api.haozhuma.com/", want: "https://api.haozhuma.com"},
+		{name: "trailing slash is trimmed", endpoint: "https://api.haozhuma.com/", want: "https://api.haozhuma.com"},
+		{name: "blank falls back to the default", endpoint: "   ", want: haozhumaDefaultEndpoint},
+		{name: "explicit http is kept", endpoint: "http://api.haozhuma.com", want: "http://api.haozhuma.com"},
+		{name: "port is kept", endpoint: "api.haozhuma.com:8443", want: "https://api.haozhuma.com:8443"},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			provider, errProvider := NewHaozhuma(HaozhumaSecret{Token: "t", Endpoint: testCase.endpoint}, nil)
+			if errProvider != nil {
+				t.Fatalf("NewHaozhuma(%q): %v", testCase.endpoint, errProvider)
+			}
+			if got := provider.Endpoint(); got != testCase.want {
+				t.Fatalf("Endpoint() for %q = %q, want %q", testCase.endpoint, got, testCase.want)
+			}
+		})
+	}
+}
+
+// An address that is not an http(s) URL is rejected while the credential is
+// read, rather than surfacing later as a failed request.
+func TestNewHaozhumaRejectsInvalidEndpoint(t *testing.T) {
+	for _, endpoint := range []string{"://bad", "ht tp://x", "ftp://x", "https://"} {
+		t.Run(endpoint, func(t *testing.T) {
+			provider, errProvider := NewHaozhuma(HaozhumaSecret{Token: "t", Endpoint: endpoint}, nil)
+			if provider != nil {
+				t.Fatalf("NewHaozhuma(%q) returned a provider", endpoint)
+			}
+			if !errors.Is(errProvider, ErrEndpoint) {
+				t.Fatalf("err = %v, want ErrEndpoint", errProvider)
+			}
+		})
+	}
+}
+
+// The web host is completed the same way as the API endpoint, so a scheme-less
+// web_base still reaches the web surface.
+func TestWebBaseNormalizesWebBase(t *testing.T) {
+	cases := []struct {
+		name    string
+		webBase string
+		want    string
+	}{
+		{name: "no scheme", webBase: "h5.haozhuma.com", want: "https://h5.haozhuma.com"},
+		{name: "no scheme with trailing slash", webBase: "h5.haozhuma.com/", want: "https://h5.haozhuma.com"},
+		{name: "trailing slash is trimmed", webBase: "https://h5.haozhuma.com/", want: "https://h5.haozhuma.com"},
+		{name: "blank falls back to the default", webBase: "", want: haozhumaDefaultWebBase},
+		{name: "explicit http is kept", webBase: "http://h5.haozhuma.com", want: "http://h5.haozhuma.com"},
+		{name: "unusable falls back to the default", webBase: "://bad", want: haozhumaDefaultWebBase},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			provider, errProvider := NewHaozhuma(HaozhumaSecret{Token: "t", WebBase: testCase.webBase}, nil)
+			if errProvider != nil {
+				t.Fatalf("NewHaozhuma(web_base=%q): %v", testCase.webBase, errProvider)
+			}
+			if got := provider.webBase(); got != testCase.want {
+				t.Fatalf("webBase() for %q = %q, want %q", testCase.webBase, got, testCase.want)
+			}
+		})
+	}
+}
+
 // MaskIdentifier keeps a recognisable but non-revealing label for the panel.
 //
 // The fixtures are made-up values, not real credentials: the point is the shape

@@ -26,11 +26,17 @@ import (
 const haozhumaDefaultWebBase = "https://h5.haozhuma.com"
 
 // webBase resolves the web host.
+//
+// A web_base written without a scheme is completed the same way the API
+// endpoint is, so "h5.haozhuma.com" reaches the web surface instead of failing
+// as a scheme-less URL. An address that cannot be used at all falls back to the
+// platform host, which is the host this surface would use anyway.
 func (h *Haozhuma) webBase() string {
-	if base := strings.TrimRight(strings.TrimSpace(h.secret.WebBase), "/"); base != "" {
-		return base
+	base, errBase := normalizeEndpoint(h.secret.WebBase)
+	if errBase != nil || base == "" {
+		return haozhumaDefaultWebBase
 	}
-	return haozhumaDefaultWebBase
+	return base
 }
 
 // Channels lists the channels this account has joined, ordered cheapest first.

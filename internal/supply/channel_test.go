@@ -3,6 +3,7 @@ package supply
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -165,6 +166,70 @@ func TestChannelNormalizeCategoryDefault(t *testing.T) {
 	}
 	if got.Category != "third-party" {
 		t.Errorf("category = %q, want third-party", got.Category)
+	}
+}
+
+// A connection address written without a scheme is completed to https when the
+// channel is written, so the stored value is a URL that can actually be used.
+// An explicit scheme is respected and a blank address stays blank.
+func TestChannelNormalizeConnectionEndpoint(t *testing.T) {
+	cases := []struct {
+		name     string
+		endpoint string
+		want     string
+	}{
+		{name: "no scheme", endpoint: "api.haozhuma.com", want: "https://api.haozhuma.com"},
+		{name: "no scheme with trailing slash", endpoint: "api.haozhuma.com/", want: "https://api.haozhuma.com"},
+		{name: "trailing slash is trimmed", endpoint: "https://api.haozhuma.com/", want: "https://api.haozhuma.com"},
+		{name: "explicit http is kept", endpoint: "http://api.haozhuma.com", want: "http://api.haozhuma.com"},
+		{name: "blank stays blank", endpoint: "   ", want: ""},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			c := Channel{
+				Label: "Haozhuma",
+				Phone: &KindConfig{
+					Enabled: true,
+					Natures: []Nature{NatureAPI},
+					Connections: map[Nature]Connection{
+						NatureAPI: {Endpoint: testCase.endpoint, Secret: "s"},
+					},
+				},
+			}
+			got, err := c.Normalize()
+			if err != nil {
+				t.Fatalf("normalize failed for %q: %v", testCase.endpoint, err)
+			}
+			if endpoint := got.Phone.Connections[NatureAPI].Endpoint; endpoint != testCase.want {
+				t.Fatalf("endpoint for %q = %q, want %q", testCase.endpoint, endpoint, testCase.want)
+			}
+		})
+	}
+}
+
+// An address that is not an http(s) URL is refused at write time, so the panel
+// answers 400 instead of the request failing later.
+func TestChannelNormalizeRejectsInvalidEndpoint(t *testing.T) {
+	for _, endpoint := range []string{"://bad", "ht tp://x", "ftp://x", "https://"} {
+		t.Run(endpoint, func(t *testing.T) {
+			c := Channel{
+				Label: "bad",
+				Phone: &KindConfig{
+					Enabled: true,
+					Natures: []Nature{NatureAPI},
+					Connections: map[Nature]Connection{
+						NatureAPI: {Endpoint: endpoint, Secret: "s"},
+					},
+				},
+			}
+			_, err := c.Normalize()
+			if err == nil {
+				t.Fatalf("expected %q to be rejected", endpoint)
+			}
+			if !strings.Contains(err.Error(), "endpoint") {
+				t.Fatalf("err = %v, want it to name the endpoint", err)
+			}
+		})
 	}
 }
 

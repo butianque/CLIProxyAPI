@@ -3,6 +3,7 @@ package supply
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -128,6 +129,30 @@ func (c Channel) KindConfigFor(kind Kind) *KindConfig {
 	return nil
 }
 
+// normalizeEndpoint trims a connection address and gives it an explicit scheme
+// when it was written without one, so "api.haozhuma.com" is stored as
+// "https://api.haozhuma.com" instead of failing at request time as a
+// scheme-less URL. An explicit http:// is kept: the choice is the operator's.
+//
+// An empty address is left empty, so a nature that needs none is unaffected. A
+// non-empty address must be an http(s) URL with a host; anything else is
+// rejected here, which is what makes the write answer 400 rather than the
+// request path failing later.
+func normalizeEndpoint(value string) (string, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return "", nil
+	}
+	if !strings.Contains(trimmed, "://") {
+		trimmed = "https://" + trimmed
+	}
+	parsed, errParse := url.Parse(trimmed)
+	if errParse != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return "", fmt.Errorf("supply: endpoint %q is not an http(s) address", strings.TrimSpace(value))
+	}
+	return strings.TrimRight(trimmed, "/"), nil
+}
+
 // normalizeConnection trims text fields and validates IMAP-specific rules.
 func normalizeConnection(nature Nature, conn Connection) (Connection, error) {
 	conn.Endpoint = strings.TrimSpace(conn.Endpoint)
@@ -135,6 +160,11 @@ func normalizeConnection(nature Nature, conn Connection) (Connection, error) {
 	conn.Secret = strings.TrimSpace(conn.Secret)
 	conn.Usage = strings.TrimSpace(conn.Usage)
 	conn.Domain = strings.TrimSpace(conn.Domain)
+	endpoint, errEndpoint := normalizeEndpoint(conn.Endpoint)
+	if errEndpoint != nil {
+		return Connection{}, errEndpoint
+	}
+	conn.Endpoint = endpoint
 	if nature != NatureIMAP {
 		conn.Usage = ""
 		conn.Domain = ""
