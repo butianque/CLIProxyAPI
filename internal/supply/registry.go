@@ -31,7 +31,7 @@ type Provider interface {
 	// Read reads one identity's inbox once.
 	Read(ctx context.Context, purpose, address string) (Message, error)
 	// Link associates an identity with the platform and the account it
-	// registered. Providers without a ledger may treat it as a no-op.
+	// registered. Providers without a pool may treat it as a no-op.
 	Link(ctx context.Context, address, target, account, authIndex string) error
 	// Release returns an identity to its source when the kind has a pool.
 	Release(ctx context.Context, address, outcome string) error
@@ -54,13 +54,13 @@ type KindLookup interface {
 type Registry struct {
 	mu        sync.RWMutex
 	providers map[Kind]Provider
-	ledger    *Ledger
+	pool      *Pool
 }
 
-// LedgerProvider exposes a supply service's cross-kind identity ledger.
-type LedgerProvider interface {
-	// Ledger returns the identity ledger, or nil when none is kept.
-	Ledger() *Ledger
+// PoolProvider exposes a supply service's cross-kind identity pool.
+type PoolProvider interface {
+	// Pool returns the identity pool, or nil when none is kept.
+	Pool() *Pool
 }
 
 // NewRegistry returns an empty registry.
@@ -68,23 +68,23 @@ func NewRegistry() *Registry {
 	return &Registry{providers: map[Kind]Provider{}}
 }
 
-// SetLedger installs the identity ledger shared by every kind.
+// SetPool installs the identity pool shared by every kind.
 //
-// The ledger is owned here, not by a provider, because it is cross-kind: one
+// The pool is owned here, not by a provider, because it is cross-kind: one
 // in-memory document backing one file is what lets a phone number and an email
-// address be read as a single list. A per-provider ledger would give each kind
+// address be read as a single list. A per-provider pool would give each kind
 // its own copy of the same file and let them drift apart.
-func (r *Registry) SetLedger(ledger *Ledger) {
+func (r *Registry) SetPool(pool *Pool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.ledger = ledger
+	r.pool = pool
 }
 
-// Ledger returns the shared identity ledger, or nil when none is installed.
-func (r *Registry) Ledger() *Ledger {
+// Pool returns the shared identity pool, or nil when none is installed.
+func (r *Registry) Pool() *Pool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.ledger
+	return r.pool
 }
 
 // Register installs the provider for its kind, replacing any previous one.
@@ -190,5 +190,5 @@ var _ Supply = (*Registry)(nil)
 // Registry implements KindLookup.
 var _ KindLookup = (*Registry)(nil)
 
-// Registry implements LedgerProvider.
-var _ LedgerProvider = (*Registry)(nil)
+// Registry implements PoolProvider.
+var _ PoolProvider = (*Registry)(nil)

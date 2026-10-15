@@ -292,7 +292,7 @@ type PprofConfig struct {
 // Credentials are never held here: they live in the host secret store, named by
 // Phone.APISecret / Phone.CookieSecret and read through host.secret.*.
 type SupplyConfig struct {
-	// StorageDir is where supply state documents live (the phone ledger and the
+	// StorageDir is where supply state documents live (the phone pool and the
 	// channel cache). Empty means "<config dir>/supply".
 	StorageDir string `yaml:"storage-dir" json:"storage-dir"`
 

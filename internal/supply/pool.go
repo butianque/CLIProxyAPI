@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-// The ledger is the host's record of every identity it has handed out and of the
+// The pool is the host's record of every identity it has handed out and of the
 // account each one registered. It is deliberately cross-kind: a phone number and
 // an email address are both "an identity that registered an account", and the
 // question a caller asks — which identity is behind this credential, and where
@@ -19,7 +19,7 @@ import (
 // channel, an email domain) goes in Meta, so adding a kind never changes this
 // shape. That is the same rule the host.supply.grab wire contract follows.
 
-// Record is one identity's history in the ledger.
+// Record is one identity's history in the pool.
 type Record struct {
 	// Kind and Address identify the identity; together they are the key.
 	Kind    Kind   `json:"kind"`
@@ -95,28 +95,30 @@ func (r Record) MetaBool(key string) bool {
 	return ok && flag
 }
 
-// Ledger is the cross-kind identity ledger.
-type Ledger struct {
+// Pool is the cross-kind identity pool.
+type Pool struct {
 	Version int      `json:"version"`
 	Records []Record `json:"records,omitempty"`
-	// SpendCNY is the running total spent through this ledger.
+	// SpendCNY is the running total spent through this pool.
 	SpendCNY float64 `json:"spend_cny,omitempty"`
 }
 
-// ledgerVersion is the on-disk schema version.
-const ledgerVersion = 1
+// poolVersion is the on-disk schema version.
+const poolVersion = 1
 
-// NewLedger returns an empty ledger.
-func NewLedger() *Ledger { return &Ledger{Version: ledgerVersion} }
+// NewPool returns an empty pool.
+func NewPool() *Pool { return &Pool{Version: poolVersion} }
 
-// LedgerPath is where the ledger lives inside a supply state directory.
+// PoolPath is where the pool lives inside a supply state directory.
 //
-// It is one file for every kind: the ledger's whole point is a single view, and
-// a per-kind file would put the join back on the reader.
-func LedgerPath(dir string) string { return filepath.Join(dir, "ledger.json") }
+// The legacy filename is intentionally retained as the on-disk format boundary
+// so upgrading does not strand existing supply history. It is one file for
+// every kind: the pool's whole point is a single view, and a per-kind file
+// would put the join back on the reader.
+func PoolPath(dir string) string { return filepath.Join(dir, "ledger.json") }
 
 // find returns the index of one identity's record, or -1.
-func (l *Ledger) find(kind Kind, address string) int {
+func (l *Pool) find(kind Kind, address string) int {
 	address = strings.TrimSpace(address)
 	for i := range l.Records {
 		if l.Records[i].Kind == kind && l.Records[i].Address == address {
@@ -127,15 +129,15 @@ func (l *Ledger) find(kind Kind, address string) int {
 }
 
 // Knows reports whether an identity has ever been handed out through this
-// ledger. A caller uses it to tell an identity it can re-occupy from one it has
+// pool. A caller uses it to tell an identity it can re-occupy from one it has
 // never seen.
-func (l *Ledger) Knows(kind Kind, address string) bool {
+func (l *Pool) Knows(kind Kind, address string) bool {
 	_, ok := l.Get(kind, address)
 	return ok
 }
 
 // Get returns the record for one identity.
-func (l *Ledger) Get(kind Kind, address string) (Record, bool) {
+func (l *Pool) Get(kind Kind, address string) (Record, bool) {
 	if i := l.find(kind, address); i >= 0 {
 		return l.Records[i], true
 	}
@@ -143,7 +145,7 @@ func (l *Ledger) Get(kind Kind, address string) (Record, bool) {
 }
 
 // All returns a copy of every record, for callers that need to scan them.
-func (l *Ledger) All() []Record {
+func (l *Pool) All() []Record {
 	out := make([]Record, len(l.Records))
 	copy(out, l.Records)
 	return out
@@ -154,9 +156,9 @@ func (l *Ledger) All() []Record {
 // meta carries the kind-specific details; the core fields are set from the
 // arguments. Re-recording an identity accumulates its rent count and spend
 // rather than duplicating it.
-func (l *Ledger) Record(kind Kind, address, source string, price float64, meta map[string]any, now int64) Record {
+func (l *Pool) Record(kind Kind, address, source string, price float64, meta map[string]any, now int64) Record {
 	if l.Version == 0 {
-		l.Version = ledgerVersion
+		l.Version = poolVersion
 	}
 	address = strings.TrimSpace(address)
 	i := l.find(kind, address)
@@ -199,7 +201,7 @@ func (l *Ledger) Record(kind Kind, address, source string, price float64, meta m
 
 // Link binds an identity to the account it registered, and to the platform it
 // registered on. It is the step that makes a record traceable: before it, the
-// ledger knows an identity was handed out; after it, the ledger knows which
+// pool knows an identity was handed out; after it, the pool knows which
 // account and which platform it belongs to.
 //
 // It records the outcome and state of a successful registration, overwriting
@@ -207,7 +209,7 @@ func (l *Ledger) Record(kind Kind, address, source string, price float64, meta m
 // definitive success, so a record that was marked timed-out or released by an
 // earlier attempt must not keep saying so once an account is bound to it: the
 // identity is held by that account now.
-func (l *Ledger) Link(kind Kind, address, target, account, authIndex string, now int64) {
+func (l *Pool) Link(kind Kind, address, target, account, authIndex string, now int64) {
 	i := l.find(kind, address)
 	if i < 0 {
 		return
@@ -230,7 +232,7 @@ func (l *Ledger) Link(kind Kind, address, target, account, authIndex string, now
 // Mark records what last happened to an identity and where it now stands.
 // Empty values leave the existing one in place, so a caller can update one
 // without clearing the other.
-func (l *Ledger) Mark(kind Kind, address, outcome, state string, now int64) {
+func (l *Pool) Mark(kind Kind, address, outcome, state string, now int64) {
 	i := l.find(kind, address)
 	if i < 0 {
 		return
@@ -251,8 +253,8 @@ func (l *Ledger) Mark(kind Kind, address, outcome, state string, now int64) {
 // was used, and credits the rental back, so counting that rental as spend would
 // overstate the running total and trip the cumulative ceiling early. Only ever
 // reverses what Record booked: the amount is capped at the record's own total
-// so a refund can never drive the ledger negative.
-func (l *Ledger) Refund(kind Kind, address string, amount float64, now int64) bool {
+// so a refund can never drive the pool negative.
+func (l *Pool) Refund(kind Kind, address string, amount float64, now int64) bool {
 	if amount <= 0 {
 		return false
 	}
@@ -277,10 +279,10 @@ func (l *Ledger) Refund(kind Kind, address string, amount float64, now int64) bo
 }
 
 // Spent returns the running total.
-func (l *Ledger) Spent() float64 { return l.SpendCNY }
+func (l *Pool) Spent() float64 { return l.SpendCNY }
 
 // ForAccount returns the records linked to one account.
-func (l *Ledger) ForAccount(account string) []Record {
+func (l *Pool) ForAccount(account string) []Record {
 	account = strings.TrimSpace(account)
 	out := make([]Record, 0, 1)
 	for _, record := range l.Records {
@@ -292,7 +294,7 @@ func (l *Ledger) ForAccount(account string) []Record {
 }
 
 // ForTarget returns the records linked to one platform.
-func (l *Ledger) ForTarget(target string) []Record {
+func (l *Pool) ForTarget(target string) []Record {
 	target = strings.TrimSpace(target)
 	out := make([]Record, 0, 1)
 	for _, record := range l.Records {
@@ -303,22 +305,22 @@ func (l *Ledger) ForTarget(target string) []Record {
 	return out
 }
 
-// LoadLedger reads the ledger; a missing file yields an empty one.
-func LoadLedger(path string) (*Ledger, error) {
-	ledger := NewLedger()
-	if errLoad := loadJSON(path, ledger); errLoad != nil {
-		return NewLedger(), errLoad
+// LoadPool reads the pool; a missing file yields an empty one.
+func LoadPool(path string) (*Pool, error) {
+	pool := NewPool()
+	if errLoad := loadJSON(path, pool); errLoad != nil {
+		return NewPool(), errLoad
 	}
-	if ledger.Version == 0 {
-		ledger.Version = ledgerVersion
+	if pool.Version == 0 {
+		pool.Version = poolVersion
 	}
-	return ledger, nil
+	return pool, nil
 }
 
-// Save writes the ledger.
-func (l *Ledger) Save(path string) error {
+// Save writes the pool.
+func (l *Pool) Save(path string) error {
 	if l.Version == 0 {
-		l.Version = ledgerVersion
+		l.Version = poolVersion
 	}
 	return saveJSON(path, l)
 }

@@ -61,8 +61,8 @@ func initSupply(cfg *config.Config, configPath string) {
 // installSupply (re)builds and installs the process-wide supply service.
 func installSupply(cfg *config.Config, configPath string) {
 	registry := supply.NewRegistry()
-	registry.SetLedger(loadSupplyLedger(cfg, configPath))
-	if provider, errPhone := buildPhoneProvider(cfg, configPath, registry.Ledger()); errPhone != nil {
+	registry.SetPool(loadSupplyPool(cfg, configPath))
+	if provider, errPhone := buildPhoneProvider(cfg, configPath, registry.Pool()); errPhone != nil {
 		log.Warnf("phone supply kind disabled: %v", errPhone)
 	} else if provider != nil {
 		if errRegister := registry.Register(provider); errRegister != nil {
@@ -82,20 +82,20 @@ func supplyStateDir(cfg *config.Config, configPath string) string {
 	return supply.StateDir(filepath.Dir(configPath), configured)
 }
 
-// loadSupplyLedger reads the cross-kind identity ledger.
+// loadSupplyPool reads the cross-kind identity pool.
 //
 // It is loaded here, once, and injected into the registry and every provider:
-// the ledger is one document shared by all kinds, so a provider that loaded its
+// the pool is one document shared by all kinds, so a provider that loaded its
 // own copy would drift from the others. A decode failure is reported but not
-// fatal — a corrupt ledger must not stop the server from starting, and the next
+// fatal — a corrupt pool must not stop the server from starting, and the next
 // write rewrites it.
-func loadSupplyLedger(cfg *config.Config, configPath string) *supply.Ledger {
-	ledger, errLoad := supply.LoadLedger(supply.LedgerPath(supplyStateDir(cfg, configPath)))
+func loadSupplyPool(cfg *config.Config, configPath string) *supply.Pool {
+	pool, errLoad := supply.LoadPool(supply.PoolPath(supplyStateDir(cfg, configPath)))
 	if errLoad != nil {
-		log.Warnf("supply ledger unreadable, starting empty: %v", errLoad)
-		return supply.NewLedger()
+		log.Warnf("supply pool unreadable, starting empty: %v", errLoad)
+		return supply.NewPool()
 	}
-	return ledger
+	return pool
 }
 
 // buildPhoneProvider assembles the phone provider from configuration and the
@@ -104,7 +104,7 @@ func loadSupplyLedger(cfg *config.Config, configPath string) *supply.Ledger {
 // It returns (nil, nil) when the kind is disabled or no platform credential is
 // stored, which is the not-configured state. A locked store is treated the same
 // way: the credential cannot be read, so the kind is not offered until unlock.
-func buildPhoneProvider(cfg *config.Config, configPath string, ledger *supply.Ledger) (*phone.ProviderImpl, error) {
+func buildPhoneProvider(cfg *config.Config, configPath string, pool *supply.Pool) (*phone.ProviderImpl, error) {
 	if cfg == nil {
 		return nil, nil
 	}
@@ -147,7 +147,7 @@ func buildPhoneProvider(cfg *config.Config, configPath string, ledger *supply.Le
 		Provider: supplyCfg.Phone.Provider,
 		Secret:   secret,
 		Store:    phone.Store{Dir: stateDir},
-		Ledger:   ledger,
+		Pool:     pool,
 		Budget: phone.Budget{
 			MaxPerNumberCNY: supplyCfg.Phone.MaxPerNumberCNY,
 			MaxTotalCNY:     supplyCfg.Phone.MaxTotalCNY,

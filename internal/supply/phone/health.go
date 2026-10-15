@@ -10,7 +10,7 @@ package phone
 // here and folded into the next choice, which is what turns "cheapest first"
 // into "cheapest that still works".
 //
-// The record is a companion to the phone ledger, not a replacement: the ledger
+// The record is a companion to the phone pool, not a replacement: the pool
 // remembers which number belongs to which account, while this remembers which
 // channel deserves the next attempt.
 
@@ -38,7 +38,7 @@ const (
 )
 
 // String names the outcome. It is used where the outcome is recorded outside the
-// health store, such as the ledger, so the value stays readable there.
+// health store, such as the pool, so the value stays readable there.
 func (o ChannelOutcome) String() string {
 	switch o {
 	case OutcomeDelivered:
@@ -95,7 +95,7 @@ func (s ChannelStat) SuccessRate() float64 {
 }
 
 // ChannelHealth is the store of per-channel records, persisted beside the
-// channel cache and the phone ledger.
+// channel cache and the phone pool.
 type ChannelHealth struct {
 	Version int                     `json:"version"`
 	Stats   map[string]*ChannelStat `json:"stats,omitempty"`

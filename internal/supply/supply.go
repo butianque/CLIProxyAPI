@@ -111,7 +111,7 @@ type Supply interface {
 	// so "no message yet" is not an error: it is reported as Ready=false.
 	Read(ctx context.Context, kind Kind, purpose, address string) (Message, error)
 	// Link associates an identity with the platform and the account it
-	// registered. Providers without a ledger may treat it as a no-op.
+	// registered. Providers without a pool may treat it as a no-op.
 	Link(ctx context.Context, kind Kind, address, target, account, authIndex string) error
 	// Release returns an identity to its source. For kinds without a pool
 	// (email domains, IMAP mailboxes) it is a no-op.

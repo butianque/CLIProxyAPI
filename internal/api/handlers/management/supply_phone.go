@@ -30,7 +30,7 @@ import (
 type phoneOps interface {
 	Balance(ctx context.Context) (float64, error)
 	Channels() *phone.ChannelCache
-	Ledger() *supply.Ledger
+	Pool() *supply.Pool
 	Health() *phone.ChannelHealth
 	RefreshChannels(ctx context.Context, join bool) (int, error)
 	Guardrail(ctx context.Context) (int, error)
@@ -66,7 +66,7 @@ func (h *Handler) supplyPhoneConfig() config.SupplyPhoneConfig {
 }
 
 // GetSupplyPhoneStatus reports the phone kind to the panel: whether it is
-// configured, the account balance, the cached channels and the phone ledger.
+// configured, the account balance, the cached channels and the phone pool.
 //
 // Every platform call here is read-only and free, so the panel can poll it.
 func (h *Handler) GetSupplyPhoneStatus(c *gin.Context) {
@@ -107,7 +107,7 @@ func (h *Handler) GetSupplyPhoneStatus(c *gin.Context) {
 		}
 	}
 
-	// The channel cache, ledger and health are plain documents on disk, not
+	// The channel cache, pool and health are plain documents on disk, not
 	// secrets, so they are reported whether or not the store is unlocked.
 	if provider != nil {
 		reportPhoneRecords(payload, provider, h.authIndexByName())
@@ -138,30 +138,30 @@ func (h *Handler) GetSupplyPhoneStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, payload)
 }
 
-// reportPhoneRecords adds the cached channels, the ledger and the channel
+// reportPhoneRecords adds the cached channels, the pool and the channel
 // health to a status payload. It reads only documents, never credentials.
 func reportPhoneRecords(payload gin.H, provider phoneOps, index map[string]string) {
 	if cache := provider.Channels(); cache != nil {
 		payload["channels"] = cache.Channels
 		payload["channels_updated_at"] = cache.UpdatedAt
 	}
-	if ledger := provider.Ledger(); ledger != nil {
-		payload["ledger"] = phoneRecords(ledger, index)
-		payload["spent_cny"] = ledger.Spent()
+	if pool := provider.Pool(); pool != nil {
+		payload["ledger"] = phoneRecords(pool, index)
+		payload["spent_cny"] = pool.Spent()
 	}
 	if health := provider.Health(); health != nil {
 		payload["channel_health"] = health.Stats
 	}
 }
 
-// phoneRecords renders the phone kind's slice of the cross-kind ledger for the
+// phoneRecords renders the phone kind's slice of the cross-kind pool for the
 // phone view. The record's kind-specific details live in Meta, so the channel a
 // number was rented from is read from there rather than from a phone-only field.
-func phoneRecords(ledger *supply.Ledger, index map[string]string) []gin.H {
-	if ledger == nil {
+func phoneRecords(pool *supply.Pool, index map[string]string) []gin.H {
+	if pool == nil {
 		return nil
 	}
-	records := ledger.All()
+	records := pool.All()
 	out := make([]gin.H, 0, len(records))
 	for _, record := range records {
 		if record.Kind != supply.KindPhone {

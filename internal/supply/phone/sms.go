@@ -268,14 +268,14 @@ func SortQuotes(quotes []Quote) {
 // Budget is the spend ceiling. Both limits are checked before a number is
 // rented, so the plugin can never spend past the operator's stated tolerance.
 type Budget struct {
-	// MaxTotalCNY caps the ledger's lifetime spend. 0 disables the cap.
+	// MaxTotalCNY caps the pool's lifetime spend. 0 disables the cap.
 	MaxTotalCNY float64
 	// MaxPerNumberCNY skips channels priced above this. 0 disables the cap.
 	MaxPerNumberCNY float64
 }
 
 // roundCNY rounds a CNY amount to the platform's three-decimal precision, so a
-// balance difference (which carries float noise) becomes a clean ledger price.
+// balance difference (which carries float noise) becomes a clean pool price.
 func roundCNY(value float64) float64 {
 	if value <= 0 {
 		return 0
@@ -357,7 +357,7 @@ func (c *ChannelCache) Save(path string) error {
 // -- location ----------------------------------------------------------------
 
 // Store owns the phone kind's on-disk state: the channel cache. The identity
-// ledger is deliberately not here — it is cross-kind and owned by
+// pool is deliberately not here — it is cross-kind and owned by
 // internal/supply, so a phone number and an email address land in the same file
 // and the management surface can read them as one list.
 //
@@ -386,8 +386,8 @@ func NewStore(authPath, override string) Store {
 // ChannelsPath is where the channel cache lives.
 func (s Store) ChannelsPath() string { return filepath.Join(s.Dir, "loomy-sms-channels.json") }
 
-// LedgerPath is where the cross-kind identity ledger lives.
-func (s Store) LedgerPath() string { return supply.LedgerPath(s.Dir) }
+// PoolPath is where the cross-kind identity pool lives.
+func (s Store) PoolPath() string { return supply.PoolPath(s.Dir) }
 
 // Load reads the channel cache, falling back to an empty one on a decode error.
 func (s Store) Load() *ChannelCache {
@@ -459,7 +459,7 @@ type ChannelStateSetter interface {
 	SetChannelOpen(ctx context.Context, action string, uids []string) ([]string, error)
 }
 
-// Service couples a platform to its channel cache and the ledger, and enforces
+// Service couples a platform to its channel cache and the pool, and enforces
 // the rent order: cheapest usable channel first.
 type Service struct {
 	Provider Provider
@@ -474,14 +474,14 @@ type Service struct {
 
 	mu       sync.Mutex
 	cache    *ChannelCache
-	ledger   *supply.Ledger
+	pool     *supply.Pool
 	health   *ChannelHealth
 	cooldown *CoolDown
 	loaded   bool
-	// shared is the cross-kind ledger owned by the supply registry. When set,
+	// shared is the cross-kind pool owned by the supply registry. When set,
 	// stateAll uses it instead of loading its own copy, so every kind reads and
 	// writes one document.
-	shared *supply.Ledger
+	shared *supply.Pool
 }
 
 // NewService builds a service over one provider.
@@ -495,25 +495,25 @@ func NewService(provider Provider, store Store, budget Budget) *Service {
 }
 
 // state lazily loads the on-disk documents once.
-func (s *Service) state() (*ChannelCache, *supply.Ledger) {
-	cache, ledger, _ := s.stateAll()
-	return cache, ledger
+func (s *Service) state() (*ChannelCache, *supply.Pool) {
+	cache, pool, _ := s.stateAll()
+	return cache, pool
 }
 
 // stateAll lazily loads every on-disk document once, health included.
-func (s *Service) stateAll() (*ChannelCache, *supply.Ledger, *ChannelHealth) {
+func (s *Service) stateAll() (*ChannelCache, *supply.Pool, *ChannelHealth) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.loaded {
 		s.cache = s.Store.Load()
 		if s.shared != nil {
-			s.ledger = s.shared
+			s.pool = s.shared
 		} else {
-			ledger, errLedger := supply.LoadLedger(s.Store.LedgerPath())
-			if errLedger != nil {
-				ledger = supply.NewLedger()
+			pool, errPool := supply.LoadPool(s.Store.PoolPath())
+			if errPool != nil {
+				pool = supply.NewPool()
 			}
-			s.ledger = ledger
+			s.pool = pool
 		}
 		health, errHealth := LoadChannelHealth(s.Store.HealthPath())
 		if errHealth != nil {
@@ -525,7 +525,7 @@ func (s *Service) stateAll() (*ChannelCache, *supply.Ledger, *ChannelHealth) {
 		}
 		s.loaded = true
 	}
-	return s.cache, s.ledger, s.health
+	return s.cache, s.pool, s.health
 }
 
 // Health returns the channel health store.
@@ -540,21 +540,21 @@ func (s *Service) Channels() *ChannelCache {
 	return cache
 }
 
-// Ledger returns the cross-kind identity ledger.
-func (s *Service) Ledger() *supply.Ledger {
-	_, ledger := s.state()
-	return ledger
+// Pool returns the cross-kind identity pool.
+func (s *Service) Pool() *supply.Pool {
+	_, pool := s.state()
+	return pool
 }
 
-// -- phone ledger views ------------------------------------------------------
+// -- phone pool views ------------------------------------------------------
 //
-// The ledger itself is cross-kind (internal/supply). These helpers read and
+// The pool itself is cross-kind (internal/supply). These helpers read and
 // write the phone kind's records, keeping the phone-specific details (channel,
 // carrier, region) in the record's Meta bag so the shared shape never grows a
 // field for one kind.
 
-// ledgerRecordMeta builds the Meta bag for one phone record.
-func ledgerRecordMeta(number Number) map[string]any {
+// poolRecordMeta builds the Meta bag for one phone record.
+func poolRecordMeta(number Number) map[string]any {
 	meta := map[string]any{}
 	if number.Code != "" {
 		meta["channel"] = number.Code
@@ -574,23 +574,23 @@ func ledgerRecordMeta(number Number) map[string]any {
 	return meta
 }
 
-// ledgerPhone returns one number's ledger record.
-func ledgerPhone(ledger *supply.Ledger, phone string) (supply.Record, bool) {
-	return ledger.Get(supply.KindPhone, phone)
+// poolPhone returns one number's pool record.
+func poolPhone(pool *supply.Pool, phone string) (supply.Record, bool) {
+	return pool.Get(supply.KindPhone, phone)
 }
 
-// ledgerChannel returns the channel a number was rented from, as recorded.
-func ledgerChannel(ledger *supply.Ledger, phone string) string {
-	record, ok := ledgerPhone(ledger, phone)
+// poolChannel returns the channel a number was rented from, as recorded.
+func poolChannel(pool *supply.Pool, phone string) string {
+	record, ok := poolPhone(pool, phone)
 	if !ok {
 		return ""
 	}
 	return record.MetaString("channel")
 }
 
-// ledgerMarkBlacklisted records a number we asked the platform to stop returning.
-func ledgerMarkBlacklisted(ledger *supply.Ledger, phone string, now int64) {
-	ledger.Mark(supply.KindPhone, phone, "blacklisted", "blacklisted", now)
+// poolMarkBlacklisted records a number we asked the platform to stop returning.
+func poolMarkBlacklisted(pool *supply.Pool, phone string, now int64) {
+	pool.Mark(supply.KindPhone, phone, "blacklisted", "blacklisted", now)
 }
 
 // ReplaceChannels installs a freshly read channel list and persists it.
@@ -678,11 +678,11 @@ func projectKeyword(cache *ChannelCache) string {
 // and narrows the platform's choice to channels at or below the ceiling; a
 // missing web session is not an error.
 func (s *Service) Acquire(ctx context.Context, project Project) (Number, supply.Record, error) {
-	cache, ledger, health := s.stateAll()
+	cache, pool, health := s.stateAll()
 
 	s.mu.Lock()
 	candidates := cache.Cheapest(s.Budget.MaxPerNumberCNY)
-	spent := ledger.Spent()
+	spent := pool.Spent()
 	cooling := s.cooldown.Active(nowUnix())
 	s.mu.Unlock()
 
@@ -718,7 +718,7 @@ func (s *Service) Acquire(ctx context.Context, project Project) (Number, supply.
 		}
 		// An unpinned rental has no list price, so the platform's own charge is
 		// unknown until it happens. Read the balance first and price the rental
-		// by the difference, so the ledger and the cumulative ceiling stay
+		// by the difference, so the pool and the cumulative ceiling stay
 		// truthful on the fallback path too.
 		var before float64
 		var errBefore error
@@ -922,17 +922,17 @@ func (s *Service) SetChannelOpen(ctx context.Context, action string, uids []stri
 	return setter.SetChannelOpen(ctx, action, uids)
 }
 
-// LedgerChannels returns the set of channels that hold a number this account has
+// PoolChannels returns the set of channels that hold a number this account has
 // used. It is the guard for pausing a channel: the platform refuses to re-issue
 // a number whose channel is paused, so pausing one of these would strand a
 // re-authentication (design 23 §3.4).
-func (s *Service) LedgerChannels() map[string]bool {
-	_, ledger := s.state()
+func (s *Service) PoolChannels() map[string]bool {
+	_, pool := s.state()
 	out := map[string]bool{}
-	if ledger == nil {
+	if pool == nil {
 		return out
 	}
-	for _, record := range ledger.All() {
+	for _, record := range pool.All() {
 		if record.Kind != supply.KindPhone {
 			continue
 		}
@@ -982,9 +982,9 @@ func (s *Service) RecordDelivery(uid string, price float64) {
 }
 
 // SuspendUnreliable pauses a channel that has failed too often, unless doing so
-// would strand a number already in the ledger.
+// would strand a number already in the pool.
 //
-// It returns whether the channel was paused. A channel holding a ledger number
+// It returns whether the channel was paused. A channel holding a pool number
 // is protected: the pause is skipped and the channel is left to the score, which
 // already demotes it. That is the R-PROTECT rule from design 23 §3.4 — the
 // protection is deliberate and one-sided, because a stranded number costs a full
@@ -994,8 +994,8 @@ func (s *Service) SuspendUnreliable(ctx context.Context, uid string) (bool, erro
 	if uid == "" {
 		return false, nil
 	}
-	if s.LedgerChannels()[uid] {
-		hostLogSafe(fmt.Sprintf("loomy sms: %s is unreliable but holds a ledger number; demoting only, not pausing", uid))
+	if s.PoolChannels()[uid] {
+		hostLogSafe(fmt.Sprintf("loomy sms: %s is unreliable but holds a pool number; demoting only, not pausing", uid))
 		return false, nil
 	}
 	if _, errPause := s.SetChannelOpen(ctx, "pause", []string{uid}); errPause != nil {
@@ -1065,7 +1065,7 @@ func (s *Service) GuardChannels(ctx context.Context, sid string) (int, error) {
 	// leave the account with nothing to rent from. Prefer the cheapest in-stock
 	// channel at or below the ceiling; if every channel is over the ceiling,
 	// keep the cheapest in-stock one anyway, so the account still works and the
-	// overrun is visible in the ledger rather than silently making it unusable.
+	// overrun is visible in the pool rather than silently making it unusable.
 	// A channel we paused for unreliability is preferred for this slot as a last
 	// resort, so its pause never leaves the account with nothing.
 	keep := ""
@@ -1179,13 +1179,13 @@ func (s *Service) joinedUIDs(ctx context.Context) (map[string]bool, error) {
 // Reacquire re-occupies one exact number, which is how a re-authentication gets
 // back onto the number an account registered with.
 func (s *Service) Reacquire(ctx context.Context, project Project, phone string) (Number, supply.Record, error) {
-	_, ledger := s.state()
+	_, pool := s.state()
 
 	price := 0.0
-	if record, ok := ledgerPhone(ledger, phone); ok && record.Price > 0 {
+	if record, ok := poolPhone(pool, phone); ok && record.Price > 0 {
 		price = record.Price
 	}
-	if errBudget := s.Budget.Allows(price, ledger.Spent()); errBudget != nil {
+	if errBudget := s.Budget.Allows(price, pool.Spent()); errBudget != nil {
 		return Number{}, supply.Record{}, errBudget
 	}
 	number, errRent := s.Provider.AcquirePhone(ctx, project, phone)
@@ -1195,21 +1195,21 @@ func (s *Service) Reacquire(ctx context.Context, project Project, phone string) 
 	return s.commitRental(number, price, project)
 }
 
-// commitRental folds one successful rental into the ledger and persists it.
+// commitRental folds one successful rental into the pool and persists it.
 func (s *Service) commitRental(number Number, price float64, project Project) (Number, supply.Record, error) {
 	if number.SID == "" {
 		number.SID = project.SID
 	}
 	now := time.Now().Unix()
-	_, ledger := s.state()
+	_, pool := s.state()
 	s.mu.Lock()
-	record := ledger.Record(supply.KindPhone, number.Phone, s.Provider.ID(), price, ledgerRecordMeta(number), now)
-	errSave := ledger.Save(s.Store.LedgerPath())
+	record := pool.Record(supply.KindPhone, number.Phone, s.Provider.ID(), price, poolRecordMeta(number), now)
+	errSave := pool.Save(s.Store.PoolPath())
 	s.mu.Unlock()
 	if errSave != nil {
 		// The number is already rented; a failed write must not lose it for the
 		// caller, so the error is reported alongside the record.
-		return number, record, fmt.Errorf("sms: rented %s but ledger write failed: %w", number.Phone, errSave)
+		return number, record, fmt.Errorf("sms: rented %s but pool write failed: %w", number.Phone, errSave)
 	}
 	return number, record, nil
 }
@@ -1229,14 +1229,14 @@ func (s *Service) Release(ctx context.Context, project Project, phone string) er
 //
 // The caller reaches this only when the rental produced nothing usable — the
 // message was never sent, or none arrived before the deadline — and the platform
-// credits such a rental back. Keeping its price in the ledger would overstate
+// credits such a rental back. Keeping its price in the pool would overstate
 // the running total, so the refund is folded in here, next to the release that
 // caused it.
 //
 // The outcome says which of the two it was, because they mean opposite things to
 // the channel: OutcomeTimeout is the channel's own failure and is counted against
 // it, while OutcomeReleased means no verdict was reached and must not be. The
-// channel is taken from the ledger record for the number.
+// channel is taken from the pool record for the number.
 func (s *Service) ReleaseUnused(ctx context.Context, project Project, phone string, price float64, outcome ChannelOutcome) error {
 	errRelease := s.Provider.Release(ctx, project, phone)
 	if errRelease != nil {
@@ -1245,18 +1245,18 @@ func (s *Service) ReleaseUnused(ctx context.Context, project Project, phone stri
 		// was never concluded.
 		return errRelease
 	}
-	_, ledger, health := s.stateAll()
+	_, pool, health := s.stateAll()
 	s.mu.Lock()
-	channel := ledgerChannel(ledger, phone)
-	refunded := ledger.Refund(supply.KindPhone, phone, price, nowUnix())
-	ledger.Mark(supply.KindPhone, phone, outcome.String(), "released", nowUnix())
+	channel := poolChannel(pool, phone)
+	refunded := pool.Refund(supply.KindPhone, phone, price, nowUnix())
+	pool.Mark(supply.KindPhone, phone, outcome.String(), "released", nowUnix())
 	if channel != "" {
 		health.Record(channel, outcome, price, nowUnix())
 		if outcome == OutcomeTimeout {
 			s.cooldown.Mark(channel, nowUnix(), s.CoolDownSeconds)
 		}
 	}
-	errSave := ledger.Save(s.Store.LedgerPath())
+	errSave := pool.Save(s.Store.PoolPath())
 	if channel != "" {
 		if errHealth := s.Store.SaveHealth(health); errHealth != nil && errSave == nil {
 			errSave = errHealth
@@ -1271,14 +1271,14 @@ func (s *Service) ReleaseUnused(ctx context.Context, project Project, phone stri
 
 // Blacklist stops the platform from handing this number back.
 func (s *Service) Blacklist(ctx context.Context, project Project, phone string) error {
-	_, ledger := s.state()
+	_, pool := s.state()
 	errBlacklist := s.Provider.Blacklist(ctx, project, phone)
 	if errBlacklist != nil {
 		return errBlacklist
 	}
 	s.mu.Lock()
-	ledgerMarkBlacklisted(ledger, phone, time.Now().Unix())
-	errSave := ledger.Save(s.Store.LedgerPath())
+	poolMarkBlacklisted(pool, phone, time.Now().Unix())
+	errSave := pool.Save(s.Store.PoolPath())
 	s.mu.Unlock()
 	return errSave
 }
@@ -1287,10 +1287,10 @@ func (s *Service) Blacklist(ctx context.Context, project Project, phone string) 
 // platform. The platform is the phone kind's target: the account it registered
 // was a Loomy account.
 func (s *Service) LinkAccount(phone, target, account, authIndex string) error {
-	_, ledger := s.state()
+	_, pool := s.state()
 	s.mu.Lock()
-	ledger.Link(supply.KindPhone, phone, target, account, authIndex, time.Now().Unix())
-	errSave := ledger.Save(s.Store.LedgerPath())
+	pool.Link(supply.KindPhone, phone, target, account, authIndex, time.Now().Unix())
+	errSave := pool.Save(s.Store.PoolPath())
 	s.mu.Unlock()
 	return errSave
 }

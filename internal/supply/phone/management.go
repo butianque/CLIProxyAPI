@@ -25,8 +25,8 @@ func (p *ProviderImpl) Balance(ctx context.Context) (float64, error) {
 // Channels returns the cached channel list.
 func (p *ProviderImpl) Channels() *ChannelCache { return p.service.Channels() }
 
-// Ledger returns the phone ledger.
-func (p *ProviderImpl) Ledger() *supply.Ledger { return p.service.Ledger() }
+// Pool returns the phone pool.
+func (p *ProviderImpl) Pool() *supply.Pool { return p.service.Pool() }
 
 // Health returns the channel health record.
 func (p *ProviderImpl) Health() *ChannelHealth { return p.service.Health() }

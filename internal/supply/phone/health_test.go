@@ -145,12 +145,12 @@ func TestReleaseUnusedTimeoutCountsAgainstChannel(t *testing.T) {
 // The reliability pause must never strand a number already used for an account:
 // the platform refuses to re-issue a number whose channel is paused, so such a
 // channel is demoted but left enabled.
-func TestSuspendUnreliableProtectsLedgerChannel(t *testing.T) {
+func TestSuspendUnreliableProtectsPoolChannel(t *testing.T) {
 	joiner := newFakeJoiner([]Quote{{UID: "21614-used", Price: 0.13, Stock: 4}})
 	joiner.joined["21614-used"] = true
 	service := newTestService(t, joiner, nil, Budget{})
 
-	// Rent once, so the ledger holds a number attributed to this channel.
+	// Rent once, so the pool holds a number attributed to this channel.
 	if _, _, errAcquire := service.Acquire(context.Background(), Project{SID: "21614"}); errAcquire != nil {
 		t.Fatalf("Acquire: %v", errAcquire)
 	}
@@ -160,14 +160,14 @@ func TestSuspendUnreliableProtectsLedgerChannel(t *testing.T) {
 		t.Fatalf("SuspendUnreliable: %v", errSuspend)
 	}
 	if paused {
-		t.Fatalf("a channel holding a ledger number must not be paused")
+		t.Fatalf("a channel holding a pool number must not be paused")
 	}
 	if joiner.paused["21614-used"] {
 		t.Fatalf("the channel reached the platform: %+v", joiner.paused)
 	}
 }
 
-// A channel with no number in the ledger is safe to pause once it has failed too
+// A channel with no number in the pool is safe to pause once it has failed too
 // often.
 func TestSuspendUnreliablePausesCleanChannel(t *testing.T) {
 	joiner := newFakeJoiner([]Quote{{UID: "21614-bad", Price: 0.13, Stock: 4}})

@@ -13,7 +13,7 @@
 //
 // The package keeps its original shape because that shape is what the platform
 // requires: a Provider talks to one platform, a Service layers the channel
-// cache, the phone ledger, the spend budget and the channel guardrail on top of
+// cache, the phone pool, the spend budget and the channel guardrail on top of
 // it, and a Store owns the two on-disk documents. Only stdlib is used, so the
 // move carries no dependency into the host.
 package phone
@@ -37,7 +37,7 @@ type Config struct {
 	// Secret is the already-decrypted platform credential. It is never logged
 	// and never leaves this package.
 	Secret HaozhumaSecret
-	// Store locates the channel cache and the phone ledger.
+	// Store locates the channel cache and the phone pool.
 	Store Store
 	// Budget caps spending.
 	Budget Budget
@@ -51,10 +51,10 @@ type Config struct {
 	// ones on every grab, so a blind rental can only land on an affordable
 	// channel. It is the host's equivalent of the plugin's sms_guardrail.
 	Guardrail bool
-	// Ledger is the cross-kind identity ledger, owned by the supply registry
+	// Pool is the cross-kind identity pool, owned by the supply registry
 	// and shared with every other kind. It is injected rather than loaded here
 	// so one in-memory document backs the one file.
-	Ledger *supply.Ledger
+	Pool *supply.Pool
 }
 
 // ProviderImpl is the base-side supply provider for the phone kind. It adapts
@@ -86,8 +86,8 @@ func New(cfg Config) (*ProviderImpl, error) {
 	}
 	service := NewService(platform, cfg.Store, cfg.Budget)
 	service.Strategy = cfg.Strategy
-	if cfg.Ledger != nil {
-		service.shared = cfg.Ledger
+	if cfg.Pool != nil {
+		service.shared = cfg.Pool
 	}
 	if cfg.CoolDownSeconds > 0 {
 		service.CoolDownSeconds = cfg.CoolDownSeconds
@@ -105,7 +105,7 @@ func New(cfg Config) (*ProviderImpl, error) {
 func (p *ProviderImpl) Kind() supply.Kind { return supply.KindPhone }
 
 // Service exposes the underlying platform service, so the management surface
-// can report the channel cache, the ledger and the guardrail state.
+// can report the channel cache, the pool and the guardrail state.
 func (p *ProviderImpl) Service() *Service { return p.service }
 
 // Status reports whether the platform credential resolved and the kind is
@@ -127,7 +127,7 @@ func (p *ProviderImpl) Status(context.Context) (supply.Status, error) {
 // ones. Both used to be the plugin's job before every login; they live here now
 // so a plugin only asks for a number.
 //
-// Re-occupying a named number is restricted to numbers the ledger already
+// Re-occupying a named number is restricted to numbers the pool already
 // recorded: an arbitrary number (the operator's own, say) belongs to the manual
 // login path, and asking the platform to hand back a number it never rented to
 // us would either fail or, worse, take somebody else's. That case is reported
@@ -138,7 +138,7 @@ func (p *ProviderImpl) Grab(ctx context.Context, opts supply.GrabOptions) (suppl
 		project.SID = strings.TrimSpace(opts.Purpose)
 	}
 	address := strings.TrimSpace(opts.Address)
-	if address != "" && !p.service.Ledger().Knows(supply.KindPhone, address) {
+	if address != "" && !p.service.Pool().Knows(supply.KindPhone, address) {
 		return supply.Identity{}, supply.ErrUnknownIdentity
 	}
 
@@ -234,10 +234,10 @@ func (p *ProviderImpl) recordDelivery(address string) {
 	if address == "" {
 		return
 	}
-	// Look the channel up first: if the ledger has no record yet there is
+	// Look the channel up first: if the pool has no record yet there is
 	// nothing to credit, and the flag must stay unset so a later poll can try
 	// again.
-	record, ok := p.service.Ledger().Get(supply.KindPhone, address)
+	record, ok := p.service.Pool().Get(supply.KindPhone, address)
 	if !ok || strings.TrimSpace(record.MetaString("channel")) == "" {
 		return
 	}
@@ -262,7 +262,7 @@ func (p *ProviderImpl) Link(_ context.Context, address, target, account, authInd
 // The outcome is recorded against the channel that produced the number. A
 // timeout is a real failure of that channel, so after the failure is recorded
 // the channel is suspended when it has failed enough times in a row — unless
-// it still holds a number in the ledger, in which case pausing it would block
+// it still holds a number in the pool, in which case pausing it would block
 // re-acquiring that number and the channel is only demoted by the score.
 func (p *ProviderImpl) Release(ctx context.Context, address, outcome string) error {
 	project := p.project
@@ -273,11 +273,11 @@ func (p *ProviderImpl) Release(ctx context.Context, address, outcome string) err
 	if strings.EqualFold(strings.TrimSpace(outcome), "timeout") {
 		channelOutcome = OutcomeTimeout
 	}
-	// The price and the channel are taken from the ledger, which recorded them
+	// The price and the channel are taken from the pool, which recorded them
 	// at rental time.
 	var price float64
 	var channel string
-	if record, ok := p.service.Ledger().Get(supply.KindPhone, address); ok {
+	if record, ok := p.service.Pool().Get(supply.KindPhone, address); ok {
 		price = record.Price
 		channel = strings.TrimSpace(record.MetaString("channel"))
 	}

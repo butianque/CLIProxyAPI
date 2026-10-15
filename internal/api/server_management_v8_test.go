@@ -94,6 +94,7 @@ func TestManagementV8IndependentContract(t *testing.T) {
 		"GET /v8/management/plugins/:id/quota", "POST /v8/management/plugins/:id/quota", "DELETE /v8/management/plugins/:id/quota",
 		"POST /v8/management/plugins/store/:id/install", "DELETE /v8/management/plugins/:id",
 		"GET /v8/management/supply/status",
+		"GET /v8/management/supply/pool",
 		"GET /v8/management/supply/channels", "POST /v8/management/supply/channels",
 		"DELETE /v8/management/supply/channels/:id",
 		"GET /v8/management/supply/phone/status",
@@ -132,6 +133,8 @@ func TestManagementV8IndependentContract(t *testing.T) {
 		request(route.method, route.path, "", http.StatusNotFound)
 	}
 	request(http.MethodPost, "/v8/management/oauth/providers/vertex/import", "", http.StatusNotFound)
+	request(http.MethodGet, "/v8/management/supply/ledger", "", http.StatusNotFound)
+	request(http.MethodGet, "/v8/management/supply/pool", "", http.StatusOK)
 	for _, tc := range []struct {
 		method, url, body string
 		status            int

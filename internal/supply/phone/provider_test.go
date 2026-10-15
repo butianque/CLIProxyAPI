@@ -31,7 +31,7 @@ func newHostPhoneProvider(t *testing.T, provider Provider, channels []Quote, bud
 	}
 }
 
-// A number the ledger never recorded must not be re-occupied: asking the
+// A number the pool never recorded must not be re-occupied: asking the
 // platform for it would either fail or take a number that was never ours. The
 // caller is told so distinctly, and no platform call is made.
 func TestGrabUnknownAddressIsRejectedWithoutRenting(t *testing.T) {
@@ -47,7 +47,7 @@ func TestGrabUnknownAddressIsRejectedWithoutRenting(t *testing.T) {
 	}
 }
 
-// A number the ledger recorded is re-occupied through the platform, and the
+// A number the pool recorded is re-occupied through the platform, and the
 // rental is attributed to that exact number.
 func TestGrabReacquiresKnownAddress(t *testing.T) {
 	provider := &fakeProvider{phone: "13800000000"}

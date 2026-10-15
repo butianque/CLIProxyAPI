@@ -8,22 +8,22 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/supply"
 )
 
-// This file is the cross-kind identity ledger's management surface. It answers
+// This file is the cross-kind identity pool's management surface. It answers
 // the one question the per-kind surfaces cannot: which identity is behind a
 // credential, and which platform did it register on.
 //
-// The ledger itself is written by the supply service (internal/supply); this
+// The pool itself is written by the supply service (internal/supply); this
 // surface only reads it. A record's auth_index is best-effort — it is derived
 // from the credential, which does not exist yet at the moment the record is
 // written — so when it is absent the reader resolves it from the account name
 // against the live credential list.
 
-// GetSupplyLedger reports every identity the host has handed out, across kinds.
+// GetSupplyPool reports every identity the host has handed out, across kinds.
 //
 // Optional filters: ?kind=phone|email and ?target=<platform>.
-func (h *Handler) GetSupplyLedger(c *gin.Context) {
-	ledger := supply.DefaultLedger()
-	if ledger == nil {
+func (h *Handler) GetSupplyPool(c *gin.Context) {
+	pool := supply.DefaultPool()
+	if pool == nil {
 		c.JSON(http.StatusOK, gin.H{"status": "ok", "enabled": false, "records": []any{}})
 		return
 	}
@@ -31,7 +31,7 @@ func (h *Handler) GetSupplyLedger(c *gin.Context) {
 	filterTarget := strings.TrimSpace(c.Query("target"))
 	index := h.authIndexByName()
 
-	records := ledger.All()
+	records := pool.All()
 	out := make([]gin.H, 0, len(records))
 	for _, record := range records {
 		if filterKind.Valid() && record.Kind != filterKind {
@@ -40,13 +40,13 @@ func (h *Handler) GetSupplyLedger(c *gin.Context) {
 		if filterTarget != "" && record.Target != filterTarget {
 			continue
 		}
-		out = append(out, ledgerRecordView(record, index))
+		out = append(out, poolRecordView(record, index))
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"status":    "ok",
 		"enabled":   true,
 		"records":   out,
-		"spent_cny": ledger.Spent(),
+		"spent_cny": pool.Spent(),
 	})
 }
 
@@ -72,8 +72,8 @@ func resolveAuthIndex(record supply.Record, index map[string]string) (string, bo
 	return found, true
 }
 
-// ledgerRecordView renders one record for the panel.
-func ledgerRecordView(record supply.Record, index map[string]string) gin.H {
+// poolRecordView renders one record for the panel.
+func poolRecordView(record supply.Record, index map[string]string) gin.H {
 	authIndex, resolved := resolveAuthIndex(record, index)
 	view := gin.H{
 		"kind":       string(record.Kind),
@@ -127,7 +127,7 @@ func (h *Handler) authIndexByName() map[string]string {
 }
 
 // normalizeCredentialName reduces a credential name to its comparable form: the
-// file name without its ".json" suffix, lower-cased. A ledger account is stored
+// file name without its ".json" suffix, lower-cased. A pool account is stored
 // without the suffix (it is the account name, not a file), so the suffix is
 // dropped before comparing.
 func normalizeCredentialName(name string) string {

@@ -73,10 +73,10 @@ func (s *Server) registerManagementV8Routes() {
 	v8.DELETE("/secrets/:name", s.mgmt.DeleteSecret)
 
 	v8.GET("/supply/status", s.mgmt.GetSupplyStatus)
-	// The cross-kind identity ledger: which identity is behind a credential,
+	// The cross-kind identity pool: which identity is behind a credential,
 	// and which platform it registered on. It is also the pool view: ?kind=
 	// narrows it to one kind's handed-out identities.
-	v8.GET("/supply/ledger", s.mgmt.GetSupplyLedger)
+	v8.GET("/supply/pool", s.mgmt.GetSupplyPool)
 
 	// The configured sources of identities. A channel is a label plus a nature
 	// plus the connection details that nature implies; the nature is what the

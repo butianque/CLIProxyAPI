@@ -188,7 +188,7 @@ func TestAcquireFallsBackToUnpinnedWhenCacheEmpty(t *testing.T) {
 		t.Fatalf("provider calls = %v, want one unpinned rental", provider.rented)
 	}
 	if entry.Address != "13800000006" {
-		t.Fatalf("ledger record = %+v, want the rented number recorded", entry)
+		t.Fatalf("pool record = %+v, want the rented number recorded", entry)
 	}
 }
 
@@ -210,7 +210,7 @@ func TestAcquireKeepsFreeChannel(t *testing.T) {
 	}
 }
 
-// An unpinned rental must be priced from the balance difference so the ledger
+// An unpinned rental must be priced from the balance difference so the pool
 // and the cumulative ceiling stay truthful when the channel list is empty.
 func TestAcquireUnpinnedPricesFromBalance(t *testing.T) {
 	provider := &fakeProvider{phone: "13800000008", balance: 3.19, rentCost: 0.33}
@@ -224,8 +224,8 @@ func TestAcquireUnpinnedPricesFromBalance(t *testing.T) {
 	if entry.Price != 0.33 {
 		t.Fatalf("entry price = %v, want 0.33 from the balance difference", entry.Price)
 	}
-	if spent := service.Ledger().Spent(); spent != 0.33 {
-		t.Fatalf("ledger spend = %v, want 0.33", spent)
+	if spent := service.Pool().Spent(); spent != 0.33 {
+		t.Fatalf("pool spend = %v, want 0.33", spent)
 	}
 }
 
@@ -245,8 +245,8 @@ func TestAcquirePinnedChannel(t *testing.T) {
 	}
 }
 
-// The ledger accumulates spend and links a number to the account it registered.
-func TestLedgerRecordsSpendAndAccount(t *testing.T) {
+// The pool accumulates spend and links a number to the account it registered.
+func TestPoolRecordsSpendAndAccount(t *testing.T) {
 	provider := &fakeProvider{phone: "13800000004"}
 	service := newTestService(t, provider, []Quote{
 		{UID: "21614-cheap", Price: 0.13, Stock: 4},
@@ -260,11 +260,11 @@ func TestLedgerRecordsSpendAndAccount(t *testing.T) {
 		t.Fatalf("LinkAccount: %v", errLink)
 	}
 
-	// A fresh service over the same directory must see the same ledger.
+	// A fresh service over the same directory must see the same pool.
 	reloaded := NewService(provider, service.Store, Budget{})
-	entry, ok := reloaded.Ledger().Get(supply.KindPhone, number.Phone)
+	entry, ok := reloaded.Pool().Get(supply.KindPhone, number.Phone)
 	if !ok {
-		t.Fatalf("ledger lost %s after reload", number.Phone)
+		t.Fatalf("pool lost %s after reload", number.Phone)
 	}
 	if entry.Account != "loomy-"+number.Phone || entry.AuthIndex != "idx-1" {
 		t.Fatalf("entry = %+v, want the linked account", entry)
@@ -272,10 +272,10 @@ func TestLedgerRecordsSpendAndAccount(t *testing.T) {
 	if entry.Target != "loomy" {
 		t.Fatalf("target = %q, want the platform the number registered on", entry.Target)
 	}
-	if reloaded.Ledger().Spent() != 0.13 {
-		t.Fatalf("spent = %v, want 0.13", reloaded.Ledger().Spent())
+	if reloaded.Pool().Spent() != 0.13 {
+		t.Fatalf("spent = %v, want 0.13", reloaded.Pool().Spent())
 	}
-	if got := reloaded.Ledger().ForAccount("loomy-" + number.Phone); len(got) != 1 {
+	if got := reloaded.Pool().ForAccount("loomy-" + number.Phone); len(got) != 1 {
 		t.Fatalf("ForAccount returned %d entries, want 1", len(got))
 	}
 }
@@ -292,18 +292,18 @@ func TestReleaseUnusedCreditsSpendBack(t *testing.T) {
 	if errAcquire != nil {
 		t.Fatalf("Acquire: %v", errAcquire)
 	}
-	if service.Ledger().Spent() != 0.13 {
-		t.Fatalf("spent after rent = %v, want 0.13", service.Ledger().Spent())
+	if service.Pool().Spent() != 0.13 {
+		t.Fatalf("spent after rent = %v, want 0.13", service.Pool().Spent())
 	}
 
 	if errRelease := service.ReleaseUnused(context.Background(), Project{SID: "21614"}, number.Phone, entry.Price, OutcomeReleased); errRelease != nil {
 		t.Fatalf("ReleaseUnused: %v", errRelease)
 	}
-	if got := service.Ledger().Spent(); got != 0 {
+	if got := service.Pool().Spent(); got != 0 {
 		t.Fatalf("spent after release = %v, want 0 (the rental was credited back)", got)
 	}
 	reloaded := NewService(provider, service.Store, Budget{})
-	if got := reloaded.Ledger().Spent(); got != 0 {
+	if got := reloaded.Pool().Spent(); got != 0 {
 		t.Fatalf("reloaded spent = %v, want 0", got)
 	}
 }
@@ -323,12 +323,12 @@ func TestReleaseUnusedSkipsRefundWhenReleaseFails(t *testing.T) {
 	if errRelease := service.ReleaseUnused(context.Background(), Project{SID: "21614"}, number.Phone, entry.Price, OutcomeReleased); errRelease == nil {
 		t.Fatalf("ReleaseUnused should report the failed release")
 	}
-	if got := service.Ledger().Spent(); got != 0.13 {
+	if got := service.Pool().Spent(); got != 0.13 {
 		t.Fatalf("spent = %v, want 0.13 (a failed release keeps the charge)", got)
 	}
 }
 
-// The channel cache is persisted and reloaded beside the ledger.
+// The channel cache is persisted and reloaded beside the pool.
 func TestChannelCachePersists(t *testing.T) {
 	provider := &fakeProvider{phone: "13800000005"}
 	service := newTestService(t, provider, []Quote{
@@ -341,9 +341,9 @@ func TestChannelCachePersists(t *testing.T) {
 	if len(cheapest) != 2 || cheapest[0].UID != "21614-a" {
 		t.Fatalf("reloaded cheapest = %+v, want 21614-a first", cheapest)
 	}
-	// The ledger is cross-kind now, so its file is the shared one rather than a
+	// The pool is cross-kind now, so its file is the shared one rather than a
 	// phone-only name.
-	if filepath.Base(reloaded.Store.LedgerPath()) != "ledger.json" {
-		t.Fatalf("ledger path = %s", reloaded.Store.LedgerPath())
+	if filepath.Base(reloaded.Store.PoolPath()) != "ledger.json" {
+		t.Fatalf("pool path = %s", reloaded.Store.PoolPath())
 	}
 }
