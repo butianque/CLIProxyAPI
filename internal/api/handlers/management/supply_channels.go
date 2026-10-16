@@ -151,11 +151,13 @@ func (h *Handler) PostSupplyChannel(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": errStore.Error()})
 		return
 	}
+	phone := toKindConfig(body.Phone)
+	h.stampPhoneCredentialNames(phone)
 	channel := supply.Channel{
 		ID:       body.ID,
 		Label:    body.Label,
 		Category: body.Category,
-		Phone:    toKindConfig(body.Phone),
+		Phone:    phone,
 		Email:    toKindConfig(body.Email),
 	}
 	saved, errSave := store.Upsert(channel, time.Now().Unix())
@@ -168,6 +170,45 @@ func (h *Handler) PostSupplyChannel(c *gin.Context) {
 		"status":  "ok",
 		"channel": channelView(saved, status.Names, status.Enabled),
 	})
+}
+
+// stampPhoneCredentialNames names the phone kind's single platform credential on
+// every nature a submitted phone block declares.
+//
+// The phone kind has exactly one platform credential per surface, and the
+// secret-store entry name holding it belongs to the configuration
+// (supply.phone.api-secret / supply.phone.cookie-secret), not to a channel. A
+// connection has to name it: the probe resolves a credential through the
+// connection's Secret, so a connection that leaves the name out is reported as
+// "credential not ready" even though the credential is stored and the channel is
+// otherwise configured.
+//
+// The panel cannot know these names, because they are configuration rather than
+// channel data, so the host stamps them here instead of letting the panel guess.
+// Only the Secret field is touched: endpoint, account, usage and domain stay
+// whatever the operator submitted.
+func (h *Handler) stampPhoneCredentialNames(kc *supply.KindConfig) {
+	if kc == nil {
+		return
+	}
+	if kc.Connections == nil {
+		kc.Connections = make(map[supply.Nature]supply.Connection, len(kc.Natures))
+	}
+	phoneCfg := h.supplyPhoneConfig()
+	for _, nature := range kc.Natures {
+		conn := kc.Connections[nature]
+		switch nature {
+		case supply.NatureAPI:
+			conn.Secret = phoneCfg.APISecret
+		case supply.NatureWeb:
+			conn.Secret = phoneCfg.CookieSecret
+		default:
+			// Another kind's nature, or one the base has no credential for:
+			// leave the connection exactly as submitted.
+			continue
+		}
+		kc.Connections[nature] = conn
+	}
 }
 
 // DeleteSupplyChannel removes one channel.

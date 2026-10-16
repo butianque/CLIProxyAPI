@@ -12,7 +12,9 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/secretstore"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/supply"
 )
 
 func setupChannelTest(t *testing.T) (*Handler, *gin.Engine) {
@@ -303,6 +305,105 @@ func TestSupplyChannelBothKinds(t *testing.T) {
 	if len(resp["channels"].([]any)) != 1 {
 		t.Error("email list should have 1")
 	}
+}
+
+// A phone connection that names no credential is stamped with the configured
+// platform credential name, and nothing else about the connection is rewritten.
+//
+// The phone kind has one platform credential per surface and its secret-store
+// name lives in configuration, so a channel that left it out used to be reported
+// by the probe as "no credential is named" while the credential was stored.
+func TestSupplyChannelStampsPhoneCredentialNames(t *testing.T) {
+	h, r := setupChannelTest(t)
+
+	id := createChannel(t, r, `{"label":"Phone","phone":{"enabled":true,"natures":["api","web"],"connections":{"api":{"endpoint":"https://api.example.com","account":"operator"},"web":{"endpoint":"https://web.example.com"}}}}`)
+	channel := storedChannel(t, h, id)
+	if channel.Phone == nil {
+		t.Fatal("the stored channel has no phone block")
+	}
+	if got := channel.Phone.Connections[supply.NatureAPI].Secret; got != "haozhuma" {
+		t.Fatalf("api secret = %q, want the configured name %q", got, "haozhuma")
+	}
+	if got := channel.Phone.Connections[supply.NatureWeb].Secret; got != "haozhuma-ck" {
+		t.Fatalf("web secret = %q, want the configured name %q", got, "haozhuma-ck")
+	}
+	// Only the secret is the host's: the rest of the connection is the
+	// operator's and must survive the stamp unchanged.
+	api := channel.Phone.Connections[supply.NatureAPI]
+	if api.Endpoint != "https://api.example.com" || api.Account != "operator" {
+		t.Fatalf("stamping rewrote the connection: endpoint=%q account=%q", api.Endpoint, api.Account)
+	}
+}
+
+// The email kind is not the phone kind: its connection carries its own
+// credential, so the stamp must not touch it.
+func TestSupplyChannelLeavesEmailConnectionsAlone(t *testing.T) {
+	h, r := setupChannelTest(t)
+
+	id := createChannel(t, r, `{"label":"Multi","phone":{"enabled":true,"natures":["api"],"connections":{"api":{}}},"email":{"enabled":true,"natures":["imap"],"connections":{"imap":{"account":"box@example.com","secret":"mail-key","usage":"self-domain","domain":"ormnes.com"}}}}`)
+	channel := storedChannel(t, h, id)
+	if channel.Email == nil {
+		t.Fatal("the stored channel has no email block")
+	}
+	imap := channel.Email.Connections[supply.NatureIMAP]
+	if imap.Secret != "mail-key" || imap.Account != "box@example.com" || imap.Usage != "self-domain" || imap.Domain != "ormnes.com" {
+		t.Fatalf("the email connection was rewritten: %+v", imap)
+	}
+}
+
+// The stamped name is the configured one, not the built-in default: an install
+// that names its phone credentials differently must get those names.
+func TestSupplyChannelStampsConfiguredCredentialNames(t *testing.T) {
+	h, r := setupChannelTestWithConfig(t, config.SupplyConfig{Phone: config.SupplyPhoneConfig{APISecret: "hz2", CookieSecret: "hz2-ck"}})
+
+	id := createChannel(t, r, `{"label":"Phone","phone":{"enabled":true,"natures":["api","web"],"connections":{"api":{},"web":{}}}}`)
+	channel := storedChannel(t, h, id)
+	if got := channel.Phone.Connections[supply.NatureAPI].Secret; got != "hz2" {
+		t.Fatalf("api secret = %q, want the configured %q", got, "hz2")
+	}
+	if got := channel.Phone.Connections[supply.NatureWeb].Secret; got != "hz2-ck" {
+		t.Fatalf("web secret = %q, want the configured %q", got, "hz2-ck")
+	}
+}
+
+// A declared nature with no connection entry at all still gets one, so the
+// nature names a credential instead of being saved as a nameless connection.
+func TestSupplyChannelStampsCredentialNamesWithoutConnections(t *testing.T) {
+	h, r := setupChannelTest(t)
+
+	id := createChannel(t, r, `{"label":"Phone","phone":{"enabled":true,"natures":["api"]}}`)
+	channel := storedChannel(t, h, id)
+	api, ok := channel.Phone.Connections[supply.NatureAPI]
+	if !ok {
+		t.Fatalf("api connection missing: %v", channel.Phone.Connections)
+	}
+	if api.Secret != "haozhuma" {
+		t.Fatalf("api secret = %q, want the configured name %q", api.Secret, "haozhuma")
+	}
+}
+
+// storedChannel re-reads one channel from the on-disk store, so a test asserts
+// what was persisted rather than what the response happened to echo.
+func storedChannel(t *testing.T, h *Handler, id string) supply.Channel {
+	t.Helper()
+	store, errStore := h.supplyChannels()
+	if errStore != nil {
+		t.Fatalf("load channels: %v", errStore)
+	}
+	channel, ok := store.Get(id)
+	if !ok {
+		t.Fatalf("channel %s is not on disk", id)
+	}
+	return channel
+}
+
+// setupChannelTestWithConfig is setupChannelTest with a supply section written,
+// so a test can drive the phone kind's configured credential names.
+func setupChannelTestWithConfig(t *testing.T, supplyCfg config.SupplyConfig) (*Handler, *gin.Engine) {
+	t.Helper()
+	h, r := setupChannelTest(t)
+	h.cfg = &config.Config{Supply: supplyCfg}
+	return h, r
 }
 
 func TestSupplyChannelRejectsInvalid(t *testing.T) {
