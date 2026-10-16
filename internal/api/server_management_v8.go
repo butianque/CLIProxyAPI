@@ -90,6 +90,9 @@ func (s *Server) registerManagementV8Routes() {
 	v8.GET("/supply/channels", s.mgmt.GetSupplyChannels)
 	v8.POST("/supply/channels", s.mgmt.PostSupplyChannel)
 	v8.DELETE("/supply/channels/:id", s.mgmt.DeleteSupplyChannel)
+	// The probe answers "is this channel actually reachable": one cheap
+	// authenticated call per declared nature, read-only and concurrent.
+	v8.POST("/supply/channels/probe", s.mgmt.PostSupplyChannelProbe)
 
 	// The phone kind's management surface. The panel drives the platform
 	// through these instead of reaching into the plugin.

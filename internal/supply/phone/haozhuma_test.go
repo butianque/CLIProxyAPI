@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ParseHaozhumaCookie accepts either the bare cookie the browser exposes or a
@@ -178,6 +179,146 @@ func TestBalanceParsesSummary(t *testing.T) {
 	}
 	if balance != 3.19 {
 		t.Fatalf("balance = %v, want 3.19", balance)
+	}
+}
+
+// A probe makes exactly one authenticated call and reports a short detail. It
+// must never return a credential value, and a failure it could not even attempt
+// (an absent credential) is ErrProbeUnready rather than a plain failure.
+func TestProbeAPIReportsBalance(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("api") != "getSummary" {
+			t.Errorf("api = %q, want getSummary", r.URL.Query().Get("api"))
+		}
+		_, _ = w.Write([]byte(`{"msg":null,"code":0,"money":"2.290","num":"100"}`))
+	}))
+	defer server.Close()
+
+	detail, errProbe := probeAPI(context.Background(), server.Client(), server.URL, `{"token":"fake-token"}`)
+	if errProbe != nil {
+		t.Fatalf("probeAPI: %v", errProbe)
+	}
+	if detail != "balance ¥2.29" {
+		t.Fatalf("detail = %q, want the balance", detail)
+	}
+	if strings.Contains(detail, "fake-token") {
+		t.Fatalf("detail %q leaked the credential", detail)
+	}
+}
+
+// The platform answering with a rejection is a plain failure, not "not ready":
+// the request was sent, so the caller must report the channel as offline.
+func TestProbeAPIPlatformRefusalIsNotUnready(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"code":-1,"msg":"token error"}`))
+	}))
+	defer server.Close()
+
+	if _, errProbe := probeAPI(context.Background(), server.Client(), server.URL, `{"token":"fake-token"}`); errProbe == nil {
+		t.Fatal("probeAPI: want an error for a refused token")
+	} else if errors.Is(errProbe, ErrProbeUnready) {
+		t.Fatalf("err = %v, want a plain failure (offline), not ErrProbeUnready", errProbe)
+	}
+}
+
+// A credential that cannot be used means nothing was sent anywhere: that is
+// "not ready", and the caller must not blame the platform for it.
+func TestProbeAPICredentialProblemsAreUnready(t *testing.T) {
+	cases := []struct {
+		name       string
+		endpoint   string
+		credential string
+	}{
+		{name: "empty credential", endpoint: "https://api.haozhuma.cn", credential: "   "},
+		{name: "not a json object", endpoint: "https://api.haozhuma.cn", credential: "not json"},
+		{name: "no token and no account", endpoint: "https://api.haozhuma.cn", credential: `{"cookie":"PHPSESSID=x"}`},
+		{name: "unusable endpoint", endpoint: "://bad", credential: `{"token":"t"}`},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			_, errProbe := probeAPI(context.Background(), nil, testCase.endpoint, testCase.credential)
+			if !errors.Is(errProbe, ErrProbeUnready) {
+				t.Fatalf("err = %v, want ErrProbeUnready", errProbe)
+			}
+		})
+	}
+}
+
+// The web probe authenticates with the session cookie alone: listing channels
+// never touches the SMS API, so a cookie-only channel is still probeable.
+func TestProbeWebReportsChannels(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if cookie := r.Header.Get("Cookie"); cookie != "PHPSESSID=abc" {
+			t.Errorf("cookie = %q, want the session cookie", cookie)
+		}
+		_, _ = w.Write([]byte(`{"code":200,"msg":"ok","data":[
+		  {"uid":"1-A","mc":"[1]A","yhj":"0.10","zxky":"可用数量:1","yyy":"电信|","hd":"190|","lxfs":"未留"},
+		  {"uid":"2-B","mc":"[2]B","yhj":"0.20","zxky":"可用数量:2","yyy":"移动|","hd":"186|","lxfs":"未留"}
+		]}`))
+	}))
+	defer server.Close()
+
+	detail, errProbe := probeWeb(context.Background(), server.Client(), server.URL, `{"cookie":"PHPSESSID=abc"}`)
+	if errProbe != nil {
+		t.Fatalf("probeWeb: %v", errProbe)
+	}
+	if detail != "2 channels" {
+		t.Fatalf("detail = %q, want the channel count", detail)
+	}
+}
+
+// A cookie secret that carries no cookie cannot be probed, and the endpoint the
+// credential names is what the probe calls.
+func TestProbeWebNeedsACookie(t *testing.T) {
+	if _, errProbe := probeWeb(context.Background(), nil, "", `{"token":"t"}`); !errors.Is(errProbe, ErrProbeUnready) {
+		t.Fatalf("err = %v, want ErrProbeUnready", errProbe)
+	}
+}
+
+// A transport failure reports the platform, not the credential. The API
+// authenticates with query parameters, so the raw error — which carries the
+// address it failed on — would hand the token to whoever reads the panel.
+func TestProbeAPITransportErrorHidesTheCredential(t *testing.T) {
+	const token = "sk-live-do-not-echo"
+	// Port 1 is reserved and never listening: connecting fails without a server.
+	_, errProbe := probeAPI(context.Background(), &http.Client{Timeout: time.Second}, "http://127.0.0.1:1", `{"token":"`+token+`"}`)
+	if errProbe == nil {
+		t.Fatal("probeAPI: want a transport failure")
+	}
+	if strings.Contains(errProbe.Error(), token) {
+		t.Fatalf("error %q leaked the credential", errProbe.Error())
+	}
+	if errors.Is(errProbe, ErrProbeUnready) {
+		t.Fatalf("err = %v, want a plain failure (offline), not ErrProbeUnready", errProbe)
+	}
+}
+
+// The platform's own text can quote the request back — a proxy error page is the
+// usual way, and the client quotes the reply body when it is not the JSON
+// envelope it expects. The credential must not travel out on that path either.
+func TestProbeAPIPlatformEchoHidesTheCredential(t *testing.T) {
+	const token = "sk-live-do-not-echo"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A gateway reporting the address it refused: the token is in the query.
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("403 Forbidden: " + r.URL.String()))
+	}))
+	defer server.Close()
+
+	_, errProbe := probeAPI(context.Background(), server.Client(), server.URL, `{"token":"`+token+`"}`)
+	if errProbe == nil {
+		t.Fatal("probeAPI: want a failure for a refused request")
+	}
+	if strings.Contains(errProbe.Error(), token) {
+		t.Fatalf("error %q leaked the credential", errProbe.Error())
+	}
+	// The status proves the reply body was quoted into the error and then swept:
+	// without that, the test would pass just because nothing reached the server.
+	if !strings.Contains(errProbe.Error(), "403") {
+		t.Fatalf("error %q does not quote the refused reply", errProbe.Error())
+	}
+	if errors.Is(errProbe, ErrProbeUnready) {
+		t.Fatalf("err = %v, want a plain failure (offline), not ErrProbeUnready", errProbe)
 	}
 }
 

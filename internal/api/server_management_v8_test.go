@@ -98,6 +98,7 @@ func TestManagementV8IndependentContract(t *testing.T) {
 		"GET /v8/management/supply/pool",
 		"GET /v8/management/supply/channels", "POST /v8/management/supply/channels",
 		"DELETE /v8/management/supply/channels/:id",
+		"POST /v8/management/supply/channels/probe",
 		"GET /v8/management/supply/phone/status",
 		"POST /v8/management/supply/phone/refresh", "POST /v8/management/supply/phone/guardrail",
 		"POST /v8/management/supply/phone/channel", "POST /v8/management/supply/phone/api",
