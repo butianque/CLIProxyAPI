@@ -19,9 +19,9 @@ import (
 // guessing which layer owned each field. This surface answers that once, so a
 // field has exactly one source:
 //
-//	auth store    -> identity, parsed, enabled, auth_state
+//	auth store    -> identity, parsed, enabled, manually_disabled, auth_state
 //	supply pool   -> source_kind (which identity is behind the credential)
-//	auth metadata -> policy, manually_disabled
+//	auth metadata -> policy
 //	quota cache   -> quota_state, fetched_at, plan_id, channel, quota
 //	auth health   -> request counts and the heatmap
 //
@@ -60,6 +60,10 @@ type accountView struct {
 	QuotaState string               `json:"quota_state"`
 	FetchedAt  string               `json:"fetched_at,omitempty"`
 	Quota      []accountQuotaBucket `json:"quota,omitempty"`
+	// Channels lists every routing channel the credential actually carries, so
+	// the management UI can offer a routing choice that exists instead of a
+	// fixed vocabulary that may not match the account.
+	Channels []accountChannel `json:"channels,omitempty"`
 
 	RequestCount int64               `json:"request_count"`
 	SuccessCount int64               `json:"success_count"`
@@ -81,8 +85,15 @@ type accountQuotaBucket struct {
 	Description       string   `json:"description,omitempty"`
 }
 
-// accountHeatBucket is one fixed-width window of an account's request history.
-// SuccessRate is null when the window saw no requests, because "no requests" and
+// accountChannel is one routing channel the credential carries. Key is the
+// plugin-owned identifier an account policy selects; Label is the name the
+// plugin derived from what the upstream reports, and is what the operator sees.
+type accountChannel struct {
+	Key   string `json:"key"`
+	Label string `json:"label"`
+}
+
+// accountHeatBucket is one fixed-width window of an account's request history.// SuccessRate is null when the window saw no requests, because "no requests" and
 // "every request failed" are different facts.
 type accountHeatBucket struct {
 	Bucket      string   `json:"bucket"`
@@ -166,6 +177,10 @@ func buildAccountView(auth *coreauth.Auth, poolRecord supply.Record, hasPoolReco
 		RequestCount: auth.Success + auth.Failed,
 		SuccessCount: auth.Success,
 		FailureCount: auth.Failed,
+		// Manually disabled is the credential's own state, not a routing policy:
+		// the operator's enable switch sets the credential's disabled flag, and a
+		// policy only decides which channels the credential may route through.
+		ManuallyDisabled: auth.Disabled,
 	}
 	if view.AuthState == "" {
 		view.AuthState = string(coreauth.StatusUnknown)
@@ -175,10 +190,11 @@ func buildAccountView(auth *coreauth.Auth, poolRecord supply.Record, hasPoolReco
 	}
 
 	// The routing policy is account metadata, so an operator can move a
-	// credential between channels without copying the credential file.
+	// credential between channels without copying the credential file. It is
+	// only the routing decision: it never says whether the credential itself is
+	// switched on.
 	if policy := authMetadataString(auth, "policy"); pluginapi.ValidAccountPolicy(policy) {
 		view.Policy = policy
-		view.ManuallyDisabled = policy == pluginapi.AccountPolicyDisabled
 	}
 
 	if !nextRetry.IsZero() {
@@ -221,6 +237,20 @@ func applyCachedQuota(view *accountView, host *pluginhost.Host) {
 	if subscription := snapshot.Response.Subscription; subscription != nil {
 		view.PlanID = strings.TrimSpace(subscription.Plan)
 		view.Channel = strings.TrimSpace(subscription.TierName)
+	}
+	// The channel list rides the last good reading, so a failed probe keeps
+	// offering the channels it already knew about. A channel without a key is
+	// unusable (a policy selects a channel by its key), so it is dropped rather
+	// than reported as an anonymous choice.
+	for _, channel := range snapshot.Response.Channels {
+		key := strings.TrimSpace(channel.Key)
+		if key == "" {
+			continue
+		}
+		view.Channels = append(view.Channels, accountChannel{
+			Key:   key,
+			Label: strings.TrimSpace(channel.Label),
+		})
 	}
 	for _, group := range snapshot.Response.Groups {
 		for _, bucket := range group.Buckets {

@@ -1409,6 +1409,46 @@ func TestRegisteredPluginsIncludesMetadataAndOAuthCapability(t *testing.T) {
 	}
 }
 
+// A plugin that declares ProviderKeys serves one login entry per key, and the
+// panel builds one card per entry. The AuthProvider identifier stays a login
+// alias for compatibility, but it is not a site, so advertising it would render
+// an extra card that can never resolve a credential.
+func TestRegisteredPluginsOAuthProvidersExcludeIdentifierAlias(t *testing.T) {
+	host := newHostWithRecords(capabilityRecord{
+		id: "zcode",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			AuthProvider: fakeAuthProvider{identifier: "zcode"},
+			ProviderKeys: []string{"zcode-bigmodel", "zcode-zai"},
+			ProviderLabels: map[string]string{
+				"zcode-bigmodel": "智谱站",
+				"zcode-zai":      "国际站",
+			},
+		}},
+	})
+
+	infos := host.RegisteredPlugins()
+	if len(infos) != 1 {
+		t.Fatalf("RegisteredPlugins() len = %d, want 1; infos=%#v", len(infos), infos)
+	}
+	info := infos[0]
+	if info.OAuthProvider != "zcode" {
+		t.Fatalf("OAuthProvider = %q, want the identifier so existing clients keep working", info.OAuthProvider)
+	}
+	if want := []string{"zcode-bigmodel", "zcode-zai"}; !slices.Equal(info.OAuthProviders, want) {
+		t.Fatalf("OAuthProviders = %v, want %v", info.OAuthProviders, want)
+	}
+	if slices.Contains(info.OAuthProviders, "zcode") {
+		t.Fatal("the identifier alias must not be advertised as a login entry")
+	}
+	if info.OAuthProviderLabels["zcode-bigmodel"] != "智谱站" || info.OAuthProviderLabels["zcode-zai"] != "国际站" {
+		t.Fatalf("OAuthProviderLabels = %#v, want the declared labels", info.OAuthProviderLabels)
+	}
+	// Not advertised as a site, but still resolvable for auth.
+	if !host.HasAuthProvider("zcode") {
+		t.Fatal("the identifier must stay resolvable as a login alias")
+	}
+}
+
 func TestHostApplyConfig_InvalidMetadataOrNoCapabilitiesSkipped(t *testing.T) {
 	loader := newTestSymbolLoader()
 	loader.lookups["empty-name"] = newTestSymbolLookup(&testPlugin{

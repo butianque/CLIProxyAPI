@@ -47,6 +47,7 @@ type rpcCapabilities struct {
 	ManagementAPI                 bool                         `json:"management_api"`
 	QuotaProvider                 bool                         `json:"quota_provider"`
 	ProviderKeys                  []string                     `json:"provider_keys,omitempty"`
+	ProviderLabels                map[string]string            `json:"provider_labels,omitempty"`
 }
 
 type rpcIdentifierResponse struct {
@@ -190,6 +191,7 @@ func rpcCapabilitiesFromPlugin(plugin pluginapi.Plugin) rpcCapabilities {
 		CommandLinePlugin:             caps.CommandLinePlugin != nil,
 		ManagementAPI:                 caps.ManagementAPI != nil,
 		QuotaProvider:                 caps.QuotaProvider != nil,
+		ProviderLabels:                cloneStringMap(caps.ProviderLabels),
 	}
 }
 

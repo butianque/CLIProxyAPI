@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -134,6 +135,12 @@ type Capabilities struct {
 	// serves both a mainland and an international origin under separate keys).
 	// Empty keeps the default one-key-per-plugin behavior.
 	ProviderKeys []string
+	// ProviderLabels maps each provider key to a short user-facing label shown
+	// by management clients next to the login entry for that key. The plugin
+	// owns this vocabulary, like Metadata.Name. When a key has no entry, the
+	// host and its clients must not invent a label and fall back to the plugin
+	// name instead.
+	ProviderLabels map[string]string
 }
 
 // ExecutorModelScope declares which model-registration paths a plugin executor supports.
@@ -1972,30 +1979,52 @@ func (g *QuotaGroup) UnmarshalJSON(data []byte) error {
 // Account routing policies an operator assigns to a credential. A policy is
 // account metadata owned by the host, not a provider capability: the host
 // stores it and the plugin honors it when choosing a channel.
+//
+// The value space is deliberately open-ended. A policy names the channels the
+// credential may route through using the plugin's own channel keys, which the
+// plugin reports in QuotaFetchResponse.Channels, so a provider that grows a
+// third channel needs no host change and no vocabulary update.
 const (
-	AccountPolicyStartPlanOnly  = "start-plan-only"
-	AccountPolicyAPIKeyOnly     = "api-key-only"
-	AccountPolicyStartPlanFirst = "start-plan-first"
-	AccountPolicyDisabled       = "disabled"
+	// AccountPolicyAuto uses every channel the credential carries, in the
+	// plugin's own preference order. It is the default: a credential with no
+	// policy routes like one explicitly set to auto.
+	AccountPolicyAuto = "auto"
+	// AccountPolicyOnlyPrefix pins a credential to one channel. The value is
+	// the prefix followed by the plugin's channel key, for example
+	// "only:start-plan".
+	AccountPolicyOnlyPrefix = "only:"
 )
 
-// AccountPolicyValues returns every accepted account routing policy.
-func AccountPolicyValues() []string {
-	return []string{
-		AccountPolicyStartPlanOnly,
-		AccountPolicyAPIKeyOnly,
-		AccountPolicyStartPlanFirst,
-		AccountPolicyDisabled,
-	}
+// AccountPolicyOnly builds the policy that pins a credential to one channel.
+func AccountPolicyOnly(channelKey string) string {
+	return AccountPolicyOnlyPrefix + strings.TrimSpace(channelKey)
 }
 
-// ValidAccountPolicy reports whether value is an accepted account routing policy.
+// AccountPolicyChannel returns the single channel a policy pins and whether the
+// policy pins one at all. A policy that does not pin a channel (the empty
+// string, "auto", or anything unrecognized) reports false.
+func AccountPolicyChannel(policy string) (string, bool) {
+	trimmed := strings.TrimSpace(policy)
+	if !strings.HasPrefix(trimmed, AccountPolicyOnlyPrefix) {
+		return "", false
+	}
+	key := strings.TrimSpace(strings.TrimPrefix(trimmed, AccountPolicyOnlyPrefix))
+	if key == "" {
+		return "", false
+	}
+	return key, true
+}
+
+// ValidAccountPolicy reports whether value is an accepted account routing
+// policy. The empty string and "auto" both mean the default; every other
+// accepted value must name a channel.
 func ValidAccountPolicy(value string) bool {
-	switch value {
-	case AccountPolicyStartPlanOnly, AccountPolicyAPIKeyOnly, AccountPolicyStartPlanFirst, AccountPolicyDisabled:
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" || trimmed == AccountPolicyAuto {
 		return true
 	}
-	return false
+	_, pinsChannel := AccountPolicyChannel(trimmed)
+	return pinsChannel
 }
 
 // Quota states a credential's quota snapshot can be in. A query error is never
@@ -2063,12 +2092,27 @@ type QuotaMetric struct {
 	Currency string  `json:"currency,omitempty"`
 }
 
+// QuotaChannel is one routing channel a credential can actually use. Key is the
+// plugin-owned identifier an account policy selects; Label is the channel's
+// user-facing name, which the plugin derives from what the upstream reports.
+//
+// The list is reported independently of the account policy: a policy selects
+// among these channels, so a narrowed policy must never shorten the list, or a
+// credential pinned to one channel could never be switched back.
+type QuotaChannel struct {
+	Key   string `json:"key"`
+	Label string `json:"label"`
+}
+
 // QuotaFetchResponse carries normalized quota information for management UI rendering.
 type QuotaFetchResponse struct {
 	Subscription       *QuotaSubscription `json:"subscription,omitempty"`
 	Summary            []QuotaMetric      `json:"summary,omitempty"`
 	ServerTimeOffsetMs int64              `json:"serverTimeOffsetMs,omitempty"`
 	Groups             []QuotaGroup       `json:"groups,omitempty"`
+	// Channels lists every routing channel the credential carries, in preference
+	// order. Readers use it to offer a routing choice that actually exists.
+	Channels []QuotaChannel `json:"channels,omitempty"`
 	// FetchedAt is the RFC3339 time the host recorded this snapshot. The host
 	// stamps it so an expired reading cannot pass for a live balance; plugins
 	// leave it empty.

@@ -4195,8 +4195,17 @@ func TestMultiKeyPluginFansOutAcrossProviderKeys(t *testing.T) {
 	if host.modelProvider("multi") != "multi-cn" {
 		t.Fatalf("primary provider = %q, want multi-cn", host.modelProvider("multi"))
 	}
-	if host.HasAuthProvider("multi") {
-		t.Fatal("undeclared identifier must not resolve once ProviderKeys is declared")
+	if !host.HasAuthProvider("multi") {
+		t.Fatal("declared identifier must stay resolvable as a login alias")
+	}
+	// The executor path stays declared-key only: the identifier must not register
+	// an executor or an executor model client, otherwise PickAuth("multi") would
+	// resolve a credential-less provider.
+	if _, okExecutor := manager.executors["multi"]; okExecutor {
+		t.Fatal("identifier must not register an executor")
+	}
+	if _, okClient := modelRegistry.clients[pluginExecutorModelClientID("multi", "multi")]; okClient {
+		t.Fatal("identifier must not register an executor model client")
 	}
 }
 

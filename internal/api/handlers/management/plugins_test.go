@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -84,9 +85,50 @@ func TestConfigReloadGenerationSkipsOlderSnapshot(t *testing.T) {
 	}
 }
 
+// The panel renders one login card per oauth_providers entry. The field is
+// omitted when it would repeat the legacy single-provider field, so plugins that
+// contribute one entry keep their response shape, and the labels travel with the
+// entries they name.
+func TestPluginOAuthProviderEntriesAndLabels(t *testing.T) {
+	cases := []struct {
+		name string
+		info pluginhost.RegisteredPluginInfo
+		want []string
+	}{
+		{
+			name: "one entry matching the legacy field is omitted",
+			info: pluginhost.RegisteredPluginInfo{OAuthProvider: "alpha", OAuthProviders: []string{"alpha"}},
+			want: nil,
+		},
+		{
+			name: "multiple entries are emitted",
+			info: pluginhost.RegisteredPluginInfo{OAuthProvider: "zcode", OAuthProviders: []string{"zcode-bigmodel", "zcode-zai"}},
+			want: []string{"zcode-bigmodel", "zcode-zai"},
+		},
+		{
+			name: "no entries",
+			info: pluginhost.RegisteredPluginInfo{OAuthProvider: "alpha"},
+			want: nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pluginOAuthProviders(tc.info); !slices.Equal(got, tc.want) {
+				t.Fatalf("pluginOAuthProviders = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	if got := pluginOAuthProviderLabels(map[string]string{"zcode-zai": "国际站"}); got["zcode-zai"] != "国际站" {
+		t.Fatalf("pluginOAuthProviderLabels = %#v, want the declared label", got)
+	}
+	if got := pluginOAuthProviderLabels(nil); got != nil {
+		t.Fatalf("pluginOAuthProviderLabels(nil) = %#v, want nil so the field is omitted", got)
+	}
+}
+
 func TestListPluginsIncludesScannedAndConfiguredPlugins(t *testing.T) {
 	t.Parallel()
-
 	pluginsDir := writeManagementPluginFile(t, "scanned")
 	disabled := false
 	h := &Handler{

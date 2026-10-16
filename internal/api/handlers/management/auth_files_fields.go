@@ -467,8 +467,9 @@ func normalizeAuthFilePatchFields(fields map[string]json.RawMessage) (map[string
 }
 
 // validateAccountPolicyPatch rejects an account routing policy the host does not
-// implement. A policy is a closed enum: accepting any string would let a typo
-// silently take a credential out of scheduling.
+// implement. A policy either uses every channel the credential carries ("auto")
+// or pins one of the plugin's channel keys ("only:<channel>"); accepting any
+// other string would let a typo silently take a credential out of scheduling.
 func validateAccountPolicyPatch(fields map[string]json.RawMessage) error {
 	raw, ok := fields["policy"]
 	if !ok {
@@ -490,7 +491,7 @@ func validateAccountPolicyPatch(fields map[string]json.RawMessage) error {
 		return nil
 	}
 	if !pluginapi.ValidAccountPolicy(policy) {
-		return fmt.Errorf("policy must be one of %s", strings.Join(pluginapi.AccountPolicyValues(), ", "))
+		return fmt.Errorf(`policy must be "auto" or "only:<channel>"`)
 	}
 	return nil
 }

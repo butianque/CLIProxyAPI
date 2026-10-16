@@ -94,6 +94,7 @@ func registerRPCPlugin(ctx context.Context, host *Host, id string, client plugin
 			ExecutorInputFormats:          append([]string(nil), resp.Capabilities.ExecutorInputFormats...),
 			ExecutorOutputFormats:         append([]string(nil), resp.Capabilities.ExecutorOutputFormats...),
 			ProviderKeys:                  append([]string(nil), resp.Capabilities.ProviderKeys...),
+			ProviderLabels:                cloneStringMap(resp.Capabilities.ProviderLabels),
 		},
 	}
 	if resp.Capabilities.ModelRegistrar {

@@ -115,13 +115,12 @@ func normalizeProviderKeys(raw []string) []string {
 	return out
 }
 
-// authProviderKeys returns the provider keys a plugin serves for auth parsing,
-// login, and refresh. A plugin that declares ProviderKeys owns all of them;
-// otherwise it owns the single AuthProvider identifier.
+// authProviderKeys returns every provider key a plugin serves for auth parsing,
+// login, and refresh. Declared ProviderKeys own the plugin; the AuthProvider
+// identifier stays resolvable as a login alias because it is what the host
+// advertises to management clients as the plugin's OAuth entry point. The
+// identifier is appended last so the first declared key stays the primary one.
 func (h *Host) authProviderKeys(record capabilityRecord) []string {
-	if keys := declaredProviderKeys(record); len(keys) > 0 {
-		return keys
-	}
 	authProvider := record.plugin.Capabilities.AuthProvider
 	if authProvider == nil {
 		return nil
@@ -130,10 +129,17 @@ func (h *Host) authProviderKeys(record capabilityRecord) []string {
 	if !okIdentifier {
 		return nil
 	}
-	if key := normalizeProviderID(identifier); key != "" {
-		return []string{key}
+	keys := declaredProviderKeys(record)
+	if len(keys) == 0 {
+		if identifier == "" {
+			return nil
+		}
+		return []string{identifier}
 	}
-	return nil
+	if identifier != "" && !slices.Contains(keys, identifier) {
+		keys = append(keys, identifier)
+	}
+	return keys
 }
 
 func authIDForPath(path, authDir string) string {

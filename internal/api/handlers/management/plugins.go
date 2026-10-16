@@ -25,20 +25,22 @@ type pluginListResponse struct {
 }
 
 type pluginListEntry struct {
-	ID               string                  `json:"id"`
-	Path             string                  `json:"path"`
-	Configured       bool                    `json:"configured"`
-	Registered       bool                    `json:"registered"`
-	Enabled          bool                    `json:"enabled"`
-	EffectiveEnabled bool                    `json:"effective_enabled"`
-	SupportsOAuth    bool                    `json:"supports_oauth"`
-	OAuthProvider    string                  `json:"oauth_provider"`
-	SupportsQuota    bool                    `json:"supports_quota"`
-	QuotaProvider    string                  `json:"quota_provider,omitempty"`
-	Logo             string                  `json:"logo"`
-	ConfigFields     []pluginConfigFieldInfo `json:"config_fields"`
-	Menus            []pluginMenuInfo        `json:"menus"`
-	Metadata         *pluginMetadataInfo     `json:"metadata"`
+	ID                  string                  `json:"id"`
+	Path                string                  `json:"path"`
+	Configured          bool                    `json:"configured"`
+	Registered          bool                    `json:"registered"`
+	Enabled             bool                    `json:"enabled"`
+	EffectiveEnabled    bool                    `json:"effective_enabled"`
+	SupportsOAuth       bool                    `json:"supports_oauth"`
+	OAuthProvider       string                  `json:"oauth_provider"`
+	OAuthProviders      []string                `json:"oauth_providers,omitempty"`
+	OAuthProviderLabels map[string]string       `json:"oauth_provider_labels,omitempty"`
+	SupportsQuota       bool                    `json:"supports_quota"`
+	QuotaProvider       string                  `json:"quota_provider,omitempty"`
+	Logo                string                  `json:"logo"`
+	ConfigFields        []pluginConfigFieldInfo `json:"config_fields"`
+	Menus               []pluginMenuInfo        `json:"menus"`
+	Metadata            *pluginMetadataInfo     `json:"metadata"`
 }
 
 type pluginMetadataInfo struct {
@@ -124,6 +126,8 @@ func (h *Handler) ListPlugins(c *gin.Context) {
 			entry.Registered = true
 			entry.SupportsOAuth = info.SupportsOAuth
 			entry.OAuthProvider = htmlsanitize.String(info.OAuthProvider)
+			entry.OAuthProviders = pluginOAuthProviders(info)
+			entry.OAuthProviderLabels = pluginOAuthProviderLabels(info.OAuthProviderLabels)
 			entry.SupportsQuota = info.SupportsQuota
 			entry.QuotaProvider = htmlsanitize.String(info.QuotaProvider)
 			entry.Logo = htmlsanitize.String(info.Metadata.Logo)
@@ -484,6 +488,37 @@ func pluginMenus(menus []pluginhost.RegisteredPluginMenu) []pluginMenuInfo {
 			Menu:        htmlsanitize.String(menu.Menu),
 			Description: htmlsanitize.String(menu.Description),
 		})
+	}
+	return out
+}
+
+// pluginOAuthProviders returns the login entries a plugin contributes to
+// management clients. The list is omitted when it would add nothing to the
+// existing oauth_provider field, so single-entry plugins keep their response
+// shape unchanged.
+func pluginOAuthProviders(info pluginhost.RegisteredPluginInfo) []string {
+	providers := htmlsanitize.Strings(info.OAuthProviders)
+	if len(providers) == 0 {
+		return nil
+	}
+	if len(providers) == 1 && providers[0] == htmlsanitize.String(info.OAuthProvider) {
+		return nil
+	}
+	return providers
+}
+
+// pluginOAuthProviderLabels returns plugin-declared provider labels escaped for
+// browser-facing clients, or nil when the plugin declares none.
+func pluginOAuthProviderLabels(labels map[string]string) map[string]string {
+	if len(labels) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(labels))
+	for key, value := range labels {
+		out[htmlsanitize.String(key)] = htmlsanitize.String(value)
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }

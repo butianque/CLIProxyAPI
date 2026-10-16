@@ -57,12 +57,13 @@ func TestListAccountsReportsUnknownAsAbsent(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 
 	manager := coreauth.NewManager(nil, nil, nil)
+	pinnedPolicy := pluginapi.AccountPolicyOnly("start-plan")
 	record := &coreauth.Auth{
 		ID:       "zcode-1",
 		FileName: "zcode-1.json",
 		Provider: "zcode",
 		Status:   coreauth.StatusActive,
-		Metadata: map[string]any{"policy": pluginapi.AccountPolicyStartPlanFirst},
+		Metadata: map[string]any{"policy": pinnedPolicy},
 		Success:  7,
 		Failed:   2,
 	}
@@ -82,7 +83,7 @@ func TestListAccountsReportsUnknownAsAbsent(t *testing.T) {
 	if account["provider"] != "zcode" {
 		t.Fatalf("provider = %#v", account["provider"])
 	}
-	if account["policy"] != pluginapi.AccountPolicyStartPlanFirst {
+	if account["policy"] != pinnedPolicy {
 		t.Fatalf("policy = %#v", account["policy"])
 	}
 	if account["manually_disabled"] != false {
@@ -141,8 +142,10 @@ func TestListAccountsFiltersAndCounts(t *testing.T) {
 
 	manager := coreauth.NewManager(nil, nil, nil)
 	for _, record := range []*coreauth.Auth{
-		{ID: "loomy-1", FileName: "loomy-1.json", Provider: "loomy", Status: coreauth.StatusActive,
-			Metadata: map[string]any{"policy": pluginapi.AccountPolicyDisabled}},
+		// The operator's enable switch sets the credential's own disabled flag, so
+		// that flag — not a routing policy — is what reports manually_disabled.
+		{ID: "loomy-1", FileName: "loomy-1.json", Provider: "loomy", Status: coreauth.StatusDisabled, Disabled: true,
+			Metadata: map[string]any{"policy": pluginapi.AccountPolicyAuto}},
 		{ID: "zcode-1", FileName: "zcode-1.json", Provider: "zcode", Status: coreauth.StatusActive,
 			Metadata: map[string]any{"policy": "not-a-policy"}},
 	} {
@@ -164,7 +167,7 @@ func TestListAccountsFiltersAndCounts(t *testing.T) {
 		t.Fatalf("unexpected order: %#v", accounts)
 	}
 	if accounts[0]["manually_disabled"] != true {
-		t.Fatalf("a disabled policy must set manually_disabled: %#v", accounts[0]["manually_disabled"])
+		t.Fatalf("a disabled credential must report manually_disabled: %#v", accounts[0]["manually_disabled"])
 	}
 	// An unrecognized policy is not echoed back as if the host honoured it.
 	if _, present := accounts[1]["policy"]; present {
@@ -260,6 +263,11 @@ func TestListAccountsReportsCachedQuotaAndFailedProbe(t *testing.T) {
 					}
 					return pluginapi.QuotaFetchResponse{
 						Subscription: &pluginapi.QuotaSubscription{Plan: "Start Plan", TierName: "start-plan"},
+						Channels: []pluginapi.QuotaChannel{
+							{Key: "start-plan", Label: "Start Plan (free)"},
+							{Key: "  api-key  ", Label: "Coding Plan (paid)"},
+							{Key: "   ", Label: "unusable"},
+						},
 						Groups: []pluginapi.QuotaGroup{{
 							DisplayName: "start-plan",
 							Buckets: []pluginapi.QuotaBucket{{
@@ -309,6 +317,22 @@ func TestListAccountsReportsCachedQuotaAndFailedProbe(t *testing.T) {
 		t.Fatalf("quota bucket = %#v", bucket)
 	}
 
+	// The channel list is what the credential can actually route through: a
+	// padded key is trimmed, and a channel without a key is dropped because a
+	// policy selects a channel by its key.
+	channels, ok := account["channels"].([]any)
+	if !ok || len(channels) != 2 {
+		t.Fatalf("expected 2 channels, got %#v", account["channels"])
+	}
+	first, ok := channels[0].(map[string]any)
+	if !ok || first["key"] != "start-plan" || first["label"] != "Start Plan (free)" {
+		t.Fatalf("channel[0] = %#v", channels[0])
+	}
+	second, ok := channels[1].(map[string]any)
+	if !ok || second["key"] != "api-key" {
+		t.Fatalf("a padded channel key must be trimmed, got %#v", channels[1])
+	}
+
 	// A failed probe is a query error, not an exhausted account, and the last
 	// good reading keeps its own timestamp.
 	fail = true
@@ -321,6 +345,12 @@ func TestListAccountsReportsCachedQuotaAndFailedProbe(t *testing.T) {
 	}
 	if _, ok := account["fetched_at"].(string); !ok {
 		t.Fatalf("the last good reading must keep its timestamp, got %#v", account["fetched_at"])
+	}
+	// The channel list rides the last good reading too, so a failed probe keeps
+	// offering the channels the credential is known to carry.
+	channels, ok = account["channels"].([]any)
+	if !ok || len(channels) != 2 {
+		t.Fatalf("a failed probe must keep the last known channels, got %#v", account["channels"])
 	}
 }
 
@@ -404,15 +434,19 @@ func TestPatchAuthFileFieldsAccountPolicy(t *testing.T) {
 		return recorder
 	}
 
+	pinnedPolicy := pluginapi.AccountPolicyOnly("start-plan")
 	rejected := patch(`{"name":"` + fileName + `","policy":"start-plan-onlyy"}`)
 	if rejected.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d body=%s, want 400", rejected.Code, rejected.Body.String())
 	}
-	if !strings.Contains(rejected.Body.String(), pluginapi.AccountPolicyStartPlanFirst) {
-		t.Fatalf("the rejection must name the accepted policies, got %s", rejected.Body.String())
+	// The rejection must describe the accepted shape rather than list values: a
+	// policy names a plugin-owned channel key the host cannot enumerate.
+	rejection := rejected.Body.String()
+	if !strings.Contains(rejection, pluginapi.AccountPolicyAuto) || !strings.Contains(rejection, pluginapi.AccountPolicyOnlyPrefix) {
+		t.Fatalf("the rejection must describe the accepted policies, got %s", rejection)
 	}
 
-	accepted := patch(`{"name":"` + fileName + `","policy":"` + pluginapi.AccountPolicyStartPlanFirst + `"}`)
+	accepted := patch(`{"name":"` + fileName + `","policy":"` + pinnedPolicy + `"}`)
 	if accepted.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s, want 200", accepted.Code, accepted.Body.String())
 	}
@@ -420,19 +454,24 @@ func TestPatchAuthFileFieldsAccountPolicy(t *testing.T) {
 	// so an operator can move a credential between channels without editing the
 	// credential file.
 	account := accountList(t, listAccounts(t, h, "/v8/management/accounts"))[0]
-	if account["policy"] != pluginapi.AccountPolicyStartPlanFirst {
-		t.Fatalf("policy = %#v, want %q", account["policy"], pluginapi.AccountPolicyStartPlanFirst)
+	if account["policy"] != pinnedPolicy {
+		t.Fatalf("policy = %#v, want %q", account["policy"], pinnedPolicy)
 	}
 	if account["manually_disabled"] != false {
 		t.Fatalf("manually_disabled = %#v, want false", account["manually_disabled"])
 	}
 
-	disabled := patch(`{"name":"` + fileName + `","policy":"` + pluginapi.AccountPolicyDisabled + `"}`)
+	// Manual disabling is the credential's own state, so the enable switch — not
+	// a policy — is what moves manually_disabled.
+	disabled := patch(`{"name":"` + fileName + `","disabled":true}`)
 	if disabled.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s, want 200", disabled.Code, disabled.Body.String())
 	}
 	account = accountList(t, listAccounts(t, h, "/v8/management/accounts"))[0]
 	if account["manually_disabled"] != true {
-		t.Fatalf("a disabled policy must set manually_disabled, got %#v", account["manually_disabled"])
+		t.Fatalf("a disabled credential must report manually_disabled, got %#v", account["manually_disabled"])
+	}
+	if account["policy"] != pinnedPolicy {
+		t.Fatalf("disabling a credential must not touch its routing policy, got %#v", account["policy"])
 	}
 }

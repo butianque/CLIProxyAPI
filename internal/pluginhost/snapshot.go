@@ -31,9 +31,17 @@ type RegisteredPluginInfo struct {
 	Metadata      pluginapi.Metadata
 	SupportsOAuth bool
 	OAuthProvider string
-	SupportsQuota bool
-	QuotaProvider string
-	Menus         []RegisteredPluginMenu
+	// OAuthProviders lists the login entries this plugin contributes. It is the
+	// set management clients should render, which is the declared provider-key
+	// set when the plugin declares one and the AuthProvider identifier
+	// otherwise. It never carries the identifier as an extra alias.
+	OAuthProviders []string
+	// OAuthProviderLabels maps each entry in OAuthProviders to the plugin-owned
+	// user-facing label. It is empty when the plugin declares no labels.
+	OAuthProviderLabels map[string]string
+	SupportsQuota       bool
+	QuotaProvider       string
+	Menus               []RegisteredPluginMenu
 }
 
 // RegisteredPluginMenu describes a plugin-owned resource menu entry.
@@ -77,9 +85,17 @@ func (h *Host) RegisteredPlugins() []RegisteredPluginInfo {
 	for _, record := range records {
 		authProvider := record.plugin.Capabilities.AuthProvider
 		oauthProvider := ""
+		oauthProviders := []string(nil)
 		if authProvider != nil && !h.isPluginFused(record.id) {
 			if identifier, okIdentifier := h.callAuthProviderIdentifier(record.id, authProvider); okIdentifier {
 				oauthProvider = identifier
+			}
+			// The panel-facing entry set is the declared provider-key set when
+			// one exists, so the AuthProvider identifier alias stays out of it.
+			if declared := declaredProviderKeys(record); len(declared) > 0 {
+				oauthProviders = declared
+			} else if oauthProvider != "" {
+				oauthProviders = []string{oauthProvider}
 			}
 		}
 		quotaProvider := record.plugin.Capabilities.QuotaProvider
@@ -90,14 +106,16 @@ func (h *Host) RegisteredPlugins() []RegisteredPluginInfo {
 			}
 		}
 		out = append(out, RegisteredPluginInfo{
-			ID:            record.id,
-			Priority:      record.priority,
-			Metadata:      clonePluginMetadata(record.meta),
-			SupportsOAuth: authProvider != nil,
-			OAuthProvider: oauthProvider,
-			SupportsQuota: quotaProvider != nil,
-			QuotaProvider: quotaIdentifier,
-			Menus:         menusByPlugin[record.id],
+			ID:                  record.id,
+			Priority:            record.priority,
+			Metadata:            clonePluginMetadata(record.meta),
+			SupportsOAuth:       authProvider != nil,
+			OAuthProvider:       oauthProvider,
+			OAuthProviders:      oauthProviders,
+			OAuthProviderLabels: cloneStringMap(record.plugin.Capabilities.ProviderLabels),
+			SupportsQuota:       quotaProvider != nil,
+			QuotaProvider:       quotaIdentifier,
+			Menus:               menusByPlugin[record.id],
 		})
 	}
 	return out

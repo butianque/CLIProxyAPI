@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -187,6 +188,37 @@ func TestRPCCapabilitiesIncludeQuotaProvider(t *testing.T) {
 	}
 	if decoded["quota_provider"] != true {
 		t.Fatalf("quota_provider = %#v, want true", decoded["quota_provider"])
+	}
+}
+
+// Provider keys and their labels are the login entries a plugin advertises, so
+// both must survive the registration handshake. This pins the wire contract the
+// host decodes a DLL plugin's registration response through.
+func TestRPCCapabilitiesDecodeProviderKeysAndLabels(t *testing.T) {
+	var caps rpcCapabilities
+	raw := []byte(`{
+		"auth_provider": true,
+		"provider_keys": ["zcode-bigmodel", "zcode-zai"],
+		"provider_labels": {"zcode-bigmodel": "智谱站", "zcode-zai": "国际站"}
+	}`)
+	if errUnmarshal := json.Unmarshal(raw, &caps); errUnmarshal != nil {
+		t.Fatalf("Unmarshal() error = %v", errUnmarshal)
+	}
+	if want := []string{"zcode-bigmodel", "zcode-zai"}; !slices.Equal(caps.ProviderKeys, want) {
+		t.Fatalf("ProviderKeys = %v, want %v", caps.ProviderKeys, want)
+	}
+	if caps.ProviderLabels["zcode-bigmodel"] != "智谱站" || caps.ProviderLabels["zcode-zai"] != "国际站" {
+		t.Fatalf("ProviderLabels = %#v, want the declared labels", caps.ProviderLabels)
+	}
+
+	// A plugin that declares no labels must leave the field empty rather than
+	// inventing one, so the panel falls back to the plugin name.
+	var bare rpcCapabilities
+	if errUnmarshal := json.Unmarshal([]byte(`{"auth_provider":true}`), &bare); errUnmarshal != nil {
+		t.Fatalf("Unmarshal() error = %v", errUnmarshal)
+	}
+	if len(bare.ProviderLabels) != 0 {
+		t.Fatalf("ProviderLabels = %#v, want empty when the plugin declares none", bare.ProviderLabels)
 	}
 }
 
