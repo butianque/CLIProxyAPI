@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
@@ -126,9 +127,8 @@ func assertProbeState(t *testing.T, channelID, nature string, natures map[string
 }
 
 // The probe answers with one state per declared nature and nothing else: an
-// undeclared nature never appears, a phone nature whose credential name is not
-// in the store is unready (never offline, and never a network call), and the
-// email kind has no probe at all.
+// undeclared nature never appears, and a nature whose credential name is not in
+// the store is unready — never offline, and never a network call.
 func TestSupplyChannelProbeReportsDeclaredNatures(t *testing.T) {
 	_, r := setupChannelTest(t)
 	unlockedEmptyStore(t)
@@ -151,8 +151,9 @@ func TestSupplyChannelProbeReportsDeclaredNatures(t *testing.T) {
 
 	assertProbeState(t, bothID, "api", probes[bothID], "unready")
 	assertProbeState(t, bothID, "web", probes[bothID], "unready")
-	// IMAP has not landed in the base, so the email kind is unsupported.
-	assertProbeState(t, bothID, "imap", probes[bothID], "unsupported")
+	// IMAP is a real probe now, and this channel names a credential that is not
+	// in the store: unready, and nothing left the process.
+	assertProbeState(t, bothID, "imap", probes[bothID], "unready")
 	if len(probes[bothID]) != 3 {
 		t.Fatalf("channel %s: probed %v, want the three declared natures", bothID, probes[bothID])
 	}
@@ -272,7 +273,7 @@ func TestSupplyChannelsRoundTrip(t *testing.T) {
 func TestSupplyChannelBothKinds(t *testing.T) {
 	_, r := setupChannelTest(t)
 
-	body := `{"label":"Multi","phone":{"enabled":true,"natures":["api","web"],"connections":{"api":{"secret":"a"},"web":{"secret":"w"}}},"email":{"enabled":true,"natures":["imap"],"connections":{"imap":{"account":"me@qq.com","secret":"s","usage":"self-domain","domain":"ormnes.com"}}}}`
+	body := `{"label":"Multi","category":"self-built","phone":{"enabled":true,"natures":["api","web"],"connections":{"api":{"secret":"a"},"web":{"secret":"w"}}},"email":{"enabled":true,"natures":["imap"],"connections":{"imap":{"account":"me@qq.com","secret":"s","domain":"ormnes.com"}}}}`
 	req := httptest.NewRequest(http.MethodPost, "/supply/channels", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
@@ -335,19 +336,30 @@ func TestSupplyChannelStampsPhoneCredentialNames(t *testing.T) {
 	}
 }
 
-// The email kind is not the phone kind: its connection carries its own
-// credential, so the stamp must not touch it.
+// The email kind is not the phone kind: the host does not stamp its credential,
+// because the entry is named after the mailbox. A name the document already
+// carries is kept — it may point at an entry stored under an older rule — and a
+// document without one gets the derived name, which is what the panel relies on.
 func TestSupplyChannelLeavesEmailConnectionsAlone(t *testing.T) {
 	h, r := setupChannelTest(t)
 
-	id := createChannel(t, r, `{"label":"Multi","phone":{"enabled":true,"natures":["api"],"connections":{"api":{}}},"email":{"enabled":true,"natures":["imap"],"connections":{"imap":{"account":"box@example.com","secret":"mail-key","usage":"self-domain","domain":"ormnes.com"}}}}`)
+	id := createChannel(t, r, `{"label":"Multi","category":"self-built","phone":{"enabled":true,"natures":["api"],"connections":{"api":{}}},"email":{"enabled":true,"natures":["imap"],"connections":{"imap":{"account":"box@example.com","secret":"mail-key","domain":"ormnes.com"}}}}`)
 	channel := storedChannel(t, h, id)
 	if channel.Email == nil {
 		t.Fatal("the stored channel has no email block")
 	}
 	imap := channel.Email.Connections[supply.NatureIMAP]
-	if imap.Secret != "mail-key" || imap.Account != "box@example.com" || imap.Usage != "self-domain" || imap.Domain != "ormnes.com" {
+	if imap.Account != "box@example.com" || imap.Usage != "self-domain" || imap.Domain != "ormnes.com" {
 		t.Fatalf("the email connection was rewritten: %+v", imap)
+	}
+	if imap.Secret != "mail-key" {
+		t.Fatalf("the email connection names %q, want the name it was saved with", imap.Secret)
+	}
+
+	derived := createChannel(t, r, `{"label":"Derived","category":"self-built","email":{"enabled":true,"natures":["imap"],"connections":{"imap":{"account":"Box@Example.com","domain":"ormnes.com"}}}}`)
+	nameless := storedChannel(t, h, derived).Email.Connections[supply.NatureIMAP]
+	if want := supply.EmailCredentialName("Box@Example.com"); nameless.Secret != want {
+		t.Fatalf("the email connection names %q, want the derived %q", nameless.Secret, want)
 	}
 }
 
@@ -406,6 +418,98 @@ func setupChannelTestWithConfig(t *testing.T, supplyCfg config.SupplyConfig) (*H
 	return h, r
 }
 
+// setupPoolTest installs an empty identity pool for the duration of a test and
+// wires the two pool routes, so a registration can be reported and then read
+// back the way the panel reads it.
+func setupPoolTest(t *testing.T) (*Handler, *gin.Engine) {
+	t.Helper()
+	previous := supply.Default()
+	t.Cleanup(func() { supply.SetDefault(previous) })
+
+	registry := supply.NewRegistry()
+	registry.SetPool(supply.NewPool())
+	supply.SetDefault(registry)
+
+	h, r := setupChannelTest(t)
+	r.GET("/supply/pool", h.GetSupplyPool)
+	r.POST("/supply/pool/accounts", h.PostSupplyPoolAccount)
+	return h, r
+}
+
+// TestSupplyPoolAccountRoundTrip checks that a reported registration is stored
+// under its identity and read back with the channel that produced it and the
+// accounts it produced. The panel draws one row per identity and one strip entry
+// per project, so both halves have to survive the round trip.
+func TestSupplyPoolAccountRoundTrip(t *testing.T) {
+	_, r := setupPoolTest(t)
+
+	bodies := []string{
+		`{"kind":"email","address":"1@ormnes.com","channel_id":"ormnes","target":"loomy","account":"loomy-16723433586","outcome":"registered"}`,
+		`{"kind":"email","address":"1@ormnes.com","target":"zcode-zai","account":"zcode-zai-0f101ea3","outcome":"registered"}`,
+	}
+	for _, body := range bodies {
+		req := httptest.NewRequest(http.MethodPost, "/supply/pool/accounts", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		rr := httptest.NewRecorder()
+		r.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("POST /supply/pool/accounts: %d %s", rr.Code, rr.Body.String())
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/supply/pool?kind=email", nil)
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET /supply/pool: %d %s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Records []map[string]any `json:"records"`
+	}
+	if errUnmarshal := json.Unmarshal(rr.Body.Bytes(), &resp); errUnmarshal != nil {
+		t.Fatalf("decode: %v", errUnmarshal)
+	}
+	if len(resp.Records) != 1 {
+		t.Fatalf("records = %d, want 1 (one identity, two registrations)", len(resp.Records))
+	}
+	record := resp.Records[0]
+	if record["address"] != "1@ormnes.com" || record["channel_id"] != "ormnes" {
+		t.Fatalf("record = %v, want the address and the channel that handed it out", record)
+	}
+	projects, _ := record["projects"].([]any)
+	if len(projects) != 2 {
+		t.Fatalf("projects = %v, want both registrations", record["projects"])
+	}
+	first, _ := projects[0].(map[string]any)
+	if first["target"] != "loomy" || first["account"] != "loomy-16723433586" {
+		t.Fatalf("first project = %v, want loomy with its account", first)
+	}
+}
+
+// TestSupplyPoolAccountRejectsIncomplete checks the report is refused when it
+// does not name an identity or a registration: a half-filled report would show
+// up as an identity nobody can trace.
+func TestSupplyPoolAccountRejectsIncomplete(t *testing.T) {
+	_, r := setupPoolTest(t)
+
+	bodies := map[string]string{
+		"no kind":    `{"address":"1@ormnes.com","target":"loomy"}`,
+		"no address": `{"kind":"email","target":"loomy"}`,
+		"no target":  `{"kind":"email","address":"1@ormnes.com"}`,
+	}
+	for name, body := range bodies {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/supply/pool/accounts", bytes.NewBufferString(body))
+			req.Header.Set("Content-Type", "application/json")
+			rr := httptest.NewRecorder()
+			r.ServeHTTP(rr, req)
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("%s: %d %s, want 400", name, rr.Code, rr.Body.String())
+			}
+		})
+	}
+}
+
 func TestSupplyChannelRejectsInvalid(t *testing.T) {
 	_, r := setupChannelTest(t)
 
@@ -429,13 +533,93 @@ func TestSupplyChannelRejectsInvalid(t *testing.T) {
 		t.Errorf("imap-phone: %d, want 400", rr.Code)
 	}
 
-	// Self-domain without domain → 400.
-	body = `{"label":"bad","email":{"enabled":true,"natures":["imap"],"connections":{"imap":{"usage":"self-domain"}}}}`
+	// Self-hosted category without a domain → 400: the category says this mailbox
+	// receives for a domain, and codes are matched by address on it.
+	body = `{"label":"bad","category":"self-built","email":{"enabled":true,"natures":["imap"],"connections":{"imap":{"account":"me@qq.com"}}}}`
 	req = httptest.NewRequest(http.MethodPost, "/supply/channels", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	rr = httptest.NewRecorder()
 	r.ServeHTTP(rr, req)
 	if rr.Code != http.StatusBadRequest {
-		t.Errorf("self-domain-no-domain: %d, want 400", rr.Code)
+		t.Errorf("self-hosted-no-domain: %d, want 400", rr.Code)
+	}
+
+	// A domain on a third-party category → 400 as well: the two answers disagree,
+	// and dropping the domain quietly would leave a channel that looks configured.
+	body = `{"label":"bad","email":{"enabled":true,"natures":["imap"],"connections":{"imap":{"account":"me@qq.com","domain":"ormnes.com"}}}}`
+	req = httptest.NewRequest(http.MethodPost, "/supply/channels", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr = httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("third-party-with-domain: %d, want 400", rr.Code)
+	}
+}
+
+// A body is usually Chinese, so the preview cut has to land on a rune boundary:
+// slicing a multi-byte rune in half leaves a replacement character at the end of
+// every truncated preview, which reads like a decoding bug in the mail itself.
+func TestPreviewTextCutsOnRuneBoundary(t *testing.T) {
+	got := previewText(strings.Repeat("验证码", 100))
+	if !strings.HasSuffix(got, "…") {
+		t.Fatalf("a long body must be marked as truncated, got %q", got)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("the cut split a rune: %q", got)
+	}
+	if len(got) > emailPreviewBytes+len("…") {
+		t.Fatalf("preview is %d bytes, want at most %d", len(got), emailPreviewBytes+len("…"))
+	}
+
+	if got := previewText("short  body\n"); got != "short body" {
+		t.Fatalf("whitespace collapse: got %q", got)
+	}
+	if got := previewText(" \n\t "); got != "" {
+		t.Fatalf("blank body: got %q", got)
+	}
+}
+
+// An OAuth2 mailbox is stored and read back like any other channel. The
+// application id comes back so the editor can show it, and the credential entry
+// name is derived under the OAuth2 prefix — the panel never sends a name, and
+// the two kinds of credential never share one.
+func TestSupplyChannelOAuth2Mailbox(t *testing.T) {
+	h, r := setupChannelTest(t)
+	id := createChannel(t, r, `{"label":"Outlook","category":"self-owned","email":{"enabled":true,"natures":["oauth2"],"connections":{"oauth2":{"endpoint":"outlook.office365.com:993","account":"Box@Outlook.com","client_id":"app-123"}}}}`)
+
+	channel := storedChannel(t, h, id)
+	conn := channel.Email.Connections[supply.NatureOAuth2]
+	if want := supply.EmailOAuth2CredentialName("box@outlook.com"); conn.Secret != want {
+		t.Fatalf("secret name = %q, want %q", conn.Secret, want)
+	}
+	if conn.ClientID != "app-123" {
+		t.Fatalf("client id = %q, want app-123", conn.ClientID)
+	}
+	if conn.Usage != "personal" {
+		t.Fatalf("usage = %q, want personal", conn.Usage)
+	}
+}
+
+// A mailbox is read one way, and an OAuth2 connection without the application id
+// can never mint a token. Both are refused when the channel is written: saving
+// them would produce a channel that looks configured and reads nothing.
+func TestSupplyChannelRejectsUnusableMailbox(t *testing.T) {
+	_, r := setupChannelTest(t)
+
+	bodies := map[string]string{
+		"both methods": `{"label":"both","email":{"enabled":true,"natures":["imap","oauth2"],"connections":{"imap":{"account":"box@qq.com","secret":"a"},"oauth2":{"account":"box@outlook.com","client_id":"app-123","secret":"b"}}}}`,
+		"no client id": `{"label":"no-app","email":{"enabled":true,"natures":["oauth2"],"connections":{"oauth2":{"endpoint":"outlook.office365.com:993","account":"box@outlook.com"}}}}`,
+		"url endpoint": `{"label":"url","email":{"enabled":true,"natures":["oauth2"],"connections":{"oauth2":{"endpoint":"https://outlook.office365.com","account":"box@outlook.com","client_id":"app-123"}}}}`,
+	}
+	for name, body := range bodies {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/supply/channels", bytes.NewBufferString(body))
+			req.Header.Set("Content-Type", "application/json")
+			rr := httptest.NewRecorder()
+			r.ServeHTTP(rr, req)
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("%s: %d %s, want 400", name, rr.Code, rr.Body.String())
+			}
+		})
 	}
 }

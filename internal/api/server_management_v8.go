@@ -83,6 +83,9 @@ func (s *Server) registerManagementV8Routes() {
 	// and which platform it registered on. It is also the pool view: ?kind=
 	// narrows it to one kind's handed-out identities.
 	v8.GET("/supply/pool", s.mgmt.GetSupplyPool)
+	// Recording a registration the pool cannot observe on its own: the caller
+	// that ran the signup reports the platform, account and outcome.
+	v8.POST("/supply/pool/accounts", s.mgmt.PostSupplyPoolAccount)
 
 	// The configured sources of identities. A channel is a label plus a nature
 	// plus the connection details that nature implies; the nature is what the
@@ -105,6 +108,12 @@ func (s *Server) registerManagementV8Routes() {
 	v8.POST("/supply/phone/web-login", s.mgmt.PostSupplyPhoneWebLogin)
 	v8.POST("/supply/phone/web-credential", s.mgmt.PostSupplyPhoneWebCredential)
 	v8.POST("/supply/phone/blacklist", s.mgmt.PostSupplyPhoneBlacklist)
+
+	// The email kind's management surface: what mailboxes are configured, what
+	// arrived in them, and where a mailbox authorization code is stored.
+	v8.GET("/supply/email/status", s.mgmt.GetSupplyEmailStatus)
+	v8.GET("/supply/email/inbox", s.mgmt.GetSupplyEmailInbox)
+	v8.POST("/supply/email/credential", s.mgmt.PostSupplyEmailCredential)
 
 	// The action surface: every plugin's named operations, plus the jobs their
 	// long-running actions run as. The panel triggers actions by key instead of

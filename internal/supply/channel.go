@@ -3,8 +3,10 @@ package supply
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -37,13 +39,23 @@ const (
 	// recipient addresses, which is what lets several self-hosted domains
 	// forward into a single channel.
 	NatureIMAP Nature = "imap"
+	// NatureOAuth2 reads a mailbox over IMAP too, but authenticates with an
+	// OAuth2 bearer token minted from a refresh token instead of with a
+	// password. Microsoft mailboxes accept nothing else: their IMAP server
+	// answers LOGINDISABLED and advertises AUTH=XOAUTH2 alone.
+	//
+	// It is a separate nature rather than a flag on NatureIMAP because the
+	// operator's answer differs — a different credential, a different form,
+	// a different failure ("the refresh token expired" is not "the password is
+	// wrong") — and because the panel asks for one connection method at a time.
+	NatureOAuth2 Nature = "oauth2"
 	// NatureWeb drives a website's own endpoints with a session cookie. Phone
 	// only: it is how a code platform's channel list is managed.
 	NatureWeb Nature = "web"
 )
 
 // natures lists every supported nature, in the order the panel offers them.
-var natures = []Nature{NatureAPI, NatureIMAP, NatureWeb}
+var natures = []Nature{NatureAPI, NatureIMAP, NatureOAuth2, NatureWeb}
 
 // Natures returns the supported natures.
 func Natures() []Nature {
@@ -68,9 +80,19 @@ func (n Nature) SupportsKind(kind Kind) bool {
 	case KindPhone:
 		return n == NatureAPI || n == NatureWeb
 	case KindEmail:
-		return n == NatureAPI || n == NatureIMAP
+		return n == NatureAPI || n == NatureIMAP || n == NatureOAuth2
 	}
 	return false
+}
+
+// ReadsMailbox reports whether this nature opens a mailbox over IMAP.
+//
+// Both IMAP and OAuth2 speak the same protocol, so they share the address
+// rules, the derived credential name shape, and the catch-all domain question.
+// They differ only in what proves the session's identity, which is why the
+// stored credential cannot be shared between them.
+func (n Nature) ReadsMailbox() bool {
+	return n == NatureIMAP || n == NatureOAuth2
 }
 
 // Connection holds the per-nature details for reaching a channel.
@@ -78,9 +100,20 @@ type Connection struct {
 	Endpoint string `json:"endpoint,omitempty"`
 	Account  string `json:"account,omitempty"`
 	Secret   string `json:"secret,omitempty"`
-	// IMAP-only fields.
+	// Mailbox-only fields.
+	//
+	// Usage is derived, not typed: it follows the channel's category (see
+	// Channel.CatchAll), so it can never disagree with it. Domain is the one fact
+	// only the operator knows, and it is required exactly when the mailbox is a
+	// domain's catch-all.
 	Usage  string `json:"usage,omitempty"`
 	Domain string `json:"domain,omitempty"`
+	// ClientID is the OAuth2 application the refresh token was issued to.
+	//
+	// It lives on the channel rather than in the secret store because it is not
+	// a secret — the refresh token is — and an operator editing the channel
+	// should see which application it belongs to without retyping it.
+	ClientID string `json:"client_id,omitempty"`
 }
 
 // KindConfig is the per-kind block inside a channel: which natures it speaks
@@ -129,6 +162,35 @@ func (c Channel) KindConfigFor(kind Kind) *KindConfig {
 	return nil
 }
 
+// CatchAllCategory reports whether category means "a domain I built that catches
+// every address" rather than "one mailbox I can read".
+//
+// The three categories answer different questions and none of them is a synonym
+// for another:
+//
+//   - third-party: someone else's service. One address at a time.
+//   - self-built:  a domain of mine with a catch-all, so a fresh address can be
+//     minted for every signup and all of them land in one mailbox.
+//   - self-owned:  a mailbox of mine (a personal mailbox, say). It is mine, but it
+//     is still exactly one address; nothing can be minted on it.
+//
+// Only self-built can hand out addresses, which is why only it needs a domain.
+func CatchAllCategory(category string) bool {
+	return strings.TrimSpace(category) == "self-built"
+}
+
+// CatchAll reports whether this channel's mailbox receives every address of a
+// domain the operator built.
+//
+// This is the switch that decides what the channel *is*, and it lives in the
+// category on purpose: "a domain of mine with a catch-all" is a fact about what
+// the channel can do, not about how we connect (the same domain can be read over
+// IMAP or through a forwarding worker's API). Keeping it here means the panel
+// asks it once, and the connection cannot contradict it.
+func (c Channel) CatchAll() bool {
+	return CatchAllCategory(c.Category)
+}
+
 // normalizeEndpoint trims a connection address and gives it an explicit scheme
 // when it was written without one, so "api.haozhuma.com" is stored as
 // "https://api.haozhuma.com" instead of failing at request time as a
@@ -153,41 +215,125 @@ func normalizeEndpoint(value string) (string, error) {
 	return strings.TrimRight(trimmed, "/"), nil
 }
 
-// normalizeConnection trims text fields and validates IMAP-specific rules.
-func normalizeConnection(nature Nature, conn Connection) (Connection, error) {
+// normalizeIMAPEndpoint validates a mailbox connection address, which is a host
+// with an optional port ("imap.qq.com:993") rather than a URL.
+//
+// IMAP is not HTTP, so the rule normalizeEndpoint applies would be actively
+// harmful here: it prefixes "https://" onto a bare host, and the client would
+// then try to dial a URL it cannot use. A scheme in an IMAP address is rejected
+// instead of silently rewritten, because the operator meant something the host
+// will not do.
+//
+// An omitted port is left off: the default belongs to the client, not to the
+// stored document.
+func normalizeIMAPEndpoint(value string) (string, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return "", nil
+	}
+	if strings.Contains(trimmed, "://") {
+		return "", fmt.Errorf("supply: imap endpoint %q must be host:port, not a URL", trimmed)
+	}
+	host, port, errSplit := net.SplitHostPort(trimmed)
+	if errSplit != nil {
+		host, port = trimmed, ""
+	}
+	if host == "" || strings.ContainsAny(host, " \t/") {
+		return "", fmt.Errorf("supply: imap endpoint %q has no usable host", trimmed)
+	}
+	if port == "" {
+		return host, nil
+	}
+	number, errAtoi := strconv.Atoi(port)
+	if errAtoi != nil || number < 1 || number > 65535 {
+		return "", fmt.Errorf("supply: imap endpoint %q has an invalid port", trimmed)
+	}
+	return host + ":" + port, nil
+}
+
+// normalizeConnection trims text fields and validates mailbox-specific rules.
+//
+// catchAll is the channel's category answer: a mailbox that receives for a
+// domain the operator owns needs that domain, and a plain mailbox must not carry
+// one. Deriving the usage from it — instead of reading a usage the caller sent —
+// is what keeps the two from disagreeing.
+func normalizeConnection(nature Nature, conn Connection, catchAll bool) (Connection, error) {
 	conn.Endpoint = strings.TrimSpace(conn.Endpoint)
 	conn.Account = strings.TrimSpace(conn.Account)
 	conn.Secret = strings.TrimSpace(conn.Secret)
 	conn.Usage = strings.TrimSpace(conn.Usage)
 	conn.Domain = strings.TrimSpace(conn.Domain)
-	endpoint, errEndpoint := normalizeEndpoint(conn.Endpoint)
-	if errEndpoint != nil {
-		return Connection{}, errEndpoint
+	conn.ClientID = strings.TrimSpace(conn.ClientID)
+	if nature.ReadsMailbox() {
+		endpoint, errEndpoint := normalizeIMAPEndpoint(conn.Endpoint)
+		if errEndpoint != nil {
+			return Connection{}, errEndpoint
+		}
+		conn.Endpoint = endpoint
+	} else {
+		endpoint, errEndpoint := normalizeEndpoint(conn.Endpoint)
+		if errEndpoint != nil {
+			return Connection{}, errEndpoint
+		}
+		conn.Endpoint = endpoint
 	}
-	conn.Endpoint = endpoint
-	if nature != NatureIMAP {
+	if !nature.ReadsMailbox() {
 		conn.Usage = ""
 		conn.Domain = ""
-	} else {
-		if conn.Usage == "" {
-			conn.Usage = "personal"
-		}
-		switch conn.Usage {
-		case "self-domain":
-			if conn.Domain == "" {
-				return Connection{}, errors.New("supply: self-domain usage requires a domain")
-			}
-		case "personal":
-			conn.Domain = ""
-		default:
-			return Connection{}, fmt.Errorf("supply: unknown imap usage %q", conn.Usage)
+		conn.ClientID = ""
+		return conn, nil
+	}
+	if nature != NatureOAuth2 {
+		conn.ClientID = ""
+	}
+	// An OAuth2 mailbox mints its access token from the refresh token, and the
+	// token endpoint needs to know which application is asking. Without it the
+	// connection can never authenticate, so it is refused here instead of
+	// becoming a channel that silently reads nothing.
+	if nature == NatureOAuth2 && conn.ClientID == "" {
+		return Connection{}, errors.New("supply: an OAuth2 mailbox needs the application id the refresh token belongs to")
+	}
+	// A mailbox credential belongs to the mailbox, so its entry name is derived
+	// from the login instead of being configured. A name already on the
+	// connection is kept: it may name an entry that exists under an older rule,
+	// and renaming the pointer would orphan the credential.
+	if conn.Secret == "" {
+		if nature == NatureOAuth2 {
+			conn.Secret = EmailOAuth2CredentialName(conn.Account)
+		} else {
+			conn.Secret = EmailCredentialName(conn.Account)
 		}
 	}
+	// A domain typed as "@example.com" (or "box@example.com") names the same
+	// domain, but stored as typed it can never match: matching appends "@" to it,
+	// and minting builds "local@" + it. That is the failure nobody can see — the
+	// channel looks configured and simply never finds a code — so it is fixed
+	// here rather than reported.
+	if conn.Domain != "" {
+		conn.Domain = strings.TrimSuffix(strings.ToLower(strings.TrimPrefix(conn.Domain, "@")), ".")
+		if strings.ContainsAny(conn.Domain, "@ \t/") {
+			return Connection{}, fmt.Errorf("supply: mailbox %q names %q, which is not a bare domain", conn.Account, conn.Domain)
+		}
+	}
+	if catchAll {
+		if conn.Domain == "" {
+			return Connection{}, errors.New("supply: a catch-all domain mailbox needs the domain it receives for")
+		}
+		conn.Usage = "self-domain"
+		return conn, nil
+	}
+	// A domain outside the self-built category is a contradiction, not something
+	// to drop quietly: the operator typed it, and dropping it would leave a
+	// channel that looks configured but can only ever receive one address.
+	if conn.Domain != "" {
+		return Connection{}, fmt.Errorf("supply: mailbox %q names domain %q, but its category is not a self-built domain", conn.Account, conn.Domain)
+	}
+	conn.Usage = "personal"
 	return conn, nil
 }
 
 // normalizeKindConfig validates one kind block.
-func normalizeKindConfig(kind Kind, kc *KindConfig) error {
+func normalizeKindConfig(kind Kind, kc *KindConfig, catchAll bool) error {
 	if len(kc.Natures) == 0 {
 		return fmt.Errorf("supply: %s config has no natures", kind)
 	}
@@ -195,7 +341,7 @@ func normalizeKindConfig(kind Kind, kc *KindConfig) error {
 		kc.Connections = make(map[Nature]Connection)
 	}
 	seen := make(map[Nature]bool, len(kc.Natures))
-	for i, nature := range kc.Natures {
+	for _, nature := range kc.Natures {
 		if !nature.Valid() {
 			return fmt.Errorf("supply: unknown nature %q in %s config", nature, kind)
 		}
@@ -206,18 +352,23 @@ func normalizeKindConfig(kind Kind, kc *KindConfig) error {
 			return fmt.Errorf("supply: duplicate nature %q in %s config", nature, kind)
 		}
 		seen[nature] = true
-		conn, errConn := normalizeConnection(nature, kc.Connections[nature])
+		conn, errConn := normalizeConnection(nature, kc.Connections[nature], catchAll)
 		if errConn != nil {
 			return errConn
 		}
 		kc.Connections[nature] = conn
-		_ = i
 	}
 	// Remove stale connection entries not in the nature list.
 	for key := range kc.Connections {
 		if !seen[key] {
 			delete(kc.Connections, key)
 		}
+	}
+	// A mailbox is read one way. IMAP and OAuth2 speak the same protocol with
+	// different credentials, so declaring both would leave the host choosing —
+	// and a wrong choice is a channel that looks configured and never reads.
+	if kind == KindEmail && seen[NatureIMAP] && seen[NatureOAuth2] {
+		return errors.New("supply: an email channel connects one way: imap or oauth2, not both")
 	}
 	return nil
 }
@@ -245,12 +396,12 @@ func (c Channel) Normalize() (Channel, error) {
 		return Channel{}, errors.New("supply: channel must serve at least one kind")
 	}
 	if c.Phone != nil {
-		if err := normalizeKindConfig(KindPhone, c.Phone); err != nil {
+		if err := normalizeKindConfig(KindPhone, c.Phone, c.CatchAll()); err != nil {
 			return Channel{}, err
 		}
 	}
 	if c.Email != nil {
-		if err := normalizeKindConfig(KindEmail, c.Email); err != nil {
+		if err := normalizeKindConfig(KindEmail, c.Email, c.CatchAll()); err != nil {
 			return Channel{}, err
 		}
 	}
@@ -405,6 +556,47 @@ func (s *ChannelStore) nextIDLocked(label string) string {
 
 func (s *ChannelStore) saveLocked() error {
 	return saveJSON(s.path, s.doc)
+}
+
+// EmailCredentialName is the secret-store entry holding one mailbox's password.
+//
+// The entry belongs to the mailbox, not to the channel: the password is the
+// login's, so naming it after the channel would ask the operator for a label
+// that means nothing and would break when the channel is renamed. Deriving it
+// from the login also means the panel never has to send a name.
+func EmailCredentialName(account string) string {
+	return emailCredentialName("email-imap-", account)
+}
+
+// EmailOAuth2CredentialName is the secret-store entry holding one mailbox's
+// OAuth2 refresh token.
+//
+// It is named apart from the password entry on purpose. The two hold different
+// kinds of value, and reusing one name across a switch from one method to the
+// other would hand a refresh token to an IMAP LOGIN command — a failure that
+// reads as "wrong password" while the real cause is the wrong kind of secret.
+func EmailOAuth2CredentialName(account string) string {
+	return emailCredentialName("email-oauth2-", account)
+}
+
+// emailCredentialName derives a mailbox's entry name under a method prefix.
+func emailCredentialName(prefix, account string) string {
+	account = strings.ToLower(strings.TrimSpace(account))
+	if account == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(prefix)
+	for _, r := range account {
+		// Keep the login readable: a name an operator can recognise in the
+		// secret store is worth more than one that is merely ASCII-safe.
+		if r == '@' || r == '.' || r == '_' || r == '-' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
+			b.WriteRune(r)
+			continue
+		}
+		b.WriteByte('-')
+	}
+	return b.String()
 }
 
 // slug reduces a label to a URL-safe ASCII identifier.

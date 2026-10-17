@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/secretstore"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/supply"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/supply/email"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/supply/phone"
 )
 
@@ -85,11 +86,9 @@ func probeChannel(ctx context.Context, channel supply.Channel) gin.H {
 	natures := map[string]gin.H{}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	// The phone kind is probed last so that a nature both kinds declare reports
-	// the phone result: the email kind has no probe yet, and its "unsupported"
-	// would otherwise hide a reachable phone connection behind the same name.
-	// Waiting between the two kinds is what makes that order hold — launching
-	// both together would let whichever goroutine wins the lock decide.
+	// Kinds are probed one after the other so that a nature name both kinds
+	// declare reports one deterministic result instead of whichever goroutine
+	// wins the lock.
 	for _, kind := range []supply.Kind{supply.KindEmail, supply.KindPhone} {
 		config := channel.KindConfigFor(kind)
 		if config == nil {
@@ -112,11 +111,6 @@ func probeChannel(ctx context.Context, channel supply.Channel) gin.H {
 // probeNature runs one nature's probe. Only the natures a kind declares are
 // ever probed, so an undeclared one never appears in the answer.
 func probeNature(ctx context.Context, kind supply.Kind, nature supply.Nature, connection supply.Connection) gin.H {
-	// The email kind has no probe yet: IMAP is not implemented in the base, so
-	// the honest answer is "unsupported" rather than a failure.
-	if kind != supply.KindPhone {
-		return gin.H{"state": probeUnsupported}
-	}
 	credential, reason := probeCredential(connection.Secret)
 	if reason != "" {
 		return gin.H{"state": probeUnready, "detail": reason}
@@ -126,10 +120,14 @@ func probeNature(ctx context.Context, kind supply.Kind, nature supply.Nature, co
 
 	var detail string
 	var errProbe error
-	switch nature {
-	case supply.NatureAPI:
+	switch {
+	case kind == supply.KindEmail && nature == supply.NatureIMAP:
+		detail, errProbe = email.ProbeIMAP(ctxProbe, connection.Endpoint, connection.Account, credential)
+	case kind == supply.KindEmail && nature == supply.NatureOAuth2:
+		detail, errProbe = email.ProbeOAuth2(ctxProbe, connection.Endpoint, connection.Account, connection.ClientID, credential)
+	case kind == supply.KindPhone && nature == supply.NatureAPI:
 		detail, errProbe = phone.ProbeAPI(ctxProbe, connection.Endpoint, credential)
-	case supply.NatureWeb:
+	case kind == supply.KindPhone && nature == supply.NatureWeb:
 		detail, errProbe = phone.ProbeWeb(ctxProbe, connection.Endpoint, credential)
 	default:
 		return gin.H{"state": probeUnsupported}
@@ -137,7 +135,7 @@ func probeNature(ctx context.Context, kind supply.Kind, nature supply.Nature, co
 	if errProbe != nil {
 		// A probe that could not even be attempted is not an unreachable
 		// channel: the panel reports those as two different states.
-		if errors.Is(errProbe, phone.ErrProbeUnready) {
+		if errors.Is(errProbe, phone.ErrProbeUnready) || errors.Is(errProbe, email.ErrProbeUnready) {
 			return gin.H{"state": probeUnready, "detail": errProbe.Error()}
 		}
 		return gin.H{"state": probeOffline, "detail": errProbe.Error()}

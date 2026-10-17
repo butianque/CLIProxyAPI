@@ -3,6 +3,7 @@ package management
 import (
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/supply"
@@ -72,6 +73,16 @@ func resolveAuthIndex(record supply.Record, index map[string]string) (string, bo
 	return found, true
 }
 
+// poolProjectView is one registration as the panel shows it: which platform the
+// identity registered on, which account it produced, how that ended, and when it
+// was last seen.
+type poolProjectView struct {
+	Target  string `json:"target"`
+	Account string `json:"account,omitempty"`
+	Outcome string `json:"outcome,omitempty"`
+	At      int64  `json:"at,omitempty"`
+}
+
 // poolRecordView renders one record for the panel.
 func poolRecordView(record supply.Record, index map[string]string) gin.H {
 	authIndex, resolved := resolveAuthIndex(record, index)
@@ -90,13 +101,87 @@ func poolRecordView(record supply.Record, index map[string]string) gin.H {
 		"first_seen": record.FirstSeen,
 		"last_used":  record.LastUsed,
 	}
+	if record.ChannelID != "" {
+		view["channel_id"] = record.ChannelID
+	}
 	if resolved {
 		view["auth_index_resolved"] = true
 	}
 	if len(record.Meta) > 0 {
 		view["meta"] = record.Meta
 	}
+	// The registrations are the identity's history, so the panel can show the
+	// accounts one address or number produced. An entry without a target is not
+	// a registration and is left out rather than shown as an empty platform.
+	projects := make([]poolProjectView, 0, len(record.Registrations))
+	for _, registration := range record.Registrations {
+		if strings.TrimSpace(registration.Target) == "" {
+			continue
+		}
+		projects = append(projects, poolProjectView{
+			Target:  registration.Target,
+			Account: registration.Account,
+			Outcome: registration.Outcome,
+			At:      registration.At,
+		})
+	}
+	if len(projects) > 0 {
+		view["projects"] = projects
+	}
 	return view
+}
+
+// PostSupplyPoolAccount records one registration an identity was used for.
+//
+// The pool is otherwise written by the supply kinds themselves, but a
+// registration is the one fact a caller knows better than the host: whoever ran
+// the signup knows the platform, the account name and how it ended. This lets
+// that be reported instead of guessed, and it is also how an identity handed out
+// before the pool kept registrations is backfilled.
+//
+// The body is {"kind":"phone|email","address":"...","channel_id":"...",
+// "target":"...","account":"...","outcome":"..."}. Kind, address and target are
+// required: without them there is no identity and no registration to record.
+func (h *Handler) PostSupplyPoolAccount(c *gin.Context) {
+	var body struct {
+		Kind      string `json:"kind"`
+		Address   string `json:"address"`
+		ChannelID string `json:"channel_id"`
+		Target    string `json:"target"`
+		Account   string `json:"account"`
+		AuthIndex string `json:"auth_index"`
+		Outcome   string `json:"outcome"`
+	}
+	if errBind := c.ShouldBindJSON(&body); errBind != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid JSON body"})
+		return
+	}
+	kind := supply.Kind(strings.ToLower(strings.TrimSpace(body.Kind)))
+	if !kind.Valid() {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "kind must be phone or email"})
+		return
+	}
+	address := strings.TrimSpace(body.Address)
+	if address == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "address is required"})
+		return
+	}
+	target := strings.TrimSpace(body.Target)
+	if target == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "target is required"})
+		return
+	}
+	pool := supply.DefaultPool()
+	if pool == nil {
+		c.JSON(http.StatusOK, gin.H{"status": "ok", "enabled": false})
+		return
+	}
+	pool.Register(kind, address, body.ChannelID, target, body.Account, body.AuthIndex, body.Outcome, time.Now().Unix())
+	if errSave := pool.Save(supply.PoolPath(supplyStateDir(h))); errSave != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": errSave.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
 // authIndexByName maps a credential name to its runtime auth index. Both the

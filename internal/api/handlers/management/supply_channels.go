@@ -52,6 +52,10 @@ func connectionView(nature supply.Nature, conn supply.Connection, secretNames []
 	if conn.Domain != "" {
 		view["domain"] = conn.Domain
 	}
+	// The application id is not a secret: the refresh token in the store is.
+	if conn.ClientID != "" {
+		view["client_id"] = conn.ClientID
+	}
 	return view
 }
 
@@ -239,6 +243,7 @@ type connectionBody struct {
 	Secret   string `json:"secret"`
 	Usage    string `json:"usage"`
 	Domain   string `json:"domain"`
+	ClientID string `json:"client_id"`
 }
 
 func toKindConfig(body *kindConfigBody) *supply.KindConfig {
@@ -258,6 +263,7 @@ func toKindConfig(body *kindConfigBody) *supply.KindConfig {
 			Secret:   cb.Secret,
 			Usage:    cb.Usage,
 			Domain:   cb.Domain,
+			ClientID: cb.ClientID,
 		}
 	}
 	return &supply.KindConfig{

@@ -27,6 +27,11 @@ type Record struct {
 
 	// Source names who supplied the identity, e.g. "haozhuma" or "mail.tm".
 	Source string `json:"source,omitempty"`
+	// ChannelID names the configured supply channel that handed the identity
+	// out, which is the join back to the source's settings. It is separate
+	// from Source because a source is a platform and a channel is one account
+	// on it: several channels can share one source.
+	ChannelID string `json:"channel_id,omitempty"`
 	// Target names the platform the identity registered, e.g. "loomy". It is
 	// empty until an account is linked, which is the honest state for an
 	// identity that was handed out but never registered anything.
@@ -44,6 +49,12 @@ type Record struct {
 	Account   string `json:"account,omitempty"`
 	AuthIndex string `json:"auth_index,omitempty"`
 
+	// Registrations is every account this identity was used to register. Target
+	// and Account above mirror the newest one, because that is what a credential
+	// lookup asks for; the list is the history, because one identity can be
+	// handed out again and register on a second platform.
+	Registrations []Registration `json:"registrations,omitempty"`
+
 	// Price is the per-handout cost in CNY. Email sources are usually free.
 	Price float64 `json:"price,omitempty"`
 	// Outcome is the last thing that happened to the identity, e.g.
@@ -52,8 +63,8 @@ type Record struct {
 	Outcome string `json:"outcome,omitempty"`
 	State   string `json:"state,omitempty"`
 
-	// Rents counts how many times the identity has been handed out, and Spend
-	// is the total CNY spent on it.
+	// Rents counts how many times the identity has been used: each handout, and
+	// each new account it registered. Spend is the total CNY spent on it.
 	Rents int     `json:"rents,omitempty"`
 	Spend float64 `json:"spend,omitempty"`
 	// FirstSeen and LastUsed are unix seconds.
@@ -64,6 +75,20 @@ type Record struct {
 	// region; an email's domain. Values are plain JSON so a kind can add one
 	// without changing this struct.
 	Meta map[string]any `json:"meta,omitempty"`
+}
+
+// Registration is one platform account an identity was used to register.
+//
+// A registration is keyed by (Target, Account): the same account registered
+// again is the same fact restated, so it updates its entry rather than adding a
+// second line for it. At is when that was last observed, which is what tells a
+// reader whether the account is still the current one.
+type Registration struct {
+	Target    string `json:"target"`
+	Account   string `json:"account,omitempty"`
+	AuthIndex string `json:"auth_index,omitempty"`
+	Outcome   string `json:"outcome,omitempty"`
+	At        int64  `json:"at,omitempty"`
 }
 
 // MetaString reads one string entry out of a record's Meta bag.
@@ -204,29 +229,103 @@ func (l *Pool) Record(kind Kind, address, source string, price float64, meta map
 // pool knows an identity was handed out; after it, the pool knows which
 // account and which platform it belongs to.
 //
+// It only ever annotates an identity the pool already knows. A link for an
+// address that was never handed out is a no-op, because the pool is the host's
+// record of what it supplied, not a place to learn about identities from
+// outside; the caller that does know the identity reaches Register directly.
+//
 // It records the outcome and state of a successful registration, overwriting
 // whatever a previous attempt left. Registration is the most recent fact and a
 // definitive success, so a record that was marked timed-out or released by an
 // earlier attempt must not keep saying so once an account is bound to it: the
 // identity is held by that account now.
 func (l *Pool) Link(kind Kind, address, target, account, authIndex string, now int64) {
-	i := l.find(kind, address)
-	if i < 0 {
+	if l.find(kind, address) < 0 {
 		return
 	}
+	record := l.Register(kind, address, "", target, account, authIndex, "registered", now)
+	record.State = "held"
+}
+
+// Register notes that an identity was used to register an account, and on which
+// platform.
+//
+// It is the write behind a registration, so it creates the record when the
+// identity is new: a caller that knows which account an identity registered does
+// not need a prior handout to have been booked first. That is the difference
+// between Register and Link — Link annotates what the pool already knows, while
+// Register states the fact and lets the record follow.
+//
+// An empty target appends no registration, because nothing was registered; the
+// record is still updated, which is what makes a bare handout traceable to the
+// channel that produced it. A registration for a pair the record already carries
+// is that fact restated, so it updates the existing entry in place and leaves
+// the rent count alone; a new pair is a new use of the identity, so it is
+// appended and counted.
+func (l *Pool) Register(kind Kind, address, channelID, target, account, authIndex, outcome string, now int64) *Record {
+	if l.Version == 0 {
+		l.Version = poolVersion
+	}
+	address = strings.TrimSpace(address)
+	channelID = strings.TrimSpace(channelID)
+	target = strings.TrimSpace(target)
+	account = strings.TrimSpace(account)
+	authIndex = strings.TrimSpace(authIndex)
+	outcome = strings.TrimSpace(outcome)
+
+	i := l.find(kind, address)
+	if i < 0 {
+		l.Records = append(l.Records, Record{
+			Kind:      kind,
+			Address:   address,
+			Source:    channelID,
+			ChannelID: channelID,
+			FirstSeen: now,
+			LastUsed:  now,
+		})
+		i = len(l.Records) - 1
+	}
 	record := &l.Records[i]
-	if target = strings.TrimSpace(target); target != "" {
+	// The channel is written once. An identity keeps the channel that first
+	// produced it, so a later report cannot quietly reassign its history.
+	if channelID != "" && record.ChannelID == "" {
+		record.ChannelID = channelID
+	}
+	// Empty arguments leave the existing value in place: a registration report
+	// carries what its caller knows, not a full record.
+	if target != "" {
 		record.Target = target
 	}
-	if account = strings.TrimSpace(account); account != "" {
+	if account != "" {
 		record.Account = account
 	}
-	if authIndex = strings.TrimSpace(authIndex); authIndex != "" {
+	if authIndex != "" {
 		record.AuthIndex = authIndex
 	}
-	record.Outcome = "registered"
-	record.State = "held"
+	if outcome != "" {
+		record.Outcome = outcome
+	}
 	record.LastUsed = now
+	if target == "" {
+		return record
+	}
+
+	registration := Registration{
+		Target:    target,
+		Account:   account,
+		AuthIndex: authIndex,
+		Outcome:   outcome,
+		At:        now,
+	}
+	for j := range record.Registrations {
+		if record.Registrations[j].Target == target && record.Registrations[j].Account == account {
+			record.Registrations[j] = registration
+			return record
+		}
+	}
+	record.Registrations = append(record.Registrations, registration)
+	record.Rents++
+	return record
 }
 
 // Mark records what last happened to an identity and where it now stands.

@@ -166,6 +166,107 @@ func TestLoadPoolMissingFileIsEmpty(t *testing.T) {
 	}
 }
 
+// Register states the fact a handout alone cannot: which platform account the
+// identity produced. It creates the record when the identity is new, because a
+// caller that knows the account does not need a handout to have been booked
+// first, and it keeps the registration so one identity can show every account it
+// was used for.
+func TestPoolRegisterCreatesRecordAndRegistration(t *testing.T) {
+	pool := NewPool()
+
+	record := pool.Register(KindEmail, "1@ormnes.com", "ormnesqq", "zcode", "zcode-1@ormnes.com", "", "registered", 10)
+	if record == nil {
+		t.Fatal("Register must return the record it wrote")
+	}
+	if len(pool.Records) != 1 {
+		t.Fatalf("records = %d, want the one identity", len(pool.Records))
+	}
+
+	got, ok := pool.Get(KindEmail, "1@ormnes.com")
+	if !ok {
+		t.Fatal("the registered identity is not in the pool")
+	}
+	if got.Source != "ormnesqq" || got.ChannelID != "ormnesqq" {
+		t.Fatalf("source = %q channel = %q, want the channel that handed the address out", got.Source, got.ChannelID)
+	}
+	if got.Target != "zcode" || got.Account != "zcode-1@ormnes.com" {
+		t.Fatalf("record = %+v, want the registered platform and account", got)
+	}
+	if got.Outcome != "registered" {
+		t.Fatalf("outcome = %q, want registered", got.Outcome)
+	}
+	if got.FirstSeen != 10 || got.LastUsed != 10 {
+		t.Fatalf("first seen = %d last used = %d, want the registration time", got.FirstSeen, got.LastUsed)
+	}
+	if got.Rents != 1 {
+		t.Fatalf("rents = %d, want 1 for the first use", got.Rents)
+	}
+	if len(got.Registrations) != 1 {
+		t.Fatalf("registrations = %+v, want the one account", got.Registrations)
+	}
+	if got.Registrations[0].Target != "zcode" || got.Registrations[0].Account != "zcode-1@ormnes.com" || got.Registrations[0].At != 10 {
+		t.Fatalf("registration = %+v, want the account and the time it was seen", got.Registrations[0])
+	}
+}
+
+// The same account reported again is the same fact restated: it updates the
+// entry instead of adding a second line, and it is not another use of the
+// identity. The channel is not reassigned either, because a record keeps the
+// channel that first produced it.
+func TestPoolRegisterRestatesTheSameAccount(t *testing.T) {
+	pool := NewPool()
+	pool.Register(KindEmail, "1@ormnes.com", "ormnesqq", "zcode", "zcode-1@ormnes.com", "", "registered", 10)
+
+	pool.Register(KindEmail, "1@ormnes.com", "other-channel", "zcode", "zcode-1@ormnes.com", "idx-9", "verified", 20)
+
+	got, _ := pool.Get(KindEmail, "1@ormnes.com")
+	if len(got.Registrations) != 1 {
+		t.Fatalf("registrations = %+v, want the same account restated, not duplicated", got.Registrations)
+	}
+	if got.Rents != 1 {
+		t.Fatalf("rents = %d, want 1: restating an account is not another use", got.Rents)
+	}
+	registration := got.Registrations[0]
+	if registration.At != 20 || registration.Outcome != "verified" || registration.AuthIndex != "idx-9" {
+		t.Fatalf("registration = %+v, want the newest facts", registration)
+	}
+	if got.ChannelID != "ormnesqq" {
+		t.Fatalf("channel = %q, want the channel that first produced the identity", got.ChannelID)
+	}
+}
+
+// A second account on the same platform is a new use of the identity, so it is
+// appended and counted, and the record's Target/Account follow the newest one.
+func TestPoolRegisterCountsANewAccountOnTheSameTarget(t *testing.T) {
+	pool := NewPool()
+	pool.Register(KindEmail, "1@ormnes.com", "ormnesqq", "zcode", "zcode-1@ormnes.com", "", "registered", 10)
+
+	pool.Register(KindEmail, "1@ormnes.com", "ormnesqq", "zcode", "zcode-2@ormnes.com", "", "registered", 30)
+
+	got, _ := pool.Get(KindEmail, "1@ormnes.com")
+	if len(got.Registrations) != 2 {
+		t.Fatalf("registrations = %+v, want both accounts", got.Registrations)
+	}
+	if got.Rents != 2 {
+		t.Fatalf("rents = %d, want 2 uses", got.Rents)
+	}
+	if got.Account != "zcode-2@ormnes.com" {
+		t.Fatalf("account = %q, want the newest registration", got.Account)
+	}
+}
+
+// Link annotates what the pool already knows, so an address it never handed out
+// stays unknown: a registration report must not invent an identity.
+func TestPoolLinkUnknownIdentityIsNoop(t *testing.T) {
+	pool := NewPool()
+
+	pool.Link(KindEmail, "absent@ormnes.com", "zcode", "zcode-absent", "", 5)
+
+	if len(pool.Records) != 0 {
+		t.Fatalf("records = %+v, want nothing for an address that was never handed out", pool.Records)
+	}
+}
+
 // ForAccount and ForTarget answer the two questions the pool exists for.
 func TestPoolQueriesByAccountAndTarget(t *testing.T) {
 	pool := NewPool()

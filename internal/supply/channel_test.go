@@ -49,7 +49,7 @@ func TestChannelNormalizeBothKinds(t *testing.T) {
 			Enabled: true,
 			Natures: []Nature{NatureIMAP},
 			Connections: map[Nature]Connection{
-				NatureIMAP: {Account: "me@qq.com", Secret: "imap-pass", Usage: "personal"},
+				NatureIMAP: {Account: "me@qq.com", Secret: "imap-pass"},
 			},
 		},
 	}
@@ -77,6 +77,8 @@ func TestChannelNormalizeNoKind(t *testing.T) {
 }
 
 func TestChannelNormalizeImapSelfDomain(t *testing.T) {
+	// The category is the only place that says "a domain I built"; the usage
+	// follows from it, so a caller that sends neither still lands on self-domain.
 	c := Channel{
 		Label:    "ormnes.com",
 		Category: "self-built",
@@ -84,7 +86,7 @@ func TestChannelNormalizeImapSelfDomain(t *testing.T) {
 			Enabled: true,
 			Natures: []Nature{NatureIMAP},
 			Connections: map[Nature]Connection{
-				NatureIMAP: {Account: "me@qq.com", Secret: "imap-pass", Usage: "self-domain", Domain: "ormnes.com"},
+				NatureIMAP: {Account: "me@qq.com", Secret: "imap-pass", Domain: "ormnes.com"},
 			},
 		},
 	}
@@ -101,20 +103,158 @@ func TestChannelNormalizeImapSelfDomain(t *testing.T) {
 	}
 }
 
-func TestChannelNormalizeImapSelfDomainNoDomain(t *testing.T) {
+// A mailbox of mine is mine, but it is still one address: only a domain I built
+// can hand out new ones. This is the difference between self-owned and
+// self-built, and it is the difference the panel shows as two categories.
+func TestChannelNormalizeImapOwnMailboxIsPersonal(t *testing.T) {
 	c := Channel{
-		Label: "bad",
+		Label:    "my-qq",
+		Category: "self-owned",
 		Email: &KindConfig{
 			Enabled: true,
 			Natures: []Nature{NatureIMAP},
 			Connections: map[Nature]Connection{
-				NatureIMAP: {Usage: "self-domain"},
+				NatureIMAP: {Account: "me@qq.com", Secret: "imap-pass"},
+			},
+		},
+	}
+	got, err := c.Normalize()
+	if err != nil {
+		t.Fatalf("normalize failed: %v", err)
+	}
+	conn := got.Email.Connections[NatureIMAP]
+	if conn.Usage != "personal" {
+		t.Errorf("usage = %q, want personal", conn.Usage)
+	}
+	if conn.Domain != "" {
+		t.Errorf("domain = %q, want empty", conn.Domain)
+	}
+}
+
+// The same mailbox cannot claim a domain just because it is self-owned: a domain
+// is only meaningful where addresses are minted on it.
+func TestChannelNormalizeImapOwnMailboxRejectsDomain(t *testing.T) {
+	c := Channel{
+		Label:    "my-qq",
+		Category: "self-owned",
+		Email: &KindConfig{
+			Enabled: true,
+			Natures: []Nature{NatureIMAP},
+			Connections: map[Nature]Connection{
+				NatureIMAP: {Account: "me@qq.com", Domain: "ormnes.com"},
+			},
+		},
+	}
+	if _, err := c.Normalize(); err == nil {
+		t.Fatal("expected error for a domain on a self-owned mailbox")
+	}
+}
+
+func TestChannelNormalizeImapSelfDomainNoDomain(t *testing.T) {
+	c := Channel{
+		Label:    "bad",
+		Category: "self-built",
+		Email: &KindConfig{
+			Enabled: true,
+			Natures: []Nature{NatureIMAP},
+			Connections: map[Nature]Connection{
+				NatureIMAP: {Account: "me@qq.com"},
 			},
 		},
 	}
 	_, err := c.Normalize()
 	if err == nil {
-		t.Fatal("expected error for self-domain without domain")
+		t.Fatal("expected error for a catch-all mailbox without a domain")
+	}
+}
+
+func TestChannelNormalizeImapPersonalMailbox(t *testing.T) {
+	// A third-party mailbox is one address, so any usage the caller sent is
+	// replaced rather than trusted.
+	c := Channel{
+		Label: "qq",
+		Email: &KindConfig{
+			Enabled: true,
+			Natures: []Nature{NatureIMAP},
+			Connections: map[Nature]Connection{
+				NatureIMAP: {Account: "me@qq.com", Secret: "imap-pass", Usage: "self-domain"},
+			},
+		},
+	}
+	got, err := c.Normalize()
+	if err != nil {
+		t.Fatalf("normalize failed: %v", err)
+	}
+	conn := got.Email.Connections[NatureIMAP]
+	if conn.Usage != "personal" {
+		t.Errorf("usage = %q, want personal", conn.Usage)
+	}
+	if conn.Domain != "" {
+		t.Errorf("domain = %q, want empty", conn.Domain)
+	}
+}
+
+// A domain typed with the at-sign is the same domain. Stored as typed it could
+// never match anything: the catch-all check appends "@" to it and the mint path
+// builds "local@" + it, so "configured" would silently mean "never finds a code".
+func TestChannelNormalizeImapDomainAcceptsAtSign(t *testing.T) {
+	c := Channel{
+		Label:    "ormnes.com",
+		Category: "self-built",
+		Email: &KindConfig{
+			Enabled: true,
+			Natures: []Nature{NatureIMAP},
+			Connections: map[Nature]Connection{
+				NatureIMAP: {Account: "me@qq.com", Domain: " @Ormnes.com. "},
+			},
+		},
+	}
+	got, err := c.Normalize()
+	if err != nil {
+		t.Fatalf("normalize failed: %v", err)
+	}
+	if domain := got.Email.Connections[NatureIMAP].Domain; domain != "ormnes.com" {
+		t.Errorf("domain = %q, want ormnes.com", domain)
+	}
+}
+
+// A whole address in the domain field is a different mistake, and it fails the
+// same way, so it is refused instead of stored.
+func TestChannelNormalizeImapDomainRejectsAddress(t *testing.T) {
+	c := Channel{
+		Label:    "bad",
+		Category: "self-built",
+		Email: &KindConfig{
+			Enabled: true,
+			Natures: []Nature{NatureIMAP},
+			Connections: map[Nature]Connection{
+				NatureIMAP: {Account: "me@qq.com", Domain: "box@ormnes.com"},
+			},
+		},
+	}
+	if _, err := c.Normalize(); err == nil {
+		t.Fatal("expected error for an address in the domain field")
+	}
+}
+
+func TestChannelNormalizeImapDomainWithoutCatchAllCategory(t *testing.T) {
+	// A domain on a channel that cannot catch all of it is a contradiction, not
+	// something to drop silently: the operator typed it, and the answer is to
+	// change the category rather than to lose the domain.
+	c := Channel{
+		Label:    "contradiction",
+		Category: "third-party",
+		Email: &KindConfig{
+			Enabled: true,
+			Natures: []Nature{NatureIMAP},
+			Connections: map[Nature]Connection{
+				NatureIMAP: {Account: "me@qq.com", Domain: "ormnes.com"},
+			},
+		},
+	}
+	_, err := c.Normalize()
+	if err == nil {
+		t.Fatal("expected error for a domain on a non catch-all channel")
 	}
 }
 
@@ -202,6 +342,69 @@ func TestChannelNormalizeConnectionEndpoint(t *testing.T) {
 			}
 			if endpoint := got.Phone.Connections[NatureAPI].Endpoint; endpoint != testCase.want {
 				t.Fatalf("endpoint for %q = %q, want %q", testCase.endpoint, endpoint, testCase.want)
+			}
+		})
+	}
+}
+
+// An IMAP address is a host:port, not a URL. Applying the http(s) rule would
+// rewrite "imap.qq.com:993" into "https://imap.qq.com:993", and the client would
+// then be handed an address it cannot dial — so the two rules must stay apart.
+func TestChannelNormalizeImapEndpoint(t *testing.T) {
+	cases := []struct {
+		name     string
+		endpoint string
+		want     string
+	}{
+		{name: "host and port", endpoint: "imap.qq.com:993", want: "imap.qq.com:993"},
+		{name: "host only keeps the port off", endpoint: "imap.qq.com", want: "imap.qq.com"},
+		{name: "surrounding space is trimmed", endpoint: "  imap.qq.com:993  ", want: "imap.qq.com:993"},
+		{name: "blank stays blank", endpoint: "   ", want: ""},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			c := Channel{
+				Label: "QQ",
+				Email: &KindConfig{
+					Enabled: true,
+					Natures: []Nature{NatureIMAP},
+					Connections: map[Nature]Connection{
+						NatureIMAP: {Endpoint: testCase.endpoint, Account: "box@qq.com", Secret: "mail-key"},
+					},
+				},
+			}
+			got, err := c.Normalize()
+			if err != nil {
+				t.Fatalf("normalize failed for %q: %v", testCase.endpoint, err)
+			}
+			if endpoint := got.Email.Connections[NatureIMAP].Endpoint; endpoint != testCase.want {
+				t.Fatalf("endpoint for %q = %q, want %q", testCase.endpoint, endpoint, testCase.want)
+			}
+		})
+	}
+}
+
+// A URL in an IMAP address is refused rather than silently rewritten: the
+// operator meant something the mailbox client will not do.
+func TestChannelNormalizeRejectsImapURL(t *testing.T) {
+	for _, endpoint := range []string{"https://imap.qq.com", "imap://imap.qq.com", "imap.qq.com:notaport"} {
+		t.Run(endpoint, func(t *testing.T) {
+			c := Channel{
+				Label: "bad",
+				Email: &KindConfig{
+					Enabled: true,
+					Natures: []Nature{NatureIMAP},
+					Connections: map[Nature]Connection{
+						NatureIMAP: {Endpoint: endpoint, Account: "box@qq.com", Secret: "s"},
+					},
+				},
+			}
+			_, err := c.Normalize()
+			if err == nil {
+				t.Fatalf("expected %q to be rejected", endpoint)
+			}
+			if !strings.Contains(err.Error(), "endpoint") {
+				t.Fatalf("err = %v, want it to name the endpoint", err)
 			}
 		})
 	}
@@ -315,5 +518,105 @@ func TestChannelStorePersistence(t *testing.T) {
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Errorf("file should still exist: %v", err)
+	}
+}
+
+// An OAuth2 mailbox is a mailbox: it takes the same address rules and the same
+// catch-all question, and its credential is derived from the login like the
+// password entry is. What differs is the entry prefix — the two hold different
+// kinds of value, so sharing a name would feed a refresh token to a LOGIN.
+func TestChannelNormalizeOAuth2Mailbox(t *testing.T) {
+	c := Channel{
+		Label:    "outlook",
+		Category: "self-built",
+		Email: &KindConfig{
+			Enabled: true,
+			Natures: []Nature{NatureOAuth2},
+			Connections: map[Nature]Connection{
+				NatureOAuth2: {
+					Endpoint: "outlook.office365.com:993",
+					Account:  "Box@Outlook.com",
+					ClientID: "app-123",
+					Domain:   "ormnes.com",
+				},
+			},
+		},
+	}
+	got, err := c.Normalize()
+	if err != nil {
+		t.Fatalf("normalize failed: %v", err)
+	}
+	conn := got.Email.Connections[NatureOAuth2]
+	if want := "email-oauth2-box@outlook.com"; conn.Secret != want {
+		t.Errorf("secret name = %q, want %q", conn.Secret, want)
+	}
+	if conn.Usage != "self-domain" {
+		t.Errorf("usage = %q, want self-domain", conn.Usage)
+	}
+	if conn.ClientID != "app-123" {
+		t.Errorf("client id = %q, want app-123", conn.ClientID)
+	}
+}
+
+// Without the application id the token endpoint cannot be asked for anything, so
+// the connection can never authenticate: refusing it at write time keeps it from
+// becoming a channel that looks configured and silently reads nothing.
+func TestChannelNormalizeOAuth2NeedsClientID(t *testing.T) {
+	c := Channel{
+		Label:    "outlook",
+		Category: "self-owned",
+		Email: &KindConfig{
+			Enabled: true,
+			Natures: []Nature{NatureOAuth2},
+			Connections: map[Nature]Connection{
+				NatureOAuth2: {Endpoint: "outlook.office365.com:993", Account: "box@outlook.com"},
+			},
+		},
+	}
+	if _, err := c.Normalize(); err == nil {
+		t.Fatal("an OAuth2 mailbox without an application id was accepted")
+	}
+}
+
+// One mailbox is read one way. Declaring both methods would leave the host
+// choosing, and a wrong choice is a channel that never reads its mail.
+func TestChannelNormalizeRejectsBothMailboxMethods(t *testing.T) {
+	c := Channel{
+		Label:    "both",
+		Category: "self-owned",
+		Email: &KindConfig{
+			Enabled: true,
+			Natures: []Nature{NatureIMAP, NatureOAuth2},
+			Connections: map[Nature]Connection{
+				NatureIMAP:   {Endpoint: "imap.qq.com:993", Account: "box@qq.com"},
+				NatureOAuth2: {Endpoint: "outlook.office365.com:993", Account: "box@outlook.com", ClientID: "app-123"},
+			},
+		},
+	}
+	if _, err := c.Normalize(); err == nil {
+		t.Fatal("a mailbox declaring both methods was accepted")
+	}
+}
+
+// An application id belongs to the method that uses it. A leftover from an
+// earlier OAuth2 attempt must not ride along on a password login.
+func TestChannelNormalizeClearsClientIDOutsideOAuth2(t *testing.T) {
+	c := Channel{
+		Label:    "qq",
+		Category: "self-owned",
+		Email: &KindConfig{
+			Enabled: true,
+			Natures: []Nature{NatureIMAP},
+			Connections: map[Nature]Connection{
+				NatureIMAP: {Endpoint: "imap.qq.com:993", Account: "box@qq.com", ClientID: "app-123"},
+			},
+		},
+	}
+	got, err := c.Normalize()
+	if err != nil {
+		t.Fatalf("normalize failed: %v", err)
+	}
+	if conn := got.Email.Connections[NatureIMAP]; conn.ClientID != "" {
+		t.Errorf("client id = %q, want it cleared", conn.ClientID)
 	}
 }

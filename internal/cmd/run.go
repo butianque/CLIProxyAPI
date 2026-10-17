@@ -18,6 +18,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/secretstore"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/supply"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/supply/email"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/supply/phone"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy"
 	log "github.com/sirupsen/logrus"
@@ -69,8 +70,40 @@ func installSupply(cfg *config.Config, configPath string) {
 			log.Warnf("phone supply kind not registered: %v", errRegister)
 		}
 	}
+	if provider, errEmail := buildEmailProvider(cfg, configPath, registry.Pool()); errEmail != nil {
+		log.Warnf("email supply kind disabled: %v", errEmail)
+	} else if provider != nil {
+		if errRegister := registry.Register(provider); errRegister != nil {
+			log.Warnf("email supply kind not registered: %v", errRegister)
+		}
+	}
 	supply.SetDefault(registry)
 	log.Infof("account supply ready at %s", supplyStateSummary(registry))
+}
+
+// buildEmailProvider assembles the email provider.
+//
+// Unlike the phone kind it does not require an unlocked store at construction:
+// every mailbox carries its own secret name, and the value is read per call. A
+// locked store therefore still yields a provider — one that reports "unknown"
+// rather than "absent", which is the honest answer and the one the panel needs
+// in order to offer an unlock.
+func buildEmailProvider(cfg *config.Config, configPath string, pool *supply.Pool) (*email.ProviderImpl, error) {
+	if cfg == nil {
+		return nil, nil
+	}
+	supplyCfg := cfg.Supply.WithDefaults()
+	if supplyCfg.Email.Disabled {
+		return nil, nil
+	}
+	stateDir := supplyStateDir(cfg, configPath)
+	return email.New(email.Config{
+		ChannelsPath: supply.ChannelPath(stateDir),
+		Pool:         pool,
+		PoolPath:     supply.PoolPath(stateDir),
+		PollWindow:   time.Duration(supplyCfg.Email.PollWindowHours) * time.Hour,
+		MaxMessages:  supplyCfg.Email.MaxMessages,
+	})
 }
 
 // supplyStateDir resolves where the supply service keeps its on-disk state.

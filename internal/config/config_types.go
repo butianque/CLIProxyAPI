@@ -298,6 +298,29 @@ type SupplyConfig struct {
 
 	// Phone configures the phone supply kind.
 	Phone SupplyPhoneConfig `yaml:"phone" json:"phone"`
+
+	// Email configures the email supply kind.
+	Email SupplyEmailConfig `yaml:"email" json:"email"`
+}
+
+// SupplyEmailConfig configures the email supply kind.
+//
+// Unlike the phone kind, this one holds no credential names: each mailbox is a
+// channel, and a channel names its own secret. What is left here is the shape
+// of a read.
+type SupplyEmailConfig struct {
+	// Disabled turns the email kind off. It is an opt-out: the kind is served
+	// whenever at least one enabled mailbox channel exists.
+	Disabled bool `yaml:"disabled" json:"disabled"`
+
+	// PollWindowHours bounds how far back a read looks for a verification mail.
+	// Empty means DefaultSupplyEmailPollWindowHours.
+	PollWindowHours int64 `yaml:"poll-window-hours" json:"poll-window-hours"`
+
+	// MaxMessages caps how many messages one folder contributes to a read. An
+	// inbox is not read in full: only the newest few can hold a live code.
+	// Empty means DefaultSupplyEmailMaxMessages.
+	MaxMessages int `yaml:"max-messages" json:"max-messages"`
 }
 
 // SupplyPhoneConfig configures the phone supply kind.
@@ -355,6 +378,12 @@ const (
 	DefaultSupplyPhoneMaxPerNumber = 0.5
 	DefaultSupplyPhoneMaxTotal     = 20.0
 	DefaultSupplyPhoneCooldownSecs = 300
+
+	// Email defaults. The window is generous because a verification mail can be
+	// a day old by the time an operator looks; the message cap is small because
+	// only the newest few can hold a live code.
+	DefaultSupplyEmailPollWindowHours = 72
+	DefaultSupplyEmailMaxMessages     = 20
 )
 
 // GuardrailEnabled reports whether the channel guardrail should run. It is on
@@ -390,6 +419,15 @@ func (c SupplyConfig) WithDefaults() SupplyConfig {
 		phone.CooldownSeconds = DefaultSupplyPhoneCooldownSecs
 	}
 	c.Phone = phone
+
+	mail := c.Email
+	if mail.PollWindowHours <= 0 {
+		mail.PollWindowHours = DefaultSupplyEmailPollWindowHours
+	}
+	if mail.MaxMessages <= 0 {
+		mail.MaxMessages = DefaultSupplyEmailMaxMessages
+	}
+	c.Email = mail
 	return c
 }
 
