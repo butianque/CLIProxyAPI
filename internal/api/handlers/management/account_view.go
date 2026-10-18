@@ -56,6 +56,10 @@ type accountView struct {
 	Channel     string `json:"channel,omitempty"`
 	Policy      string `json:"policy,omitempty"`
 	Entitlement string `json:"entitlement,omitempty"`
+	// OpenedAt is when the account was first opened on its platform, as the
+	// owning plugin recorded it. It is a fact about the account, not about the
+	// credential: the plugin writes it from what its upstream reports.
+	OpenedAt string `json:"opened_at,omitempty"`
 
 	QuotaState string               `json:"quota_state"`
 	FetchedAt  string               `json:"fetched_at,omitempty"`
@@ -196,6 +200,11 @@ func buildAccountView(auth *coreauth.Auth, poolRecord supply.Record, hasPoolReco
 	if policy := authMetadataString(auth, "policy"); pluginapi.ValidAccountPolicy(policy) {
 		view.Policy = policy
 	}
+
+	// The account's age belongs to the account, not to the credential: the
+	// plugin records the instant its upstream reports, so an import or a token
+	// refresh never moves it.
+	view.OpenedAt = accountOpenedAt(auth)
 
 	if !nextRetry.IsZero() {
 		view.CooldownUntil = nextRetry.UTC().Format(time.RFC3339)
@@ -364,4 +373,20 @@ func authMetadataString(auth *coreauth.Auth, key string) string {
 		return ""
 	}
 	return strings.TrimSpace(value)
+}
+
+// accountOpenedAt reports when the account was first opened on its platform, as
+// the owning plugin recorded it. The plugin knows what its upstream reports, so
+// the host only validates the shape: a value that is not an instant is not
+// shown at all rather than rendered as a guess.
+func accountOpenedAt(auth *coreauth.Auth) string {
+	raw := authMetadataString(auth, "opened_at")
+	if raw == "" {
+		return ""
+	}
+	instant, errParse := time.Parse(time.RFC3339, raw)
+	if errParse != nil {
+		return ""
+	}
+	return instant.UTC().Format(time.RFC3339)
 }

@@ -137,6 +137,58 @@ func TestListAccountsReportsUnknownAsAbsent(t *testing.T) {
 	}
 }
 
+func TestListAccountsReportsTheAccountOpenedAt(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	// The plugin records the instant its upstream reports, with whatever offset
+	// it was written in; the host normalizes it to UTC. A value that is not an
+	// instant is dropped rather than shown as a guess.
+	for _, record := range []*coreauth.Auth{
+		{
+			ID:       "loomy-1",
+			FileName: "loomy-1.json",
+			Provider: "loomy",
+			Status:   coreauth.StatusActive,
+			Metadata: map[string]any{"opened_at": "2026-10-06T23:03:15+08:00"},
+		},
+		{
+			ID:       "loomy-2",
+			FileName: "loomy-2.json",
+			Provider: "loomy",
+			Status:   coreauth.StatusActive,
+			Metadata: map[string]any{"opened_at": "sometime last week"},
+		},
+		{
+			ID:       "loomy-3",
+			FileName: "loomy-3.json",
+			Provider: "loomy",
+			Status:   coreauth.StatusActive,
+		},
+	} {
+		if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+			t.Fatalf("failed to register %s: %v", record.ID, errRegister)
+		}
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	h.tokenStore = &memoryAuthStore{}
+
+	accounts := accountList(t, listAccounts(t, h, "/v8/management/accounts"))
+	openedAt := map[string]any{}
+	for _, account := range accounts {
+		openedAt[account["auth_id"].(string)] = account["opened_at"]
+	}
+	if got := openedAt["loomy-1"]; got != "2026-10-06T15:03:15Z" {
+		t.Fatalf("opened_at = %#v, want 2026-10-06T15:03:15Z", got)
+	}
+	for _, id := range []string{"loomy-2", "loomy-3"} {
+		if got, present := openedAt[id]; present && got != nil {
+			t.Fatalf("%s opened_at = %#v, want absent", id, got)
+		}
+	}
+}
+
 func TestListAccountsFiltersAndCounts(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 
