@@ -15,9 +15,17 @@ func (s *Server) registerManagementV8Routes() {
 	s.engine.POST(prefix+"/oauth/callback", s.managementAvailabilityMiddleware(), s.mgmt.PostOAuthCallback)
 
 	v8 := s.engine.Group(prefix)
-	v8.Use(s.managementAvailabilityMiddleware(), s.mgmt.Middleware(), func(c *gin.Context) {
+	v8.Use(s.managementAvailabilityMiddleware(), s.mgmt.Middleware(), s.mgmt.SessionMiddleware(), func(c *gin.Context) {
 		c.Set(management.ConfigV8ContextKey, true)
 	})
+
+	// A management session is what the idle timeout, the master-passphrase gate
+	// and the secret-store grants are keyed to. The management key starts one; the
+	// session token identifies it afterwards.
+	v8.POST("/session", s.mgmt.PostSession)
+	v8.GET("/session", s.mgmt.GetSession)
+	v8.DELETE("/session", s.mgmt.DeleteSession)
+	v8.POST("/session/touch", s.mgmt.PostSessionTouch)
 	v8.GET("/config", s.mgmt.ConfigV8)
 	v8.PUT("/config", s.mgmt.ConfigV8)
 	v8.PATCH("/config", s.mgmt.ConfigV8)

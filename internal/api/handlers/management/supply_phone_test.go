@@ -208,6 +208,7 @@ func TestSecretUnlockRebuildsSupply(t *testing.T) {
 	h := &Handler{}
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Set(sessionContextKey, newTestSession(t, h))
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v8/management/secrets/unlock",
 		strings.NewReader(`{"passphrase":"master"}`))
 	ctx.Request.Header.Set("Content-Type", "application/json")

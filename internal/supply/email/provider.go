@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -483,6 +484,12 @@ func (p *ProviderImpl) hasCredential(name string) bool {
 }
 
 // targets reads the channel document and keeps the enabled mailboxes.
+//
+// A mailbox can be configured in two places, because they are two different
+// things: a channel is one connection that covers many addresses, and a pool
+// identity is one bought address that carries its own credential. Both are
+// readable mailboxes, so both are returned here — channels first, because they
+// are the general case, then the individually-held identities.
 func (p *ProviderImpl) targets() ([]Target, error) {
 	store, errLoad := supply.LoadChannels(p.cfg.ChannelsPath)
 	if errLoad != nil {
@@ -495,10 +502,10 @@ func (p *ProviderImpl) targets() ([]Target, error) {
 		if config == nil || !config.Enabled {
 			continue
 		}
-		// One mailbox is read one way. OAuth2 is checked first because a
-		// hand-edited document can declare both, and a Microsoft mailbox only
-		// answers the token method; Graph follows, because it is the same
-		// credential spent on the other resource.
+		// A channel declares one way of reading a mailbox. The order below is
+		// kept from when a channel could declare the token transports: a
+		// hand-edited document may still carry one, and reading it is better than
+		// silently dropping the mailbox.
 		connection, ok := config.Connections[supply.NatureOAuth2]
 		auth := AuthOAuth2
 		if !ok {
@@ -551,7 +558,81 @@ func (p *ProviderImpl) targets() ([]Target, error) {
 			SecretName: secret,
 		})
 	}
-	return targets, nil
+	return append(targets, p.poolTargets(targets)...), nil
+}
+
+// poolTargets turns the individually-held email identities into readable
+// mailboxes.
+//
+// The order is deliberate. An identity that has never been handed out comes
+// first, then the one used longest ago: a grab with no channel named picks the
+// first target, so a stable order would spend the same mailbox forever and leave
+// the rest of a bought batch untouched.
+func (p *ProviderImpl) poolTargets(configured []Target) []Target {
+	if p.cfg.Pool == nil {
+		return nil
+	}
+	seen := make(map[string]bool, len(configured))
+	for _, target := range configured {
+		seen[strings.ToLower(strings.TrimSpace(target.Account))] = true
+	}
+	records := p.cfg.Pool.Mailboxes()
+	// Newest-recorded first is the wrong order for spending a batch, so the list
+	// is sorted by use: unused identities keep their recorded order among
+	// themselves, and used ones follow oldest first.
+	unused := make([]supply.Record, 0, len(records))
+	used := make([]supply.Record, 0, len(records))
+	for _, record := range records {
+		box := record.Mailbox
+		if box == nil || !box.Usable() {
+			continue
+		}
+		account := strings.ToLower(strings.TrimSpace(record.Address))
+		if account == "" || seen[account] {
+			continue
+		}
+		if record.LastUsed == 0 && record.Target == "" {
+			unused = append(unused, record)
+			continue
+		}
+		used = append(used, record)
+	}
+	sort.SliceStable(used, func(i, j int) bool {
+		return used[i].LastUsed < used[j].LastUsed
+	})
+	ordered := append(unused, used...)
+
+	targets := make([]Target, 0, len(ordered))
+	for _, record := range ordered {
+		box := record.Mailbox
+		auth := AuthPassword
+		switch box.Nature {
+		case supply.NatureGraph:
+			auth = AuthGraph
+		case supply.NatureOAuth2:
+			auth = AuthOAuth2
+		}
+		secret := strings.TrimSpace(box.Secret)
+		if secret == "" {
+			secret = supply.EmailCredentialName(record.Address)
+			if auth == AuthOAuth2 || auth == AuthGraph {
+				secret = supply.EmailOAuth2CredentialName(record.Address)
+			}
+		}
+		label := strings.TrimSpace(record.Address)
+		targets = append(targets, Target{
+			// No channel: this identity is not a source of addresses, so an
+			// answer about it must not point at one.
+			Label:      label,
+			Host:       box.Endpoint,
+			Account:    record.Address,
+			Auth:       auth,
+			ClientID:   box.ClientID,
+			Usage:      "personal",
+			SecretName: secret,
+		})
+	}
+	return targets
 }
 
 // savePool persists the ledger. The pool is shared by every kind, so a write is

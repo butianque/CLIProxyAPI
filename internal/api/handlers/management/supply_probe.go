@@ -71,10 +71,13 @@ func (h *Handler) PostSupplyChannelProbe(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
+	// The probe reads the named credential, so it runs with the calling session's
+	// authority: a session that has not unlocked the store probes nothing.
+	vault := sessionVault(c)
 	probes := make([]gin.H, len(selected))
 	var wg sync.WaitGroup
 	for i, channel := range selected {
-		wg.Go(func() { probes[i] = probeChannel(ctx, channel) })
+		wg.Go(func() { probes[i] = probeChannel(ctx, channel, vault) })
 	}
 	wg.Wait()
 
@@ -82,7 +85,7 @@ func (h *Handler) PostSupplyChannelProbe(c *gin.Context) {
 }
 
 // probeChannel probes every nature the channel declares, concurrently.
-func probeChannel(ctx context.Context, channel supply.Channel) gin.H {
+func probeChannel(ctx context.Context, channel supply.Channel, vault secretstore.Vault) gin.H {
 	natures := map[string]gin.H{}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -97,7 +100,7 @@ func probeChannel(ctx context.Context, channel supply.Channel) gin.H {
 		for _, nature := range config.Natures {
 			connection := config.Connections[nature]
 			wg.Go(func() {
-				result := probeNature(ctx, kind, nature, connection)
+				result := probeNature(ctx, kind, nature, connection, vault)
 				mu.Lock()
 				natures[string(nature)] = result
 				mu.Unlock()
@@ -110,8 +113,8 @@ func probeChannel(ctx context.Context, channel supply.Channel) gin.H {
 
 // probeNature runs one nature's probe. Only the natures a kind declares are
 // ever probed, so an undeclared one never appears in the answer.
-func probeNature(ctx context.Context, kind supply.Kind, nature supply.Nature, connection supply.Connection) gin.H {
-	credential, reason := probeCredential(connection.Secret)
+func probeNature(ctx context.Context, kind supply.Kind, nature supply.Nature, connection supply.Connection, vault secretstore.Vault) gin.H {
+	credential, reason := probeCredential(vault, connection.Secret)
 	if reason != "" {
 		return gin.H{"state": probeUnready, "detail": reason}
 	}
@@ -155,19 +158,18 @@ func probeNature(ctx context.Context, kind supply.Kind, nature supply.Nature, co
 // The reason never repeats the stored value. The field is meant to hold a
 // secret-store name, but a channel can be saved with a raw credential in it, and
 // an error string is not allowed to be the one place that value escapes.
-func probeCredential(name string) (string, string) {
+func probeCredential(vault secretstore.Vault, name string) (string, string) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return "", "no credential is named for this nature"
 	}
-	store := secretstore.Default()
-	if store == nil || !store.Unlocked() {
-		return "", "the secret store is locked"
-	}
-	value, errGet := store.Get(name)
+	value, errGet := vault.Get(name)
 	if errGet != nil {
 		if errors.Is(errGet, secretstore.ErrNotFound) {
 			return "", "the named credential is not in the store"
+		}
+		if errors.Is(errGet, secretstore.ErrLocked) || errors.Is(errGet, secretstore.ErrUnauthorized) {
+			return "", "the secret store is locked"
 		}
 		return "", "the named credential cannot be read"
 	}

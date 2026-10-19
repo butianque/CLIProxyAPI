@@ -31,6 +31,7 @@ func (h *Handler) GetSupplyPool(c *gin.Context) {
 	filterKind := supply.Kind(strings.ToLower(strings.TrimSpace(c.Query("kind"))))
 	filterTarget := strings.TrimSpace(c.Query("target"))
 	index := h.authIndexByName()
+	secrets := secretStatus(c)
 
 	records := pool.All()
 	out := make([]gin.H, 0, len(records))
@@ -41,7 +42,7 @@ func (h *Handler) GetSupplyPool(c *gin.Context) {
 		if filterTarget != "" && record.Target != filterTarget {
 			continue
 		}
-		out = append(out, poolRecordView(record, index))
+		out = append(out, poolRecordView(record, index, secrets))
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"status":    "ok",
@@ -84,7 +85,7 @@ type poolProjectView struct {
 }
 
 // poolRecordView renders one record for the panel.
-func poolRecordView(record supply.Record, index map[string]string) gin.H {
+func poolRecordView(record supply.Record, index map[string]string, secrets secretStatusPayload) gin.H {
 	authIndex, resolved := resolveAuthIndex(record, index)
 	view := gin.H{
 		"kind":       string(record.Kind),
@@ -103,6 +104,21 @@ func poolRecordView(record supply.Record, index map[string]string) gin.H {
 	}
 	if record.ChannelID != "" {
 		view["channel_id"] = record.ChannelID
+	}
+	// An identity that carries its own way of reading mail says so, because the
+	// panel cannot infer it: a bought mailbox has no channel to look it up in.
+	// Only whether each secret exists is reported, never its value.
+	if box := record.Mailbox; box != nil {
+		mailbox := gin.H{
+			"nature":    string(box.Nature),
+			"endpoint":  box.Endpoint,
+			"client_id": box.ClientID,
+		}
+		if secrets.Enabled && secrets.Unlocked {
+			mailbox["has_credential"] = contains(secrets.Names, box.Secret)
+			mailbox["has_password"] = box.Password != "" && contains(secrets.Names, box.Password)
+		}
+		view["mailbox"] = mailbox
 	}
 	if resolved {
 		view["auth_index_resolved"] = true

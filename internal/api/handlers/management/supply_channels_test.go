@@ -216,6 +216,68 @@ func TestSupplyChannelProbeNeverEchoesTheCredential(t *testing.T) {
 	}
 }
 
+// pooledOf reads one channel's pooled counts from the list surface.
+func pooledOf(t *testing.T, r *gin.Engine, id string) (map[string]any, bool) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/supply/channels", nil)
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET /supply/channels: %d %s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Channels []map[string]any `json:"channels"`
+	}
+	json.Unmarshal(rr.Body.Bytes(), &resp)
+	for _, channel := range resp.Channels {
+		if channel["id"] != id {
+			continue
+		}
+		pooled, ok := channel["pooled"].(map[string]any)
+		return pooled, ok
+	}
+	t.Fatalf("channel %s is not in the list", id)
+	return nil, false
+}
+
+// A channel row carries the count of identities the pool holds from it, so the
+// panel never joins the pool by itself. Zero is a counted answer; "no pool to
+// count" is not, so the field is absent rather than zero in that case.
+func TestSupplyChannelReportsPooledCounts(t *testing.T) {
+	previous := supply.Default()
+	t.Cleanup(func() { supply.SetDefault(previous) })
+	supply.SetDefault(nil)
+
+	_, r := setupChannelTest(t)
+	id := createChannel(t, r, `{"label":"Box","email":{"enabled":true,"natures":["imap"],"connections":{"imap":{"account":"box@example.com","secret":"mail-key"}}}}`)
+
+	if _, present := pooledOf(t, r, id); present {
+		t.Fatal("a channel must not report a count when no pool is installed")
+	}
+
+	registry := supply.NewRegistry()
+	pool := supply.NewPool()
+	registry.SetPool(pool)
+	supply.SetDefault(registry)
+
+	pooled, present := pooledOf(t, r, id)
+	if !present {
+		t.Fatal("an empty pool still counts: zero is an answer, not an absence")
+	}
+	if got := pooled["email"]; got != float64(0) {
+		t.Fatalf("email pooled = %v, want 0", got)
+	}
+
+	pool.Register(supply.KindEmail, "1@example.com", id, "loomy", "loomy-1", "", "registered", 1)
+	pooled, _ = pooledOf(t, r, id)
+	if got := pooled["email"]; got != float64(1) {
+		t.Fatalf("email pooled = %v, want 1", got)
+	}
+	if _, ok := pooled["phone"]; ok {
+		t.Error("a channel that serves only email must not report a phone count")
+	}
+}
+
 func TestSupplyChannelsRoundTrip(t *testing.T) {
 	_, r := setupChannelTest(t)
 
@@ -579,37 +641,40 @@ func TestPreviewTextCutsOnRuneBoundary(t *testing.T) {
 	}
 }
 
-// An OAuth2 mailbox is stored and read back like any other channel. The
-// application id comes back so the editor can show it, and the credential entry
-// name is derived under the OAuth2 prefix — the panel never sends a name, and
-// the two kinds of credential never share one.
-func TestSupplyChannelOAuth2Mailbox(t *testing.T) {
-	h, r := setupChannelTest(t)
-	id := createChannel(t, r, `{"label":"Outlook","category":"self-owned","email":{"enabled":true,"natures":["oauth2"],"connections":{"oauth2":{"endpoint":"outlook.office365.com:993","account":"Box@Outlook.com","client_id":"app-123"}}}}`)
+// A token-based mailbox is not a channel: its credential belongs to the mailbox,
+// which makes it one bought identity — a pool record. A channel is one connection
+// that covers many addresses, so these are refused when written. Accepting them
+// is what used to grow the channel table by one row per mailbox.
+func TestSupplyChannelRejectsTokenMailboxNatures(t *testing.T) {
+	_, r := setupChannelTest(t)
 
-	channel := storedChannel(t, h, id)
-	conn := channel.Email.Connections[supply.NatureOAuth2]
-	if want := supply.EmailOAuth2CredentialName("box@outlook.com"); conn.Secret != want {
-		t.Fatalf("secret name = %q, want %q", conn.Secret, want)
+	bodies := map[string]string{
+		"oauth2":                           `{"label":"oauth2","email":{"enabled":true,"natures":["oauth2"],"connections":{"oauth2":{"endpoint":"outlook.office365.com:993","account":"box@outlook.com","client_id":"app-123"}}}}`,
+		"graph":                            `{"label":"graph","email":{"enabled":true,"natures":["graph"],"connections":{"graph":{"account":"box@outlook.com","client_id":"app-123"}}}}`,
+		"the retired own-mailbox category": `{"label":"own","category":"self-owned","email":{"enabled":true,"natures":["imap"],"connections":{"imap":{"endpoint":"imap.qq.com:993","account":"box@qq.com"}}}}`,
 	}
-	if conn.ClientID != "app-123" {
-		t.Fatalf("client id = %q, want app-123", conn.ClientID)
-	}
-	if conn.Usage != "personal" {
-		t.Fatalf("usage = %q, want personal", conn.Usage)
+	for name, body := range bodies {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/supply/channels", bytes.NewBufferString(body))
+			req.Header.Set("Content-Type", "application/json")
+			rr := httptest.NewRecorder()
+			r.ServeHTTP(rr, req)
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("%s: %d %s, want 400", name, rr.Code, rr.Body.String())
+			}
+		})
 	}
 }
 
-// A mailbox is read one way, and an OAuth2 connection without the application id
-// can never mint a token. Both are refused when the channel is written: saving
-// them would produce a channel that looks configured and reads nothing.
+// A mailbox is read one way, and a protocol address must be a host, not a URL.
+// Both are refused when the channel is written: saving them would produce a
+// channel that looks configured and reads nothing.
 func TestSupplyChannelRejectsUnusableMailbox(t *testing.T) {
 	_, r := setupChannelTest(t)
 
 	bodies := map[string]string{
-		"both methods": `{"label":"both","email":{"enabled":true,"natures":["imap","oauth2"],"connections":{"imap":{"account":"box@qq.com","secret":"a"},"oauth2":{"account":"box@outlook.com","client_id":"app-123","secret":"b"}}}}`,
-		"no client id": `{"label":"no-app","email":{"enabled":true,"natures":["oauth2"],"connections":{"oauth2":{"endpoint":"outlook.office365.com:993","account":"box@outlook.com"}}}}`,
-		"url endpoint": `{"label":"url","email":{"enabled":true,"natures":["oauth2"],"connections":{"oauth2":{"endpoint":"https://outlook.office365.com","account":"box@outlook.com","client_id":"app-123"}}}}`,
+		"url endpoint": `{"label":"url","email":{"enabled":true,"natures":["imap"],"connections":{"imap":{"endpoint":"https://imap.qq.com","account":"box@qq.com"}}}}`,
+		"no natures":   `{"label":"empty","email":{"enabled":true,"natures":[],"connections":{}}}`,
 	}
 	for name, body := range bodies {
 		t.Run(name, func(t *testing.T) {

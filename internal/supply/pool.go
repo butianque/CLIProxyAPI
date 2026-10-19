@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 // The pool is the host's record of every identity it has handed out and of the
@@ -75,6 +76,53 @@ type Record struct {
 	// region; an email's domain. Values are plain JSON so a kind can add one
 	// without changing this struct.
 	Meta map[string]any `json:"meta,omitempty"`
+
+	// Mailbox is how an individually-held email identity reads its own mail.
+	//
+	// It is what separates this kind of record from one a channel handed out: a
+	// channel is one connection that mints addresses for a whole domain, while
+	// an identity bought on its own owns exactly one address and carries its own
+	// credential. Without this block such an identity could only be represented
+	// as a channel of its own, which is the mistake this field undoes.
+	Mailbox *Mailbox `json:"mailbox,omitempty"`
+}
+
+// Mailbox is the per-identity way one email address reads its mail.
+//
+// It mirrors the connection details a channel carries, minus everything that
+// only makes sense for a source of many addresses: there is no domain to receive
+// for and no usage to derive, because this identity is exactly one address.
+//
+// Secret and Password are secret-store entry names, never values. The two are
+// named apart because they hold different kinds of secret: the token (or
+// authorization code) a transport authenticates with, and the mailbox password,
+// which exists only for a person signing in by hand — Microsoft refuses it on
+// both IMAP and Graph.
+type Mailbox struct {
+	// Nature is how the mailbox is read: imap, oauth2 or graph.
+	Nature Nature `json:"nature,omitempty"`
+	// Endpoint is the IMAP host. Empty for graph, which answers at one fixed
+	// endpoint.
+	Endpoint string `json:"endpoint,omitempty"`
+	// ClientID is the application a refresh token was issued to.
+	ClientID string `json:"client_id,omitempty"`
+	// Secret names the entry holding the credential the transport uses.
+	Secret string `json:"secret,omitempty"`
+	// Password names the entry holding the mailbox password, when one was
+	// supplied. It is used for a manual sign-in and by nothing else.
+	Password string `json:"password_secret,omitempty"`
+}
+
+// Usable reports whether a mailbox block names enough to attempt a read: a
+// transport, and a protocol host for the transports that need one.
+func (m Mailbox) Usable() bool {
+	if !m.Nature.IsMailbox() {
+		return false
+	}
+	if m.Nature == NatureGraph {
+		return true
+	}
+	return strings.TrimSpace(m.Endpoint) != ""
 }
 
 // Registration is one platform account an identity was used to register.
@@ -121,7 +169,14 @@ func (r Record) MetaBool(key string) bool {
 }
 
 // Pool is the cross-kind identity pool.
+//
+// It is written from three places that do not share a caller: the phone service
+// (under its own lock), the email provider (per call), and the management
+// surface. One mutex here is what keeps those from corrupting the document — the
+// alternative, a lock per caller, is a lock that one of them will forget.
 type Pool struct {
+	mu sync.Mutex
+
 	Version int      `json:"version"`
 	Records []Record `json:"records,omitempty"`
 	// SpendCNY is the running total spent through this pool.
@@ -157,12 +212,15 @@ func (l *Pool) find(kind Kind, address string) int {
 // pool. A caller uses it to tell an identity it can re-occupy from one it has
 // never seen.
 func (l *Pool) Knows(kind Kind, address string) bool {
-	_, ok := l.Get(kind, address)
-	return ok
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.find(kind, address) >= 0
 }
 
 // Get returns the record for one identity.
 func (l *Pool) Get(kind Kind, address string) (Record, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	if i := l.find(kind, address); i >= 0 {
 		return l.Records[i], true
 	}
@@ -171,9 +229,122 @@ func (l *Pool) Get(kind Kind, address string) (Record, bool) {
 
 // All returns a copy of every record, for callers that need to scan them.
 func (l *Pool) All() []Record {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	out := make([]Record, len(l.Records))
 	copy(out, l.Records)
 	return out
+}
+
+// CountByChannel counts how many identities each channel put into the pool, per
+// kind. A channel that supplied nothing is absent from the result.
+//
+// It counts every record, including one that has since been released: the ledger
+// still lists it, so this number has to agree with the rows an operator can count
+// under that channel. Re-renting the same identity does not count twice, because
+// the pool keys records by identity.
+//
+// An email record names the channel that minted the address. A phone record does
+// not: a number is rented from the platform, so the record names the platform
+// while the channel row holds that platform's credential. The phone join is
+// therefore the connection's secret entry name, which is the same rule the panel
+// applied by itself before this count existed.
+func CountByChannel(channels []Channel, records []Record) map[string]map[Kind]int {
+	channelOfSource := make(map[string]string, len(channels))
+	for _, channel := range channels {
+		if channel.Phone == nil {
+			continue
+		}
+		for _, conn := range channel.Phone.Connections {
+			secret := strings.TrimSpace(conn.Secret)
+			if secret == "" {
+				continue
+			}
+			// The first channel naming this credential owns it. One platform
+			// account is one channel, so a second row naming the same credential
+			// is a duplicate rather than a second source of numbers.
+			if _, taken := channelOfSource[secret]; !taken {
+				channelOfSource[secret] = channel.ID
+			}
+		}
+	}
+	counts := make(map[string]map[Kind]int, len(channels))
+	for _, record := range records {
+		channelID := strings.TrimSpace(record.ChannelID)
+		if channelID == "" && record.Kind == KindPhone {
+			channelID = channelOfSource[strings.TrimSpace(record.Source)]
+		}
+		if channelID == "" {
+			continue
+		}
+		byKind := counts[channelID]
+		if byKind == nil {
+			byKind = make(map[Kind]int, 2)
+			counts[channelID] = byKind
+		}
+		byKind[record.Kind]++
+	}
+	return counts
+}
+
+// Mailboxes returns every email identity that carries its own way of reading
+// mail, in the order they were recorded.
+//
+// It is a copy because the caller scans it while other writers are appending:
+// handing out the live slice would let a concurrent append move the records out
+// from under a reader.
+func (l *Pool) Mailboxes() []Record {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make([]Record, 0, len(l.Records))
+	for _, record := range l.Records {
+		if record.Kind != KindEmail || record.Mailbox == nil {
+			continue
+		}
+		out = append(out, record)
+	}
+	return out
+}
+
+// AttachMailbox records how one individually-held identity reads its mail, and
+// reports whether that created the record.
+//
+// It creates the record when the identity is new, because an imported mailbox has
+// never been handed out: no other writer would ever mention it, and a pool that
+// could only hold identities it produced itself could not hold a mailbox bought
+// on its own.
+//
+// Re-attaching replaces the whole block, which is what makes a re-import with a
+// different receiving method an in-place update rather than a second identity. It
+// leaves the rent count and the last-used time alone: attaching a credential is
+// not a use of the identity.
+func (l *Pool) AttachMailbox(kind Kind, address string, box Mailbox, now int64) (Record, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.Version == 0 {
+		l.Version = poolVersion
+	}
+	address = strings.TrimSpace(address)
+	box.Nature = Nature(strings.TrimSpace(string(box.Nature)))
+	box.Endpoint = strings.TrimSpace(box.Endpoint)
+	box.ClientID = strings.TrimSpace(box.ClientID)
+	box.Secret = strings.TrimSpace(box.Secret)
+	box.Password = strings.TrimSpace(box.Password)
+
+	created := false
+	i := l.find(kind, address)
+	if i < 0 {
+		l.Records = append(l.Records, Record{
+			Kind:      kind,
+			Address:   address,
+			FirstSeen: now,
+		})
+		i = len(l.Records) - 1
+		created = true
+	}
+	record := &l.Records[i]
+	record.Mailbox = &box
+	return *record, created
 }
 
 // Record notes one successful handout and folds it into the running spend.
@@ -182,6 +353,8 @@ func (l *Pool) All() []Record {
 // arguments. Re-recording an identity accumulates its rent count and spend
 // rather than duplicating it.
 func (l *Pool) Record(kind Kind, address, source string, price float64, meta map[string]any, now int64) Record {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	if l.Version == 0 {
 		l.Version = poolVersion
 	}
@@ -240,10 +413,12 @@ func (l *Pool) Record(kind Kind, address, source string, price float64, meta map
 // earlier attempt must not keep saying so once an account is bound to it: the
 // identity is held by that account now.
 func (l *Pool) Link(kind Kind, address, target, account, authIndex string, now int64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	if l.find(kind, address) < 0 {
 		return
 	}
-	record := l.Register(kind, address, "", target, account, authIndex, "registered", now)
+	record := l.registerLocked(kind, address, "", target, account, authIndex, "registered", now)
 	record.State = "held"
 }
 
@@ -263,6 +438,14 @@ func (l *Pool) Link(kind Kind, address, target, account, authIndex string, now i
 // the rent count alone; a new pair is a new use of the identity, so it is
 // appended and counted.
 func (l *Pool) Register(kind Kind, address, channelID, target, account, authIndex, outcome string, now int64) *Record {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.registerLocked(kind, address, channelID, target, account, authIndex, outcome, now)
+}
+
+// registerLocked is Register under the caller's lock, so a method that already
+// holds it can annotate a record without deadlocking on itself.
+func (l *Pool) registerLocked(kind Kind, address, channelID, target, account, authIndex, outcome string, now int64) *Record {
 	if l.Version == 0 {
 		l.Version = poolVersion
 	}
@@ -332,6 +515,8 @@ func (l *Pool) Register(kind Kind, address, channelID, target, account, authInde
 // Empty values leave the existing one in place, so a caller can update one
 // without clearing the other.
 func (l *Pool) Mark(kind Kind, address, outcome, state string, now int64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	i := l.find(kind, address)
 	if i < 0 {
 		return
@@ -357,6 +542,8 @@ func (l *Pool) Refund(kind Kind, address string, amount float64, now int64) bool
 	if amount <= 0 {
 		return false
 	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	i := l.find(kind, address)
 	if i < 0 {
 		return false
@@ -378,11 +565,17 @@ func (l *Pool) Refund(kind Kind, address string, amount float64, now int64) bool
 }
 
 // Spent returns the running total.
-func (l *Pool) Spent() float64 { return l.SpendCNY }
+func (l *Pool) Spent() float64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.SpendCNY
+}
 
 // ForAccount returns the records linked to one account.
 func (l *Pool) ForAccount(account string) []Record {
 	account = strings.TrimSpace(account)
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	out := make([]Record, 0, 1)
 	for _, record := range l.Records {
 		if record.Account == account {
@@ -395,6 +588,8 @@ func (l *Pool) ForAccount(account string) []Record {
 // ForTarget returns the records linked to one platform.
 func (l *Pool) ForTarget(target string) []Record {
 	target = strings.TrimSpace(target)
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	out := make([]Record, 0, 1)
 	for _, record := range l.Records {
 		if record.Target == target {
@@ -417,11 +612,23 @@ func LoadPool(path string) (*Pool, error) {
 }
 
 // Save writes the pool.
+//
+// The snapshot is taken under the lock and marshalled outside it: a write can be
+// slow on a large document, and holding the mutex for the whole encode would
+// stall every reader behind a disk write.
 func (l *Pool) Save(path string) error {
+	l.mu.Lock()
 	if l.Version == 0 {
 		l.Version = poolVersion
 	}
-	return saveJSON(path, l)
+	snapshot := Pool{
+		Version:  l.Version,
+		Records:  make([]Record, len(l.Records)),
+		SpendCNY: l.SpendCNY,
+	}
+	copy(snapshot.Records, l.Records)
+	l.mu.Unlock()
+	return saveJSON(path, &snapshot)
 }
 
 // -- persistence helpers -----------------------------------------------------

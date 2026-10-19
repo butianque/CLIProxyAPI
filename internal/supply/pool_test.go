@@ -282,3 +282,116 @@ func TestPoolQueriesByAccountAndTarget(t *testing.T) {
 		t.Fatalf("ForTarget = %+v, want the one matching identity", got)
 	}
 }
+
+// An imported mailbox has never been handed out, so no other writer would create
+// its record: attaching the mailbox is what puts it in the pool.
+func TestPoolAttachMailboxCreatesTheRecord(t *testing.T) {
+	pool := NewPool()
+	record, created := pool.AttachMailbox(KindEmail, "box@outlook.com", Mailbox{
+		Nature:   NatureGraph,
+		ClientID: "app-123",
+		Secret:   "email-oauth2-box@outlook.com",
+		Password: "email-password-box@outlook.com",
+	}, 7)
+
+	if !created {
+		t.Fatal("the first attach must report that it created the record")
+	}
+	if record.Mailbox == nil || record.Mailbox.Nature != NatureGraph {
+		t.Fatalf("mailbox = %+v, want a graph transport", record.Mailbox)
+	}
+	if record.Rents != 0 || record.LastUsed != 0 {
+		t.Fatalf("attaching a credential is not a use: rents %d last_used %d", record.Rents, record.LastUsed)
+	}
+	if got := pool.Mailboxes(); len(got) != 1 || got[0].Address != "box@outlook.com" {
+		t.Fatalf("Mailboxes = %+v, want the one identity", got)
+	}
+}
+
+// Re-attaching replaces the whole block, which is what makes a re-import with a
+// different receiving method an update rather than a second identity.
+func TestPoolAttachMailboxReplacesTheTransport(t *testing.T) {
+	pool := NewPool()
+	pool.AttachMailbox(KindEmail, "box@outlook.com", Mailbox{Nature: NatureGraph, ClientID: "app-123"}, 7)
+	record, created := pool.AttachMailbox(KindEmail, "box@outlook.com", Mailbox{
+		Nature:   NatureOAuth2,
+		Endpoint: "outlook.office365.com:993",
+		ClientID: "app-123",
+	}, 9)
+
+	if created {
+		t.Fatal("re-attaching must update, not create")
+	}
+	if record.Mailbox.Nature != NatureOAuth2 || record.Mailbox.Endpoint == "" {
+		t.Fatalf("mailbox = %+v, want the oauth2 transport", record.Mailbox)
+	}
+	if len(pool.All()) != 1 {
+		t.Fatalf("records = %d, want 1", len(pool.All()))
+	}
+}
+
+// CountByChannel is the number the channel row shows: how much supply a channel
+// actually contributed. An email record names its channel outright; a phone
+// record names the platform, so that join runs through the credential entry the
+// channel row holds. A released identity still counts, because the ledger still
+// lists it — the strip must agree with the rows under that channel.
+func TestCountByChannel(t *testing.T) {
+	channels := []Channel{
+		{
+			ID: "sms",
+			Phone: &KindConfig{
+				Enabled:     true,
+				Natures:     []Nature{NatureAPI},
+				Connections: map[Nature]Connection{NatureAPI: {Secret: "haozhuma"}},
+			},
+		},
+		{ID: "ormnesqq", Email: &KindConfig{Enabled: true, Natures: []Nature{NatureIMAP}}},
+		{ID: "idle"},
+	}
+	records := []Record{
+		{Kind: KindPhone, Address: "13800000001", Source: "haozhuma"},
+		{Kind: KindPhone, Address: "13800000002", Source: "haozhuma", State: "released"},
+		{Kind: KindPhone, Address: "13800000003", Source: "haozhuma", State: "blacklisted"},
+		{Kind: KindPhone, Address: "13800000004", Source: "some-other-platform"},
+		{Kind: KindEmail, Address: "1@ormnes.com", ChannelID: "ormnesqq"},
+		{Kind: KindEmail, Address: "2@ormnes.com", ChannelID: "deleted-channel"},
+	}
+
+	counts := CountByChannel(channels, records)
+	if got := counts["sms"][KindPhone]; got != 3 {
+		t.Errorf("phone supply = %d, want 3: every row under the channel counts, a foreign platform does not", got)
+	}
+	if got := counts["ormnesqq"][KindEmail]; got != 1 {
+		t.Errorf("email supply = %d, want 1", got)
+	}
+	if _, ok := counts["idle"]; ok {
+		t.Error("a channel that supplied nothing must be absent from the counts, not present as zero")
+	}
+	if got := counts["sms"][KindEmail]; got != 0 {
+		t.Errorf("a channel serving phones must not answer for emails, got %d", got)
+	}
+	if _, ok := counts["deleted-channel"]; !ok {
+		t.Error("a record naming a channel keeps that channel: its history must not move to whoever is left")
+	}
+}
+
+// A mailbox is readable only when it names a transport, and a protocol transport
+// needs a host: graph answers at one fixed endpoint, so it needs none.
+func TestMailboxUsable(t *testing.T) {
+	cases := []struct {
+		name string
+		box  Mailbox
+		want bool
+	}{
+		{"graph without a host", Mailbox{Nature: NatureGraph}, true},
+		{"imap without a host", Mailbox{Nature: NatureIMAP}, false},
+		{"imap with a host", Mailbox{Nature: NatureIMAP, Endpoint: "imap.qq.com:993"}, true},
+		{"a nature that reads no mailbox", Mailbox{Nature: NatureAPI}, false},
+		{"no nature at all", Mailbox{}, false},
+	}
+	for _, testCase := range cases {
+		if got := testCase.box.Usable(); got != testCase.want {
+			t.Errorf("%s: usable = %v, want %v", testCase.name, got, testCase.want)
+		}
+	}
+}

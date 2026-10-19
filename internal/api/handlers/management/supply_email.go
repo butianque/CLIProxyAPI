@@ -205,11 +205,11 @@ func (h *Handler) PostSupplyEmailCredential(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "a credential value is required"})
 		return
 	}
-	store, errGate := gateSupplyWrite(c, body.Passphrase)
+	vault, errGate := gateSupplyWrite(c, body.Passphrase)
 	if errGate {
 		return
 	}
-	if errSet := store.Set(name, body.Secret); errSet != nil {
+	if errSet := vault.Set(name, body.Secret); errSet != nil {
 		c.JSON(errStatus(errSet), gin.H{"status": "error", "error": errSet.Error()})
 		return
 	}

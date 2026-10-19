@@ -47,7 +47,10 @@ const (
 	// It is a separate nature rather than a flag on NatureIMAP because the
 	// operator's answer differs — a different credential, a different form,
 	// a different failure ("the refresh token expired" is not "the password is
-	// wrong") — and because the panel asks for one connection method at a time.
+	// wrong").
+	//
+	// It is not a channel nature: a mailbox that carries its own credential is
+	// one identity, so it lives in the pool. See ChannelNatures.
 	NatureOAuth2 Nature = "oauth2"
 	// NatureGraph reads the same mailbox through Microsoft Graph's REST API.
 	//
@@ -55,6 +58,8 @@ const (
 	// spent on: one minted for Graph scopes is refused by the IMAP server and
 	// cannot be exchanged for an IMAP token, so a channel that only speaks IMAP
 	// cannot use that mailbox at all.
+	//
+	// Like NatureOAuth2 it is a pool identity's transport, not a channel nature.
 	NatureGraph Nature = "graph"
 	// NatureWeb drives a website's own endpoints with a session cookie. Phone
 	// only: it is how a code platform's channel list is managed.
@@ -90,6 +95,27 @@ func (n Nature) SupportsKind(kind Kind) bool {
 		return n == NatureAPI || n == NatureIMAP || n == NatureOAuth2 || n == NatureGraph
 	}
 	return false
+}
+
+// ChannelNatures lists the natures a channel of kind may declare, in the order
+// the panel offers them.
+//
+// It is narrower than SupportsKind on purpose. A channel is one connection that
+// covers many addresses — a code platform, a catch-all domain, a forwarding
+// service. A mailbox that owns its own address and its own credential is the
+// other kind of thing: it is one identity, it lives in the pool, and giving it a
+// channel of its own would turn the channel table into an address book.
+//
+// Email therefore keeps only IMAP here. OAuth2 and Graph are how a single
+// mailbox authenticates, which is a pool identity's business, not a channel's.
+func ChannelNatures(kind Kind) []Nature {
+	switch kind {
+	case KindPhone:
+		return []Nature{NatureAPI, NatureWeb}
+	case KindEmail:
+		return []Nature{NatureIMAP}
+	}
+	return nil
 }
 
 // ReadsMailbox reports whether this nature opens a mailbox over IMAP.
@@ -191,16 +217,18 @@ func (c Channel) KindConfigFor(kind Kind) *KindConfig {
 // CatchAllCategory reports whether category means "a domain I built that catches
 // every address" rather than "one mailbox I can read".
 //
-// The three categories answer different questions and none of them is a synonym
-// for another:
+// The two categories answer different questions and neither is a synonym for the
+// other:
 //
 //   - third-party: someone else's service. One address at a time.
 //   - self-built:  a domain of mine with a catch-all, so a fresh address can be
 //     minted for every signup and all of them land in one mailbox.
-//   - self-owned:  a mailbox of mine (a personal mailbox, say). It is mine, but it
-//     is still exactly one address; nothing can be minted on it.
 //
-// Only self-built can hand out addresses, which is why only it needs a domain.
+// A personal mailbox of one's own used to be a third category. It is not one any
+// more: a channel exists to cover many addresses from one connection, while a
+// personal mailbox is exactly one address with its own credential — an identity
+// of the pool, not a source of identities. Keeping it here made the channel table
+// grow one row per bought mailbox.
 func CatchAllCategory(category string) bool {
 	return strings.TrimSpace(category) == "self-built"
 }
@@ -283,6 +311,10 @@ func normalizeIMAPEndpoint(value string) (string, error) {
 // domain the operator owns needs that domain, and a plain mailbox must not carry
 // one. Deriving the usage from it — instead of reading a usage the caller sent —
 // is what keeps the two from disagreeing.
+//
+// Only the natures a channel may declare reach here (see ChannelNatures), so the
+// token-based mailbox transports are not handled: they carry their own
+// credentials, which makes them pool identities rather than channels.
 func normalizeConnection(nature Nature, conn Connection, catchAll bool) (Connection, error) {
 	conn.Endpoint = strings.TrimSpace(conn.Endpoint)
 	conn.Account = strings.TrimSpace(conn.Account)
@@ -290,18 +322,13 @@ func normalizeConnection(nature Nature, conn Connection, catchAll bool) (Connect
 	conn.Usage = strings.TrimSpace(conn.Usage)
 	conn.Domain = strings.TrimSpace(conn.Domain)
 	conn.ClientID = strings.TrimSpace(conn.ClientID)
-	switch {
-	case nature == NatureGraph:
-		// Graph answers at one fixed endpoint. A stored one would be a second
-		// place to get it wrong, so it is cleared rather than validated.
-		conn.Endpoint = ""
-	case nature.ReadsMailbox():
+	if nature.ReadsMailbox() {
 		endpoint, errEndpoint := normalizeIMAPEndpoint(conn.Endpoint)
 		if errEndpoint != nil {
 			return Connection{}, errEndpoint
 		}
 		conn.Endpoint = endpoint
-	default:
+	} else {
 		endpoint, errEndpoint := normalizeEndpoint(conn.Endpoint)
 		if errEndpoint != nil {
 			return Connection{}, errEndpoint
@@ -314,26 +341,13 @@ func normalizeConnection(nature Nature, conn Connection, catchAll bool) (Connect
 		conn.ClientID = ""
 		return conn, nil
 	}
-	if !nature.UsesRefreshToken() {
-		conn.ClientID = ""
-	}
-	// A token-based mailbox mints its access token from the refresh token, and
-	// the token endpoint needs to know which application is asking. Without it
-	// the connection can never authenticate, so it is refused here instead of
-	// becoming a channel that silently reads nothing.
-	if nature.UsesRefreshToken() && conn.ClientID == "" {
-		return Connection{}, errors.New("supply: a mailbox read with a refresh token needs the application id it belongs to")
-	}
+	conn.ClientID = ""
 	// A mailbox credential belongs to the mailbox, so its entry name is derived
 	// from the login instead of being configured. A name already on the
 	// connection is kept: it may name an entry that exists under an older rule,
 	// and renaming the pointer would orphan the credential.
 	if conn.Secret == "" {
-		if nature.UsesRefreshToken() {
-			conn.Secret = EmailOAuth2CredentialName(conn.Account)
-		} else {
-			conn.Secret = EmailCredentialName(conn.Account)
-		}
+		conn.Secret = EmailCredentialName(conn.Account)
 	}
 	// A domain typed as "@example.com" (or "box@example.com") names the same
 	// domain, but stored as typed it can never match: matching appends "@" to it,
@@ -379,6 +393,9 @@ func normalizeKindConfig(kind Kind, kc *KindConfig, catchAll bool) error {
 		if !nature.SupportsKind(kind) {
 			return fmt.Errorf("supply: nature %q cannot serve the %s kind", nature, kind)
 		}
+		if !containsNature(ChannelNatures(kind), nature) {
+			return fmt.Errorf("supply: a %s channel does not speak %q; a mailbox with its own credential belongs to the pool", kind, nature)
+		}
 		if seen[nature] {
 			return fmt.Errorf("supply: duplicate nature %q in %s config", nature, kind)
 		}
@@ -395,12 +412,8 @@ func normalizeKindConfig(kind Kind, kc *KindConfig, catchAll bool) error {
 			delete(kc.Connections, key)
 		}
 	}
-	// A mailbox is read one way. IMAP and OAuth2 speak the same protocol with
-	// different credentials, so declaring both would leave the host choosing —
-	// and a wrong choice is a channel that looks configured and never reads.
-	if kind == KindEmail && seen[NatureIMAP] && seen[NatureOAuth2] {
-		return errors.New("supply: an email channel connects one way: imap or oauth2, not both")
-	}
+	// A mailbox is read one way, and a channel only declares IMAP; the other
+	// ways belong to a pool identity, which is checked above.
 	return nil
 }
 
@@ -417,7 +430,7 @@ func (c Channel) Normalize() (Channel, error) {
 		c.Category = "third-party"
 	}
 	switch c.Category {
-	case "third-party", "self-owned", "self-built":
+	case "third-party", "self-built":
 		// ok
 	default:
 		return Channel{}, fmt.Errorf("supply: unknown category %q", c.Category)
@@ -610,6 +623,17 @@ func EmailOAuth2CredentialName(account string) string {
 	return emailCredentialName("email-oauth2-", account)
 }
 
+// EmailPasswordCredentialName is the secret-store entry holding one mailbox's
+// password.
+//
+// It is kept apart from the authorization code entry because it answers a
+// different question: a Microsoft mailbox refuses a password on every transport,
+// so this value exists only for a person signing in to the mailbox's own web
+// page. Nothing in the read path ever spends it.
+func EmailPasswordCredentialName(account string) string {
+	return emailCredentialName("email-password-", account)
+}
+
 // emailCredentialName derives a mailbox's entry name under a method prefix.
 func emailCredentialName(prefix, account string) string {
 	account = strings.ToLower(strings.TrimSpace(account))
@@ -645,6 +669,16 @@ func slug(label string) string {
 
 // contains reports whether the slice includes the value.
 func contains(slice []string, value string) bool {
+	for _, item := range slice {
+		if item == value {
+			return true
+		}
+	}
+	return false
+}
+
+// containsNature reports whether the slice includes the nature.
+func containsNature(slice []Nature, value Nature) bool {
 	for _, item := range slice {
 		if item == value {
 			return true

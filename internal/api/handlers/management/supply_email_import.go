@@ -16,16 +16,21 @@ import (
 // mailbox seller: one mailbox per line, four fields separated by "----"
 // (account, password, application id, refresh token).
 //
-// Why a batch route instead of the panel looping over the two existing routes:
-// a hundred mailboxes would be two hundred round-trips, a hundred supply
-// rebuilds, and a hundred chances to leave a channel without a credential.
-// Parsing happens before anything is written, so a malformed line is reported
-// without touching the store, and the supply service is rebuilt once at the end.
+// Why a batch route instead of the panel looping over the two existing routes: a
+// hundred mailboxes would be two hundred round-trips and a hundred chances to
+// leave a mailbox without a credential. Parsing happens before anything is
+// written, so a malformed line is reported without touching the store.
 //
-// The password field is parsed and discarded. A Microsoft mailbox answers
-// LOGINDISABLED to a password login, so the refresh token is the only thing that
-// can authenticate — and storing the password would be keeping a secret that
-// cannot be used for anything.
+// What it writes is a pool identity per line, not a channel. A bought mailbox is
+// one address with its own credential; a channel is one connection that covers
+// many addresses. Filing a bought batch as channels turned the channel table into
+// an address book — one row per mailbox, each claiming to be a source of
+// identities.
+//
+// Both secrets are kept. The refresh token is what a transport authenticates
+// with, and the password is what a person signing in to the mailbox's own web page
+// needs; Microsoft refuses the password on IMAP and Graph alike, so nothing in the
+// read path ever spends it.
 
 const (
 	// importedMailboxHost is where a Microsoft consumer mailbox is read. It is
@@ -49,20 +54,20 @@ const (
 type mailboxLine struct {
 	Line     int
 	Account  string
+	Password string
 	ClientID string
 	Refresh  string
 	Err      error
 }
 
-// PostSupplyEmailImport stores a batch of Microsoft mailboxes: one channel per
-// mailbox, with the refresh token in the secret store.
+// PostSupplyEmailImport stores a batch of Microsoft mailboxes as pool identities,
+// with both secrets in the secret store.
 //
-// A mailbox that cannot be reached is not imported. Creating a channel whose
-// credential is already known to be dead would put a row in the table that can
+// A mailbox that cannot be reached is not imported. Storing an identity whose
+// credential is already known to be dead would put a row in the pool that can
 // only ever read nothing, and the operator would have to find it by hand. The
 // probe is optional (probe=false) for a batch that is being imported somewhere
-// without network access to the provider; the channel table's own probe then
-// reports the same verdict later.
+// without network access to the provider.
 func (h *Handler) PostSupplyEmailImport(c *gin.Context) {
 	var body struct {
 		Text       string `json:"text"`
@@ -95,13 +100,16 @@ func (h *Handler) PostSupplyEmailImport(c *gin.Context) {
 	}
 	// The gate runs once for the whole batch: it is the same secret store for
 	// every mailbox, and asking per line would turn one unlock into a hundred.
-	store, alreadyAnswered := gateSupplyWrite(c, body.Passphrase)
+	vault, alreadyAnswered := gateSupplyWrite(c, body.Passphrase)
 	if alreadyAnswered {
 		return
 	}
-	channels, errStore := h.supplyChannels()
-	if errStore != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": errStore.Error()})
+	pool := supply.DefaultPool()
+	if pool == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"status": "error",
+			"error":  "the supply pool is not configured",
+		})
 		return
 	}
 	probe := true
@@ -139,6 +147,7 @@ func (h *Handler) PostSupplyEmailImport(c *gin.Context) {
 		wg.Wait()
 	}
 
+	now := time.Now().Unix()
 	imported, updated, failed := 0, 0, 0
 	results := make([]gin.H, 0, len(lines))
 	for index, line := range lines {
@@ -157,55 +166,53 @@ func (h *Handler) PostSupplyEmailImport(c *gin.Context) {
 			results = append(results, result)
 			continue
 		}
-		// Credential first, channel second — the same order the panel's editor
-		// uses. A channel that exists without a credential is a row that looks
+		// Credential first, identity second — the same order the panel's editor
+		// uses. An identity that exists without a credential is a row that looks
 		// configured and can never authenticate.
-		name := supply.EmailOAuth2CredentialName(line.Account)
-		if errSet := store.Set(name, line.Refresh); errSet != nil {
+		tokenName := supply.EmailOAuth2CredentialName(line.Account)
+		if errSet := vault.Set(tokenName, line.Refresh); errSet != nil {
 			failed++
 			result["outcome"] = "failed"
 			result["detail"] = errSet.Error()
 			results = append(results, result)
 			continue
 		}
-		existing, found := findMailboxChannel(channels.All(), line.Account)
-		channel := supply.Channel{
-			ID:       existing.ID,
-			Label:    line.Account,
-			Category: "third-party",
-			Email: &supply.KindConfig{
-				Enabled: true,
-				Natures: []supply.Nature{nature},
-				Connections: map[supply.Nature]supply.Connection{
-					nature: {
-						Endpoint: host,
-						Account:  line.Account,
-						ClientID: line.ClientID,
-					},
-				},
-			},
+		passwordName := supply.EmailPasswordCredentialName(line.Account)
+		if line.Password != "" {
+			if errSet := vault.Set(passwordName, line.Password); errSet != nil {
+				failed++
+				result["outcome"] = "failed"
+				result["detail"] = errSet.Error()
+				results = append(results, result)
+				continue
+			}
 		}
-		saved, errSave := channels.Upsert(channel, time.Now().Unix())
-		if errSave != nil {
-			failed++
-			result["outcome"] = "failed"
-			result["detail"] = errSave.Error()
-			results = append(results, result)
-			continue
+		box := supply.Mailbox{
+			Nature:   nature,
+			Endpoint: host,
+			ClientID: line.ClientID,
+			Secret:   tokenName,
 		}
-		if found {
-			updated++
-			result["outcome"] = "updated"
-		} else {
+		if line.Password != "" {
+			box.Password = passwordName
+		}
+		_, created := pool.AttachMailbox(supply.KindEmail, line.Account, box, now)
+		if created {
 			imported++
 			result["outcome"] = "imported"
+		} else {
+			updated++
+			result["outcome"] = "updated"
 		}
-		result["channel_id"] = saved.ID
 		results = append(results, result)
 	}
-	// One rebuild covers the whole batch: the provider reads its channels and
-	// credentials per call, but the registry caches the provider itself.
+	// One save covers the whole batch: the pool is one document, and a save per
+	// line would rewrite it a hundred times.
 	if imported+updated > 0 {
+		if errSave := pool.Save(supply.PoolPath(supplyStateDir(h))); errSave != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": errSave.Error()})
+			return
+		}
 		reloadSupply()
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -254,6 +261,7 @@ func parseMailboxLines(text string) []mailboxLine {
 			continue
 		}
 		entry.Account = strings.ToLower(strings.TrimSpace(fields[0]))
+		entry.Password = strings.TrimSpace(fields[1])
 		entry.ClientID = strings.TrimSpace(fields[2])
 		entry.Refresh = strings.TrimSpace(fields[3])
 		switch {
@@ -322,26 +330,4 @@ func probeDetail(err error) string {
 		text = trimmed
 	}
 	return text
-}
-
-// findMailboxChannel returns the channel that already reads account, so a
-// re-import refreshes that channel instead of adding a second one for the same
-// mailbox.
-func findMailboxChannel(channels []supply.Channel, account string) (supply.Channel, bool) {
-	wanted := strings.ToLower(strings.TrimSpace(account))
-	for _, channel := range channels {
-		if channel.Email == nil {
-			continue
-		}
-		for _, nature := range channel.Email.Natures {
-			if !nature.IsMailbox() {
-				continue
-			}
-			connection := channel.Email.Connections[nature]
-			if strings.ToLower(strings.TrimSpace(connection.Account)) == wanted {
-				return channel, true
-			}
-		}
-	}
-	return supply.Channel{}, false
 }

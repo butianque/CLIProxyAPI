@@ -80,7 +80,12 @@ func kindConfigView(kc *supply.KindConfig, secretNames []string, storeEnabled bo
 }
 
 // channelView renders one channel for the panel.
-func channelView(channel supply.Channel, secretNames []string, storeEnabled bool) gin.H {
+//
+// pooled is the per-channel count of identities in the supply pool, keyed by
+// channel id. It is passed whole rather than pre-selected so a channel with no
+// records still reports zero: zero is a counted answer, while an absent map
+// means the pool could not be read at all.
+func channelView(channel supply.Channel, secretNames []string, storeEnabled bool, pooled map[string]map[supply.Kind]int) gin.H {
 	view := gin.H{
 		"id":      channel.ID,
 		"label":   channel.Label,
@@ -96,16 +101,49 @@ func channelView(channel supply.Channel, secretNames []string, storeEnabled bool
 	if ev := kindConfigView(channel.Email, secretNames, storeEnabled); ev != nil {
 		view["email"] = ev
 	}
+	// How much supply this channel has actually contributed. Reading a nil inner
+	// map yields zero, which is the right answer for a channel with no records.
+	if pooled != nil {
+		byKind := make(map[string]int, 2)
+		for _, kind := range channel.Kinds() {
+			byKind[string(kind)] = pooled[channel.ID][kind]
+		}
+		view["pooled"] = byKind
+	}
 	return view
 }
 
-// natureView describes one nature and the kinds it can serve, so the panel
-// renders the same set the host enforces instead of a hand-kept copy.
+// pooledCounts counts the identities in the supply pool per channel.
+//
+// A nil result means the pool is not available (no supply kind is configured),
+// and the panel must show that as unknown rather than as zero: "this channel put
+// nothing in the pool" and "there is no pool to count" are different facts.
+func pooledCounts(channels []supply.Channel) map[string]map[supply.Kind]int {
+	pool := supply.DefaultPool()
+	if pool == nil {
+		return nil
+	}
+	return supply.CountByChannel(channels, pool.All())
+}
+
+// natureView describes one nature and the kinds a channel of it may serve.
+//
+// The kinds come from supply.ChannelNatures rather than from what the nature can
+// technically do: a channel is one connection covering many addresses, so the
+// panel must offer exactly the natures a channel may declare. A token-based
+// mailbox transport can serve the email kind, but only as a pool identity, and
+// offering it here is what made the channel table grow one row per mailbox.
 func natureView(nature supply.Nature) gin.H {
 	kinds := make([]string, 0, 2)
 	for _, kind := range []supply.Kind{supply.KindPhone, supply.KindEmail} {
-		if nature.SupportsKind(kind) {
-			kinds = append(kinds, string(kind))
+		if !nature.SupportsKind(kind) {
+			continue
+		}
+		for _, allowed := range supply.ChannelNatures(kind) {
+			if allowed == nature {
+				kinds = append(kinds, string(kind))
+				break
+			}
 		}
 	}
 	return gin.H{"nature": string(nature), "kinds": kinds}
@@ -119,12 +157,13 @@ func (h *Handler) GetSupplyChannels(c *gin.Context) {
 		return
 	}
 	kind := supply.Kind(strings.ToLower(strings.TrimSpace(c.Query("kind"))))
-	status := secretStatus()
+	status := secretStatus(c)
 
 	channels := store.List(kind)
+	counts := pooledCounts(channels)
 	out := make([]gin.H, 0, len(channels))
 	for _, channel := range channels {
-		out = append(out, channelView(channel, status.Names, status.Enabled))
+		out = append(out, channelView(channel, status.Names, status.Enabled, counts))
 	}
 	natures := make([]gin.H, 0, len(supply.Natures()))
 	for _, nature := range supply.Natures() {
@@ -169,10 +208,10 @@ func (h *Handler) PostSupplyChannel(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": errSave.Error()})
 		return
 	}
-	status := secretStatus()
+	status := secretStatus(c)
 	c.JSON(http.StatusOK, gin.H{
 		"status":  "ok",
-		"channel": channelView(saved, status.Names, status.Enabled),
+		"channel": channelView(saved, status.Names, status.Enabled, pooledCounts([]supply.Channel{saved})),
 	})
 }
 

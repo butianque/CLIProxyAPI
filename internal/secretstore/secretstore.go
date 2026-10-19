@@ -39,6 +39,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/crypto/argon2"
 )
@@ -136,22 +137,33 @@ type envelope struct {
 	Unlock     UnlockMode `json:"unlock"`
 	KDF        *kdfParams `json:"kdf,omitempty"`
 	StorageKey []byte     `json:"storage_key,omitempty"`
-	Canary     []byte     `json:"canary,omitempty"`
-	Items      []byte     `json:"items,omitempty"`
+	// KeyID names the storage key in the seal file, so a store written during a
+	// rotation says which of the sealed keys decrypts it.
+	KeyID  string `json:"key_id,omitempty"`
+	Canary []byte `json:"canary,omitempty"`
+	Items  []byte `json:"items,omitempty"`
 }
 
 // Store is a host-owned secret store backed by a single file.
 //
 // A Store is safe for concurrent use. The zero value is not usable; call Open.
 type Store struct {
-	path    string
-	keyPath string
+	path     string
+	keyPath  string
+	sealPath string
 
 	mu    sync.RWMutex
 	env   envelope
 	key   []byte
 	mode  UnlockMode
 	items map[string]string
+	// sealMedium records how the storage key is protected at rest, so status can
+	// report the actual protection instead of an assumption.
+	sealMedium string
+	// sessions holds one grant per management session that proved the master
+	// passphrase. Grants never outlive the storage key: dropping the last one on
+	// a store without machine unlock drops the key too (see grants.go).
+	sessions map[string]*sessionGrant
 }
 
 // Open loads the store at path. A missing store is an empty store awaiting
@@ -164,7 +176,7 @@ type Store struct {
 // (EnableMachineUnlock on an empty store).
 func Open(path string) (*Store, error) {
 	clean := filepath.Clean(path)
-	store := &Store{path: clean, keyPath: clean + ".key"}
+	store := &Store{path: clean, keyPath: clean + ".key", sealPath: clean + ".seal"}
 
 	rawStore, errStore := os.ReadFile(clean)
 	switch {
@@ -378,18 +390,27 @@ func (s *Store) UnlockMachine() error {
 	return s.unlockFromMachineKey()
 }
 
-// unlockFromMachineKey reads the key file and decrypts the items. Callers must
+// unlockFromMachineKey opens the store from its sealed storage key. Callers must
 // hold s.mu.
 func (s *Store) unlockFromMachineKey() error {
-	rawKey, errKey := os.ReadFile(s.keyPath)
+	seal, _, errSeal := readSealFile(s.sealPath, s.keyPath)
+	if errSeal != nil {
+		return fmt.Errorf("read sealed key %s: %w", s.sealPath, errSeal)
+	}
+	rawKey, medium, errKey := seal.keyFor(s.env.KeyID)
 	if errKey != nil {
-		return fmt.Errorf("read machine key %s: %w", s.keyPath, errKey)
+		return errKey
 	}
 	if len(rawKey) != storageKeyLen {
-		return fmt.Errorf("machine key %s is %d bytes, want %d", s.keyPath, len(rawKey), storageKeyLen)
+		zero(rawKey)
+		return fmt.Errorf("sealed key is %d bytes, want %d", len(rawKey), storageKeyLen)
 	}
-	clone := append([]byte(nil), rawKey...)
-	return s.adoptStorageKeyLocked(clone)
+	if errAdopt := s.adoptStorageKeyLocked(rawKey); errAdopt != nil {
+		zero(rawKey)
+		return errAdopt
+	}
+	s.sealMedium = medium
+	return nil
 }
 
 // adoptStorageKeyLocked installs key, decrypts the items, and discards the key on
@@ -409,11 +430,13 @@ func (s *Store) adoptStorageKeyLocked(key []byte) error {
 	return nil
 }
 
-// lockLocked drops the key and plaintext items. Callers must hold s.mu.
+// lockLocked drops the key, the plaintext items, and every session grant.
+// Callers must hold s.mu.
 func (s *Store) lockLocked() {
 	zero(s.key)
 	s.key = nil
 	s.items = nil
+	s.sessions = nil
 }
 
 // SetPassphrase replaces the master passphrase. The current passphrase is
@@ -481,6 +504,9 @@ func (s *Store) SetPassphrase(current, next string) error {
 		return errSave
 	}
 	if !keepMachine {
+		if errRemove := removeIfExists(s.sealPath); errRemove != nil {
+			return errRemove
+		}
 		if errRemove := removeIfExists(s.keyPath); errRemove != nil {
 			return errRemove
 		}
@@ -590,16 +616,31 @@ func (s *Store) DisableMachineUnlock() error {
 	if errSave := s.saveLocked(); errSave != nil {
 		return errSave
 	}
+	// Both files go: the seal is the machine key now, and the old plaintext one
+	// must not be left behind as an unprotected copy.
+	if errSeal := removeIfExists(s.sealPath); errSeal != nil {
+		return errSeal
+	}
 	return removeIfExists(s.keyPath)
 }
 
 // Names lists the stored secret names in sorted order.
+//
+// This is the backend's own view: it answers whenever the storage key is held,
+// which is what plugins, the supply service and startup code rely on. Panel
+// requests go through Vault instead, which additionally requires that the calling
+// session proved the master passphrase.
 func (s *Store) Names() ([]string, error) {
 	if s == nil {
 		return nil, ErrLocked
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.namesLocked()
+}
+
+// namesLocked implements Names. Callers must hold s.mu.
+func (s *Store) namesLocked() ([]string, error) {
 	if s.key == nil {
 		return nil, ErrLocked
 	}
@@ -611,16 +652,21 @@ func (s *Store) Names() ([]string, error) {
 	return names, nil
 }
 
-// Get returns the plaintext value for name.
+// Get returns the plaintext value for name. See Names for who may call it.
 func (s *Store) Get(name string) (string, error) {
 	if s == nil {
 		return "", ErrLocked
 	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.getLocked(name)
+}
+
+// getLocked implements Get. Callers must hold s.mu.
+func (s *Store) getLocked(name string) (string, error) {
 	if name == "" {
 		return "", ErrEmptyName
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	if s.key == nil {
 		return "", ErrLocked
 	}
@@ -636,11 +682,16 @@ func (s *Store) Set(name, value string) error {
 	if s == nil {
 		return ErrLocked
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.setLocked(name, value)
+}
+
+// setLocked implements Set. Callers must hold s.mu for writing.
+func (s *Store) setLocked(name, value string) error {
 	if name == "" {
 		return ErrEmptyName
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.key == nil {
 		return ErrLocked
 	}
@@ -665,11 +716,16 @@ func (s *Store) Delete(name string) error {
 	if s == nil {
 		return ErrLocked
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.deleteLocked(name)
+}
+
+// deleteLocked implements Delete. Callers must hold s.mu for writing.
+func (s *Store) deleteLocked(name string) error {
 	if name == "" {
 		return ErrEmptyName
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.key == nil {
 		return ErrLocked
 	}
@@ -685,13 +741,66 @@ func (s *Store) Delete(name string) error {
 	return nil
 }
 
-// cacheStorageKeyFile writes the storage key to the key file. Callers must hold
-// s.mu.
-func (s *Store) cacheStorageKeyFile() error {
+// sealKeyLocked writes the storage key to the seal file, adding the current key
+// version when it is not there yet. Callers must hold s.mu for writing.
+//
+// It reuses an existing seal when the current key is already in it, so an
+// ordinary secret write does not churn the file or reset the rotation count.
+func (s *Store) sealKeyLocked() error {
 	if s.key == nil {
 		return ErrLocked
 	}
-	return writeFileAtomic(s.keyPath, s.key)
+	existing, legacy, errSeal := readSealFile(s.sealPath, s.keyPath)
+	switch {
+	case errSeal == nil && !legacy:
+		if _, medium, errKey := existing.keyFor(s.env.KeyID); errKey == nil {
+			s.sealMedium = medium
+			return nil
+		}
+	case errSeal == nil && legacy:
+		// A real seal is written below, replacing the plaintext key file.
+		existing = nil
+	case errors.Is(errSeal, os.ErrNotExist):
+		existing = nil
+	default:
+		return errSeal
+	}
+
+	protector, errProtector := platformProtector()
+	if errProtector != nil {
+		return errProtector
+	}
+	keyID := s.env.KeyID
+	if keyID == "" {
+		newID, errID := newSealKeyID()
+		if errID != nil {
+			return errID
+		}
+		keyID = newID
+	}
+	seal := &sealFile{Version: 1, Medium: protector.medium(), Created: time.Now().UTC()}
+	if existing != nil {
+		seal.Created = existing.Created
+		seal.Rotated = existing.Rotated
+	}
+	next, errAdd := seal.addSealedKey(protector, keyID, s.key)
+	if errAdd != nil {
+		return errAdd
+	}
+	if errWrite := writeSealFile(s.sealPath, next); errWrite != nil {
+		return errWrite
+	}
+	s.env.KeyID = keyID
+	s.sealMedium = next.Medium
+	// The legacy plaintext key file is superseded by the seal and must not be
+	// left behind as an unprotected copy of the same key.
+	return removeIfExists(s.keyPath)
+}
+
+// cacheStorageKeyFile re-persists the store so its storage key is sealed. Callers
+// must hold s.mu.
+func (s *Store) cacheStorageKeyFile() error {
+	return s.saveLocked()
 }
 
 // saveLocked reseals the secret map and persists the envelope. Callers must hold
@@ -709,18 +818,20 @@ func (s *Store) saveLocked() error {
 	previous := s.env.Items
 	s.env.Items = sealed
 
+	// The seal is written first: a store file whose key is nowhere on disk is
+	// unrecoverable, while a seal without a matching store file is harmless. It
+	// also settles s.env.KeyID, which the envelope below records.
+	if s.mode == UnlockMachine || s.mode == UnlockPassphraseMachine {
+		if errKey := s.sealKeyLocked(); errKey != nil {
+			s.env.Items = previous
+			return errKey
+		}
+	}
+
 	raw, errEncode := json.MarshalIndent(s.env, "", "  ")
 	if errEncode != nil {
 		s.env.Items = previous
 		return fmt.Errorf("encode secret store: %w", errEncode)
-	}
-	// The key file is written first: a store file without its key is
-	// unrecoverable, while a key without a store file is harmless.
-	if s.mode == UnlockMachine || s.mode == UnlockPassphraseMachine {
-		if errKey := writeFileAtomic(s.keyPath, s.key); errKey != nil {
-			s.env.Items = previous
-			return errKey
-		}
 	}
 	if errWrite := writeFileAtomic(s.path, raw); errWrite != nil {
 		s.env.Items = previous

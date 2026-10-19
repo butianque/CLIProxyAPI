@@ -16,7 +16,8 @@ import (
 )
 
 // setupImportTest wires the batch import route against a temporary supply
-// directory, so every assertion reads what the route actually persisted.
+// directory and an empty pool, so every assertion reads what the route actually
+// persisted.
 func setupImportTest(t *testing.T) (*Handler, *gin.Engine, string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -28,9 +29,16 @@ func setupImportTest(t *testing.T) (*Handler, *gin.Engine, string) {
 	if errMkdir := os.MkdirAll(stateDir, 0o755); errMkdir != nil {
 		t.Fatalf("create supply dir: %v", errMkdir)
 	}
+	previous := supply.Default()
+	t.Cleanup(func() { supply.SetDefault(previous) })
+	registry := supply.NewRegistry()
+	registry.SetPool(supply.NewPool())
+	supply.SetDefault(registry)
+
 	h := &Handler{configFilePath: cfgPath}
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
+	attachTestSession(t, h, r)
 	r.POST("/supply/email/import", h.PostSupplyEmailImport)
 	return h, r, stateDir
 }
@@ -47,7 +55,21 @@ func importMailboxes(t *testing.T, r *gin.Engine, body string) (int, map[string]
 	return rr.Code, decoded
 }
 
-func TestImportMailboxesStoresTokensAndChannels(t *testing.T) {
+// loadPool reads the pool document the route wrote.
+func loadPool(t *testing.T, stateDir string) *supply.Pool {
+	t.Helper()
+	pool, errLoad := supply.LoadPool(supply.PoolPath(stateDir))
+	if errLoad != nil {
+		t.Fatalf("load pool: %v", errLoad)
+	}
+	return pool
+}
+
+// An imported mailbox is a pool identity, not a channel: a bought address owns
+// exactly one mailbox and its own credential, while a channel is one connection
+// that covers many addresses. Filing a batch as channels is what turned the
+// channel table into an address book.
+func TestImportMailboxesStoresIdentitiesInThePool(t *testing.T) {
 	_, r, stateDir := setupImportTest(t)
 	unlockedEmptyStore(t)
 
@@ -66,30 +88,39 @@ func TestImportMailboxesStoresTokensAndChannels(t *testing.T) {
 		t.Fatalf("counts = imported %v updated %v failed %v", resp["imported"], resp["updated"], resp["failed"])
 	}
 
+	// Nothing reaches the channel table: these are identities, not connections.
 	channels, errLoad := supply.LoadChannels(supply.ChannelPath(stateDir))
 	if errLoad != nil {
 		t.Fatalf("load channels: %v", errLoad)
 	}
-	emailChannels := channels.List(supply.KindEmail)
-	if len(emailChannels) != 2 {
-		t.Fatalf("email channels = %d, want 2", len(emailChannels))
+	if len(channels.All()) != 0 {
+		t.Fatalf("the import wrote %d channels, want none", len(channels.All()))
 	}
-	for _, channel := range emailChannels {
-		if channel.Category != "third-party" {
-			t.Fatalf("%s category = %q", channel.Label, channel.Category)
+
+	pool := loadPool(t, stateDir)
+	records := pool.Mailboxes()
+	if len(records) != 2 {
+		t.Fatalf("pool mailboxes = %d, want 2", len(records))
+	}
+	for _, record := range records {
+		box := record.Mailbox
+		if box == nil {
+			t.Fatalf("%s has no mailbox block", record.Address)
 		}
-		connection, ok := channel.Email.Connections[supply.NatureOAuth2]
-		if !ok {
-			t.Fatalf("%s has no oauth2 connection", channel.Label)
+		if box.Nature != supply.NatureOAuth2 {
+			t.Fatalf("%s nature = %q, want oauth2", record.Address, box.Nature)
 		}
-		if connection.Endpoint != defaultImportedMailboxHost {
-			t.Fatalf("%s endpoint = %q", channel.Label, connection.Endpoint)
+		if box.Endpoint != defaultImportedMailboxHost {
+			t.Fatalf("%s endpoint = %q", record.Address, box.Endpoint)
 		}
-		if connection.ClientID == "" {
-			t.Fatalf("%s lost the application id", channel.Label)
+		if box.ClientID == "" {
+			t.Fatalf("%s lost the application id", record.Address)
 		}
-		if connection.Usage != "personal" {
-			t.Fatalf("%s usage = %q, want personal", channel.Label, connection.Usage)
+		if box.Secret != supply.EmailOAuth2CredentialName(record.Address) {
+			t.Fatalf("%s credential entry = %q", record.Address, box.Secret)
+		}
+		if box.Password != supply.EmailPasswordCredentialName(record.Address) {
+			t.Fatalf("%s password entry = %q", record.Address, box.Password)
 		}
 	}
 
@@ -99,19 +130,24 @@ func TestImportMailboxesStoresTokensAndChannels(t *testing.T) {
 		t.Fatalf("read stored token: %v", errGet)
 	}
 	// The re-import of the same mailbox rotates the token instead of adding a
-	// second channel for it.
+	// second identity for it.
 	if value != "tok-alpha-2" {
 		t.Fatalf("stored token = %q, want the rotated one", value)
+	}
+	// The password is kept too: it is what a person signing in to the mailbox's
+	// own web page needs, and Microsoft refuses it on every transport.
+	if password, errPassword := store.Get(supply.EmailPasswordCredentialName("alice@outlook.com")); errPassword != nil || password != "pw1" {
+		t.Fatalf("stored password = %q (err %v)", password, errPassword)
 	}
 }
 
 // The answer is what the panel renders, so it must not carry a credential value.
-func TestImportMailboxesNeverEchoesTheToken(t *testing.T) {
+func TestImportMailboxesNeverEchoesTheSecrets(t *testing.T) {
 	_, r, _ := setupImportTest(t)
 	unlockedEmptyStore(t)
 
 	code, resp := importMailboxes(t, r,
-		`{"text":"alice@outlook.com----pw----11111111-1111-1111-1111-111111111111----tok-secret-value","probe":false}`)
+		`{"text":"alice@outlook.com----pw-secret-value----11111111-1111-1111-1111-111111111111----tok-secret-value","probe":false}`)
 	if code != http.StatusOK {
 		t.Fatalf("import: %d %v", code, resp)
 	}
@@ -119,10 +155,13 @@ func TestImportMailboxesNeverEchoesTheToken(t *testing.T) {
 	if strings.Contains(string(encoded), "tok-secret-value") {
 		t.Fatalf("the answer carries the refresh token: %s", encoded)
 	}
+	if strings.Contains(string(encoded), "pw-secret-value") {
+		t.Fatalf("the answer carries the password: %s", encoded)
+	}
 }
 
 // A locked store cannot take a credential, and the route must say so before it
-// writes any channel.
+// writes any identity.
 func TestImportMailboxesRefusesALockedStore(t *testing.T) {
 	_, r, stateDir := setupImportTest(t)
 
@@ -142,12 +181,8 @@ func TestImportMailboxesRefusesALockedStore(t *testing.T) {
 	if code != http.StatusConflict {
 		t.Fatalf("locked store: %d, want %d", code, http.StatusConflict)
 	}
-	channels, errLoad := supply.LoadChannels(supply.ChannelPath(stateDir))
-	if errLoad != nil {
-		t.Fatalf("load channels: %v", errLoad)
-	}
-	if len(channels.All()) != 0 {
-		t.Fatalf("a refused import still wrote %d channels", len(channels.All()))
+	if records := loadPool(t, stateDir).All(); len(records) != 0 {
+		t.Fatalf("a refused import still wrote %d identities", len(records))
 	}
 
 	// Unlocking is the gate's job; once it is open the batch is still checked
@@ -167,10 +202,10 @@ func TestImportMailboxesRefusesALockedStore(t *testing.T) {
 	}
 }
 
-// A batch pasted for Graph must be stored as a Graph channel: no endpoint (Graph
-// has one fixed one), the application id kept, and the credential under the
-// token entry — a Graph channel that stored its token under the password entry
-// would be handed to an IMAP LOGIN that can never accept it.
+// A batch pasted for Graph must be stored as a Graph identity: no endpoint (Graph
+// has one fixed one), the application id kept, and the credential under the token
+// entry — a Graph identity that stored its token under the password entry would be
+// handed to an IMAP LOGIN that can never accept it.
 func TestImportMailboxesStoresTheChosenReceivingMethod(t *testing.T) {
 	_, r, stateDir := setupImportTest(t)
 	unlockedEmptyStore(t)
@@ -184,26 +219,22 @@ func TestImportMailboxesStoresTheChosenReceivingMethod(t *testing.T) {
 		t.Fatalf("answer nature = %v, want graph", resp["nature"])
 	}
 
-	channels, errLoad := supply.LoadChannels(supply.ChannelPath(stateDir))
-	if errLoad != nil {
-		t.Fatalf("load channels: %v", errLoad)
+	records := loadPool(t, stateDir).Mailboxes()
+	if len(records) != 1 {
+		t.Fatalf("pool mailboxes = %d, want 1", len(records))
 	}
-	stored := channels.List(supply.KindEmail)
-	if len(stored) != 1 {
-		t.Fatalf("email channels = %d, want 1", len(stored))
+	box := records[0].Mailbox
+	if box == nil || box.Nature != supply.NatureGraph {
+		t.Fatalf("mailbox = %+v, want a graph transport", box)
 	}
-	connection, ok := stored[0].Email.Connections[supply.NatureGraph]
-	if !ok {
-		t.Fatalf("channel natures = %v, want a graph connection", stored[0].Email.Natures)
+	if box.Endpoint != "" {
+		t.Fatalf("graph endpoint = %q, want none", box.Endpoint)
 	}
-	if connection.Endpoint != "" {
-		t.Fatalf("graph endpoint = %q, want none", connection.Endpoint)
+	if box.ClientID != "11111111-1111-1111-1111-111111111111" {
+		t.Fatalf("graph application id = %q", box.ClientID)
 	}
-	if connection.ClientID != "11111111-1111-1111-1111-111111111111" {
-		t.Fatalf("graph application id = %q", connection.ClientID)
-	}
-	if want := supply.EmailOAuth2CredentialName("alice@outlook.com"); connection.Secret != want {
-		t.Fatalf("graph credential entry = %q, want %q", connection.Secret, want)
+	if want := supply.EmailOAuth2CredentialName("alice@outlook.com"); box.Secret != want {
+		t.Fatalf("graph credential entry = %q, want %q", box.Secret, want)
 	}
 }
 
@@ -218,18 +249,14 @@ func TestImportMailboxesRejectsAnUnknownReceivingMethod(t *testing.T) {
 	if code != http.StatusBadRequest {
 		t.Fatalf("unknown receiving method: %d, want %d", code, http.StatusBadRequest)
 	}
-	channels, errLoad := supply.LoadChannels(supply.ChannelPath(stateDir))
-	if errLoad != nil {
-		t.Fatalf("load channels: %v", errLoad)
-	}
-	if len(channels.All()) != 0 {
-		t.Fatalf("a refused import wrote %d channels", len(channels.All()))
+	if records := loadPool(t, stateDir).All(); len(records) != 0 {
+		t.Fatalf("a refused import wrote %d identities", len(records))
 	}
 }
 
 // Re-importing the same mailbox with a different receiving method replaces the
-// method instead of leaving a channel with two of them: one mailbox is read one
-// way, and a stale second connection is a row nobody can reason about.
+// method instead of leaving two of them: one mailbox is read one way, and a stale
+// second transport is a record nobody can reason about.
 func TestImportMailboxesSwitchesTheReceivingMethodInPlace(t *testing.T) {
 	_, r, stateDir := setupImportTest(t)
 	unlockedEmptyStore(t)
@@ -242,19 +269,16 @@ func TestImportMailboxesSwitchesTheReceivingMethodInPlace(t *testing.T) {
 		t.Fatalf("imap import: %d %v", code, resp)
 	}
 
-	channels, errLoad := supply.LoadChannels(supply.ChannelPath(stateDir))
-	if errLoad != nil {
-		t.Fatalf("load channels: %v", errLoad)
+	records := loadPool(t, stateDir).Mailboxes()
+	if len(records) != 1 {
+		t.Fatalf("pool mailboxes = %d, want 1", len(records))
 	}
-	stored := channels.List(supply.KindEmail)
-	if len(stored) != 1 {
-		t.Fatalf("email channels = %d, want 1", len(stored))
+	box := records[0].Mailbox
+	if box.Nature != supply.NatureOAuth2 {
+		t.Fatalf("nature = %q, want oauth2", box.Nature)
 	}
-	if _, ok := stored[0].Email.Connections[supply.NatureOAuth2]; !ok {
-		t.Fatalf("natures = %v, want the oauth2 connection", stored[0].Email.Natures)
-	}
-	if _, ok := stored[0].Email.Connections[supply.NatureGraph]; ok {
-		t.Fatalf("natures = %v, the graph connection was left behind", stored[0].Email.Natures)
+	if box.Endpoint != defaultImportedMailboxHost {
+		t.Fatalf("endpoint = %q, want the IMAP host", box.Endpoint)
 	}
 }
 
@@ -306,6 +330,11 @@ func TestParseMailboxLinesNamesTheBrokenPart(t *testing.T) {
 	}
 	if lines[3].Account != "a@b.com" || lines[3].Refresh != "tok" {
 		t.Fatalf("valid line parsed as %+v", lines[3])
+	}
+	// The password is parsed even though no transport spends it: it is what a
+	// person signing in to the mailbox's own web page needs.
+	if lines[3].Password != "pw" {
+		t.Fatalf("password field = %q, want pw", lines[3].Password)
 	}
 }
 

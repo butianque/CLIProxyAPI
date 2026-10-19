@@ -6,8 +6,10 @@ package cmd
 import (
 	"context"
 	"errors"
+	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -38,12 +40,71 @@ func initSecretStore(configPath string) {
 	secretstore.Configure(store)
 	switch {
 	case store.Unlocked():
-		log.Infof("secret store ready at %s (mode %s, unlocked)", path, store.Mode())
+		log.Infof("secret store ready at %s (mode %s, backend access %s, key protection %s)",
+			path, store.Mode(), store.SystemAccess(), sealLabel(store.SealMedium()))
 	case !store.Initialized():
 		log.Warnf("secret store at %s is not initialized; set a master passphrase before storing secrets", path)
 	default:
 		log.Warnf("secret store at %s is locked (mode %s); unlock with the master passphrase to use secrets", path, store.Mode())
 	}
+	startSealRotation(store)
+}
+
+// sealLabel renders a seal medium for a log line.
+func sealLabel(medium string) string {
+	if medium == "" {
+		return "none"
+	}
+	return medium
+}
+
+// sealRotationInterval is how often the machine key is re-wrapped. A day is short
+// enough that a copied seal file goes stale within a known window and long enough
+// that the rewrite is invisible. CPA_SECRET_SEAL_ROTATE_HOURS overrides it; zero
+// disables rotation.
+const defaultSealRotationHours = 24
+
+func sealRotationInterval() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("CPA_SECRET_SEAL_ROTATE_HOURS"))
+	if raw != "" {
+		if hours, errAtoi := strconv.Atoi(raw); errAtoi == nil {
+			return time.Duration(hours) * time.Hour
+		}
+		log.Warnf("CPA_SECRET_SEAL_ROTATE_HOURS=%q is not a number; using %d hours", raw, defaultSealRotationHours)
+	}
+	return defaultSealRotationHours * time.Hour
+}
+
+// startSealRotation re-wraps the machine key on a schedule.
+//
+// What this is: the storage key is sealed again with fresh OS-supplied
+// randomness, so the artifact on disk is refreshed and the rotation count moves.
+// What this is not: it does not revoke a copy of the old seal file — that copy
+// still unseals, because the storage key itself has not changed. Rotation bounds
+// how long a copied artifact stays current and gives the seal a heartbeat the
+// operator can see; replacing the storage key is a separate, destructive action.
+func startSealRotation(store *secretstore.Store) {
+	interval := sealRotationInterval()
+	if interval <= 0 || store == nil {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for range ticker.C {
+			// Unattended access can be switched on long after startup, so the
+			// medium is checked per tick instead of once here: a store that is
+			// passphrase-only today may hold a machine key tomorrow.
+			if store.SealMedium() == "" {
+				continue
+			}
+			if errRotate := store.RotateSeal(); errRotate != nil {
+				log.Warnf("secret store: seal rotation failed: %v", errRotate)
+				continue
+			}
+			log.Infof("secret store: machine key re-sealed (%s)", sealLabel(store.SealMedium()))
+		}
+	}()
 }
 
 // initSupply installs the process-wide account-supply service used by plugins
@@ -122,13 +183,47 @@ func supplyStateDir(cfg *config.Config, configPath string) string {
 // own copy would drift from the others. A decode failure is reported but not
 // fatal — a corrupt pool must not stop the server from starting, and the next
 // write rewrites it.
+//
+// The channel document is migrated on the way: a channel used to be able to
+// declare a token-based mailbox transport, which put one bought address in the
+// same table as a service that mints addresses. Those identities are moved into
+// the pool here so an existing installation keeps reading its mail instead of
+// being refused at load time. A migration failure is a warning for the same
+// reason a decode failure is: the server must still start.
 func loadSupplyPool(cfg *config.Config, configPath string) *supply.Pool {
-	pool, errLoad := supply.LoadPool(supply.PoolPath(supplyStateDir(cfg, configPath)))
+	stateDir := supplyStateDir(cfg, configPath)
+	pool, errLoad := supply.LoadPool(supply.PoolPath(stateDir))
 	if errLoad != nil {
 		log.Warnf("supply pool unreadable, starting empty: %v", errLoad)
-		return supply.NewPool()
+		pool = supply.NewPool()
 	}
+	migrateMailboxesIntoPool(stateDir, pool)
 	return pool
+}
+
+// migrateMailboxesIntoPool moves mailbox identities a channel can no longer own
+// into the pool.
+func migrateMailboxesIntoPool(stateDir string, pool *supply.Pool) {
+	if pool == nil {
+		return
+	}
+	store, errLoad := supply.LoadChannels(supply.ChannelPath(stateDir))
+	if errLoad != nil {
+		log.Warnf("supply channels unreadable, skipping the mailbox migration: %v", errLoad)
+		return
+	}
+	moved, errMigrate := supply.MigrateChannelsToPool(store, pool, time.Now().Unix())
+	if errMigrate != nil {
+		log.Warnf("supply mailbox migration incomplete: %v", errMigrate)
+	}
+	if moved == 0 {
+		return
+	}
+	if errSave := pool.Save(supply.PoolPath(stateDir)); errSave != nil {
+		log.Warnf("supply pool not saved after the mailbox migration: %v", errSave)
+		return
+	}
+	log.Infof("moved %d mailbox identities from the channel table into the supply pool", moved)
 }
 
 // buildPhoneProvider assembles the phone provider from configuration and the

@@ -103,13 +103,33 @@ func TestChannelNormalizeImapSelfDomain(t *testing.T) {
 	}
 }
 
-// A mailbox of mine is mine, but it is still one address: only a domain I built
-// can hand out new ones. This is the difference between self-owned and
-// self-built, and it is the difference the panel shows as two categories.
-func TestChannelNormalizeImapOwnMailboxIsPersonal(t *testing.T) {
+// A personal mailbox used to be its own category. It is not one any more: a
+// channel covers many addresses from one connection, while a personal mailbox is
+// exactly one address with its own credential — a pool identity. The category is
+// refused so an old document cannot quietly keep claiming it.
+func TestChannelNormalizeRejectsTheRetiredOwnMailboxCategory(t *testing.T) {
 	c := Channel{
 		Label:    "my-qq",
 		Category: "self-owned",
+		Email: &KindConfig{
+			Enabled: true,
+			Natures: []Nature{NatureIMAP},
+			Connections: map[Nature]Connection{
+				NatureIMAP: {Account: "me@qq.com", Secret: "imap-pass"},
+			},
+		},
+	}
+	if _, err := c.Normalize(); err == nil {
+		t.Fatal("expected the retired self-owned category to be refused")
+	}
+}
+
+// A third-party mailbox is one address too, and that is the answer the usage
+// field carries: nothing can be minted on it.
+func TestChannelNormalizeThirdPartyMailboxIsPersonal(t *testing.T) {
+	c := Channel{
+		Label:    "my-qq",
+		Category: "third-party",
 		Email: &KindConfig{
 			Enabled: true,
 			Natures: []Nature{NatureIMAP},
@@ -131,12 +151,12 @@ func TestChannelNormalizeImapOwnMailboxIsPersonal(t *testing.T) {
 	}
 }
 
-// The same mailbox cannot claim a domain just because it is self-owned: a domain
-// is only meaningful where addresses are minted on it.
-func TestChannelNormalizeImapOwnMailboxRejectsDomain(t *testing.T) {
+// A domain is only meaningful where addresses are minted on it, so a mailbox
+// outside the self-built category cannot carry one.
+func TestChannelNormalizeThirdPartyMailboxRejectsDomain(t *testing.T) {
 	c := Channel{
 		Label:    "my-qq",
-		Category: "self-owned",
+		Category: "third-party",
 		Email: &KindConfig{
 			Enabled: true,
 			Natures: []Nature{NatureIMAP},
@@ -146,7 +166,7 @@ func TestChannelNormalizeImapOwnMailboxRejectsDomain(t *testing.T) {
 		},
 	}
 	if _, err := c.Normalize(); err == nil {
-		t.Fatal("expected error for a domain on a self-owned mailbox")
+		t.Fatal("expected error for a domain on a third-party mailbox")
 	}
 }
 
@@ -521,80 +541,45 @@ func TestChannelStorePersistence(t *testing.T) {
 	}
 }
 
-// An OAuth2 mailbox is a mailbox: it takes the same address rules and the same
-// catch-all question, and its credential is derived from the login like the
-// password entry is. What differs is the entry prefix — the two hold different
-// kinds of value, so sharing a name would feed a refresh token to a LOGIN.
-func TestChannelNormalizeOAuth2Mailbox(t *testing.T) {
-	c := Channel{
-		Label:    "outlook",
-		Category: "self-built",
-		Email: &KindConfig{
-			Enabled: true,
-			Natures: []Nature{NatureOAuth2},
-			Connections: map[Nature]Connection{
-				NatureOAuth2: {
-					Endpoint: "outlook.office365.com:993",
-					Account:  "Box@Outlook.com",
-					ClientID: "app-123",
-					Domain:   "ormnes.com",
+// A token-based mailbox is not a channel nature. Its credential belongs to the
+// mailbox, which makes it one bought identity — a pool record — and a channel is
+// one connection that covers many addresses. Accepting it here is what used to
+// turn the channel table into an address book, one row per mailbox.
+func TestChannelNormalizeRejectsTokenMailboxChannels(t *testing.T) {
+	for _, nature := range []Nature{NatureOAuth2, NatureGraph} {
+		c := Channel{
+			Label:    "outlook",
+			Category: "third-party",
+			Email: &KindConfig{
+				Enabled: true,
+				Natures: []Nature{nature},
+				Connections: map[Nature]Connection{
+					nature: {Endpoint: "outlook.office365.com:993", Account: "box@outlook.com", ClientID: "app-123"},
 				},
 			},
-		},
-	}
-	got, err := c.Normalize()
-	if err != nil {
-		t.Fatalf("normalize failed: %v", err)
-	}
-	conn := got.Email.Connections[NatureOAuth2]
-	if want := "email-oauth2-box@outlook.com"; conn.Secret != want {
-		t.Errorf("secret name = %q, want %q", conn.Secret, want)
-	}
-	if conn.Usage != "self-domain" {
-		t.Errorf("usage = %q, want self-domain", conn.Usage)
-	}
-	if conn.ClientID != "app-123" {
-		t.Errorf("client id = %q, want app-123", conn.ClientID)
+		}
+		if _, err := c.Normalize(); err == nil {
+			t.Fatalf("a channel declaring %q was accepted", nature)
+		}
 	}
 }
 
-// Without the application id the token endpoint cannot be asked for anything, so
-// the connection can never authenticate: refusing it at write time keeps it from
-// becoming a channel that looks configured and silently reads nothing.
-func TestChannelNormalizeOAuth2NeedsClientID(t *testing.T) {
-	c := Channel{
-		Label:    "outlook",
-		Category: "self-owned",
-		Email: &KindConfig{
-			Enabled: true,
-			Natures: []Nature{NatureOAuth2},
-			Connections: map[Nature]Connection{
-				NatureOAuth2: {Endpoint: "outlook.office365.com:993", Account: "box@outlook.com"},
-			},
-		},
+// The set a channel may declare is deliberately narrower than what a nature can
+// serve: the token transports serve the email kind, but only as pool identities.
+func TestChannelNaturesIsNarrowerThanSupportsKind(t *testing.T) {
+	if got := ChannelNatures(KindEmail); len(got) != 1 || got[0] != NatureIMAP {
+		t.Fatalf("email channel natures = %v, want only imap", got)
 	}
-	if _, err := c.Normalize(); err == nil {
-		t.Fatal("an OAuth2 mailbox without an application id was accepted")
+	if got := ChannelNatures(KindPhone); len(got) != 2 || got[0] != NatureAPI || got[1] != NatureWeb {
+		t.Fatalf("phone channel natures = %v, want api and web", got)
 	}
-}
-
-// One mailbox is read one way. Declaring both methods would leave the host
-// choosing, and a wrong choice is a channel that never reads its mail.
-func TestChannelNormalizeRejectsBothMailboxMethods(t *testing.T) {
-	c := Channel{
-		Label:    "both",
-		Category: "self-owned",
-		Email: &KindConfig{
-			Enabled: true,
-			Natures: []Nature{NatureIMAP, NatureOAuth2},
-			Connections: map[Nature]Connection{
-				NatureIMAP:   {Endpoint: "imap.qq.com:993", Account: "box@qq.com"},
-				NatureOAuth2: {Endpoint: "outlook.office365.com:993", Account: "box@outlook.com", ClientID: "app-123"},
-			},
-		},
-	}
-	if _, err := c.Normalize(); err == nil {
-		t.Fatal("a mailbox declaring both methods was accepted")
+	for _, nature := range []Nature{NatureOAuth2, NatureGraph} {
+		if !nature.SupportsKind(KindEmail) {
+			t.Fatalf("%q should still serve the email kind as a pool identity", nature)
+		}
+		if containsNature(ChannelNatures(KindEmail), nature) {
+			t.Fatalf("%q must not be a channel nature", nature)
+		}
 	}
 }
 
@@ -603,7 +588,7 @@ func TestChannelNormalizeRejectsBothMailboxMethods(t *testing.T) {
 func TestChannelNormalizeClearsClientIDOutsideOAuth2(t *testing.T) {
 	c := Channel{
 		Label:    "qq",
-		Category: "self-owned",
+		Category: "third-party",
 		Email: &KindConfig{
 			Enabled: true,
 			Natures: []Nature{NatureIMAP},

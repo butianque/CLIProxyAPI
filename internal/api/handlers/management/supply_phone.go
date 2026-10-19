@@ -89,7 +89,7 @@ func (h *Handler) GetSupplyPhoneStatus(c *gin.Context) {
 
 	// The store's own state drives the panel: whether it is usable, whether a
 	// master passphrase is installed, and which credentials exist.
-	status := secretStatus()
+	status := secretStatus(c)
 	payload["store_enabled"] = status.Enabled
 	payload["store_available"] = status.Unlocked
 	payload["passphrase_set"] = status.Passphrase
@@ -97,7 +97,7 @@ func (h *Handler) GetSupplyPhoneStatus(c *gin.Context) {
 	payload["api_present"] = status.Enabled && contains(status.Names, phoneCfg.APISecret)
 	payload["cookie_present"] = status.Enabled && contains(status.Names, phoneCfg.CookieSecret)
 	if status.Enabled && status.Unlocked {
-		if raw, errGet := secretstore.Default().Get(phoneCfg.APISecret); errGet == nil {
+		if raw, errGet := sessionVault(c).Get(phoneCfg.APISecret); errGet == nil {
 			if parsed, errParse := phone.ParseHaozhumaSecret(raw); errParse == nil {
 				webUser := strings.TrimSpace(parsed.WebUser)
 				payload["web_present"] = webUser != ""
@@ -291,7 +291,7 @@ func (h *Handler) PostSupplyPhoneAPI(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid JSON body"})
 		return
 	}
-	store, errGate := gateSupplyWrite(c, body.Passphrase)
+	vault, errGate := gateSupplyWrite(c, body.Passphrase)
 	if errGate {
 		return
 	}
@@ -300,7 +300,7 @@ func (h *Handler) PostSupplyPhoneAPI(c *gin.Context) {
 	// Read back what is stored so a blank field means "leave it alone" rather
 	// than "erase it": the panel never echoes secrets.
 	secret := phone.HaozhumaSecret{}
-	if existing, errGet := store.Get(phoneCfg.APISecret); errGet == nil {
+	if existing, errGet := vault.Get(phoneCfg.APISecret); errGet == nil {
 		if parsed, errParse := phone.ParseHaozhumaSecret(existing); errParse == nil {
 			secret = parsed
 		}
@@ -315,7 +315,7 @@ func (h *Handler) PostSupplyPhoneAPI(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": errMarshal.Error()})
 		return
 	}
-	if errStore := store.Set(phoneCfg.APISecret, string(encoded)); errStore != nil {
+	if errStore := vault.Set(phoneCfg.APISecret, string(encoded)); errStore != nil {
 		c.JSON(errStatus(errStore), gin.H{"status": "error", "error": errStore.Error()})
 		return
 	}
@@ -359,14 +359,14 @@ func (h *Handler) PostSupplyPhoneCookie(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid JSON body"})
 		return
 	}
-	store, errGate := gateSupplyWrite(c, body.Passphrase)
+	vault, errGate := gateSupplyWrite(c, body.Passphrase)
 	if errGate {
 		return
 	}
 	phoneCfg := h.supplyPhoneConfig()
 	cookie := strings.TrimSpace(body.Cookie)
 	if cookie == "" {
-		if errDelete := store.Delete(phoneCfg.CookieSecret); errDelete != nil && !errors.Is(errDelete, secretstore.ErrNotFound) {
+		if errDelete := vault.Delete(phoneCfg.CookieSecret); errDelete != nil && !errors.Is(errDelete, secretstore.ErrNotFound) {
 			c.JSON(errStatus(errDelete), gin.H{"status": "error", "error": errDelete.Error()})
 			return
 		}
@@ -379,7 +379,7 @@ func (h *Handler) PostSupplyPhoneCookie(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": errMarshal.Error()})
 		return
 	}
-	if errStore := store.Set(phoneCfg.CookieSecret, string(encoded)); errStore != nil {
+	if errStore := vault.Set(phoneCfg.CookieSecret, string(encoded)); errStore != nil {
 		c.JSON(errStatus(errStore), gin.H{"status": "error", "error": errStore.Error()})
 		return
 	}
@@ -403,12 +403,12 @@ func (h *Handler) PostSupplyPhoneWebLogin(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid JSON body"})
 		return
 	}
-	store, errGate := gateSupplyWrite(c, body.Passphrase)
+	vault, errGate := gateSupplyWrite(c, body.Passphrase)
 	if errGate {
 		return
 	}
 	phoneCfg := h.supplyPhoneConfig()
-	existing, errGet := store.Get(phoneCfg.APISecret)
+	existing, errGet := vault.Get(phoneCfg.APISecret)
 	if errGet != nil {
 		if errors.Is(errGet, secretstore.ErrNotFound) {
 			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "store the platform API credential first"})
@@ -458,7 +458,7 @@ func (h *Handler) PostSupplyPhoneWebLogin(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": errMarshal.Error()})
 			return
 		}
-		if errStore := store.Set(phoneCfg.APISecret, string(encoded)); errStore != nil {
+		if errStore := vault.Set(phoneCfg.APISecret, string(encoded)); errStore != nil {
 			c.JSON(errStatus(errStore), gin.H{"status": "error", "error": errStore.Error()})
 			return
 		}
@@ -469,7 +469,7 @@ func (h *Handler) PostSupplyPhoneWebLogin(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": errMarshal.Error()})
 		return
 	}
-	if errStore := store.Set(phoneCfg.CookieSecret, string(encoded)); errStore != nil {
+	if errStore := vault.Set(phoneCfg.CookieSecret, string(encoded)); errStore != nil {
 		c.JSON(errStatus(errStore), gin.H{"status": "error", "error": errStore.Error()})
 		return
 	}
@@ -489,7 +489,7 @@ func (h *Handler) PostSupplyPhoneWebCredential(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid JSON body"})
 		return
 	}
-	store, errGate := gateSupplyWrite(c, body.Passphrase)
+	vault, errGate := gateSupplyWrite(c, body.Passphrase)
 	if errGate {
 		return
 	}
@@ -500,7 +500,7 @@ func (h *Handler) PostSupplyPhoneWebCredential(c *gin.Context) {
 		return
 	}
 	phoneCfg := h.supplyPhoneConfig()
-	existing, errGet := store.Get(phoneCfg.APISecret)
+	existing, errGet := vault.Get(phoneCfg.APISecret)
 	if errGet != nil {
 		if errors.Is(errGet, secretstore.ErrNotFound) {
 			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "store the platform API credential first"})
@@ -525,7 +525,7 @@ func (h *Handler) PostSupplyPhoneWebCredential(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": errMarshal.Error()})
 		return
 	}
-	if errStore := store.Set(phoneCfg.APISecret, string(encoded)); errStore != nil {
+	if errStore := vault.Set(phoneCfg.APISecret, string(encoded)); errStore != nil {
 		c.JSON(errStatus(errStore), gin.H{"status": "error", "error": errStore.Error()})
 		return
 	}
@@ -573,15 +573,19 @@ func requirePhoneProvider(c *gin.Context) (phoneOps, bool) {
 // no cookie is stored, saying so instead of a credential error that reads as if
 // the API credential were broken.
 func (h *Handler) requirePhoneCookie(c *gin.Context, action string) bool {
-	store := secretstore.Default()
-	if store == nil || !store.Unlocked() {
+	vault := sessionVault(c)
+	if !vault.Available() {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": action + " needs the web session; unlock the store first"})
 		return true
 	}
 	phoneCfg := h.supplyPhoneConfig()
-	if _, errGet := store.Get(phoneCfg.CookieSecret); errGet != nil {
+	if _, errGet := vault.Get(phoneCfg.CookieSecret); errGet != nil {
 		if errors.Is(errGet, secretstore.ErrNotFound) {
 			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": action + " needs the web session; sign in under the web tab first"})
+			return true
+		}
+		if errors.Is(errGet, secretstore.ErrLocked) || errors.Is(errGet, secretstore.ErrUnauthorized) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": action + " needs the web session; unlock the store first"})
 			return true
 		}
 		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": errGet.Error()})
@@ -591,23 +595,23 @@ func (h *Handler) requirePhoneCookie(c *gin.Context, action string) bool {
 }
 
 // gateSupplyWrite applies the master-passphrase gate to a credential write and
-// returns the store. It writes the error response and returns true when the
-// write must not proceed.
-func gateSupplyWrite(c *gin.Context, passphrase string) (*secretstore.Store, bool) {
+// returns the calling session's vault. It writes the error response and returns
+// true when the write must not proceed.
+func gateSupplyWrite(c *gin.Context, passphrase string) (secretstore.Vault, bool) {
 	store := secretstore.Default()
 	if store == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": "secret store is disabled"})
-		return nil, true
+		return secretstore.Vault{}, true
 	}
-	if errGate := gateWrite(store, passphrase); errGate != nil {
+	if errGate := gateWrite(c, store, passphrase); errGate != nil {
 		payload := gin.H{"status": "error", "error": errGate.Error()}
 		if errors.Is(errGate, secretstore.ErrInvalidPassphrase) {
 			payload["passphrase_wrong"] = true
 		}
 		c.JSON(errStatus(errGate), payload)
-		return nil, true
+		return secretstore.Vault{}, true
 	}
-	return store, false
+	return sessionVault(c), false
 }
 
 // reloadSupply rebuilds the process-wide supply service so a credential change

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // initStore creates a fresh passphrase-protected store and returns it unlocked.
@@ -228,16 +229,23 @@ func TestMachineUnlockRoundTrip(t *testing.T) {
 	if errGet != nil || got != "secret" {
 		t.Fatalf("reopened get = %q, err = %v", got, errGet)
 	}
-	keyRaw, errKey := os.ReadFile(path + ".key")
-	if errKey != nil {
-		t.Fatalf("read key file: %v", errKey)
+	keyRaw, errSeal := os.ReadFile(path + ".seal")
+	if errSeal != nil {
+		t.Fatalf("read seal file: %v", errSeal)
 	}
-	if len(keyRaw) != storageKeyLen {
-		t.Fatalf("key length = %d, want %d", len(keyRaw), storageKeyLen)
+	var seal sealFile
+	if errUnmarshal := json.Unmarshal(keyRaw, &seal); errUnmarshal != nil {
+		t.Fatalf("seal file is not JSON: %v", errUnmarshal)
+	}
+	if len(seal.Keys) != 1 || len(seal.Keys[0].Payload) == 0 {
+		t.Fatalf("seal holds %d keys, want one protected key", len(seal.Keys))
 	}
 	raw, _ := os.ReadFile(path)
-	if strings.Contains(string(raw), string(keyRaw)) {
-		t.Fatal("storage key leaked into the store file")
+	if strings.Contains(string(raw), string(seal.Keys[0].Payload)) {
+		t.Fatal("sealed key leaked into the store file")
+	}
+	if _, errLegacy := os.Stat(path + ".key"); !os.IsNotExist(errLegacy) {
+		t.Fatal("the plaintext key file must not survive alongside the seal")
 	}
 }
 
@@ -250,11 +258,11 @@ func TestMachineUnlockFailsWhenKeyFileIsMissing(t *testing.T) {
 	if errSet := store.Set("a", "1"); errSet != nil {
 		t.Fatalf("set: %v", errSet)
 	}
-	if errRemove := os.Remove(path + ".key"); errRemove != nil {
-		t.Fatalf("remove key: %v", errRemove)
+	if errRemove := os.Remove(path + ".seal"); errRemove != nil {
+		t.Fatalf("remove seal: %v", errRemove)
 	}
 	if _, errOpen := Open(path); errOpen == nil {
-		t.Fatal("expected open to fail when a pure machine store lost its key")
+		t.Fatal("expected open to fail when a pure machine store lost its sealed key")
 	}
 }
 
@@ -267,11 +275,22 @@ func TestMachineUnlockRejectsMismatchedKey(t *testing.T) {
 	if errSet := store.Set("a", "1"); errSet != nil {
 		t.Fatalf("set: %v", errSet)
 	}
-	if errWrite := os.WriteFile(path+".key", randomBytes(storageKeyLen), 0o600); errWrite != nil {
-		t.Fatalf("overwrite key: %v", errWrite)
+	// Replace the sealed key with a different one, which is what a stale copy
+	// from another host looks like.
+	protector, errProtector := platformProtector()
+	if errProtector != nil {
+		t.Fatalf("protector: %v", errProtector)
+	}
+	foreign, errSeal := (&sealFile{Version: 1, Medium: protector.medium(), Created: time.Now().UTC()}).
+		addSealedKey(protector, store.env.KeyID, randomBytes(storageKeyLen))
+	if errSeal != nil {
+		t.Fatalf("build foreign seal: %v", errSeal)
+	}
+	if errWrite := writeSealFile(path+".seal", foreign); errWrite != nil {
+		t.Fatalf("overwrite seal: %v", errWrite)
 	}
 	if _, errOpen := Open(path); errOpen == nil {
-		t.Fatal("expected a mismatched machine key to be rejected")
+		t.Fatal("expected a mismatched sealed key to be rejected")
 	}
 }
 
