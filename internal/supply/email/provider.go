@@ -358,6 +358,7 @@ func (p *ProviderImpl) TargetViews() ([]TargetView, error) {
 			Label:         target.Label,
 			Mailbox:       target.Account,
 			Host:          target.Host,
+			Transport:     transportName(target.Auth),
 			Domain:        target.Domain,
 			Usage:         target.Usage,
 			SecretName:    target.SecretName,
@@ -369,14 +370,30 @@ func (p *ProviderImpl) TargetViews() ([]TargetView, error) {
 
 // TargetView is one configured mailbox as the management surface reports it.
 type TargetView struct {
-	ChannelID     string `json:"channel_id"`
-	Label         string `json:"label"`
-	Mailbox       string `json:"mailbox"`
-	Host          string `json:"host"`
+	ChannelID string `json:"channel_id"`
+	Label     string `json:"label"`
+	Mailbox   string `json:"mailbox"`
+	Host      string `json:"host"`
+	// Transport is how the mailbox is read: "imap", "oauth2", or "graph".
+	//
+	// It is reported because a Graph mailbox has no host to show, and an empty
+	// host alone reads as "not configured" rather than "read another way".
+	Transport     string `json:"transport"`
 	Domain        string `json:"domain,omitempty"`
 	Usage         string `json:"usage,omitempty"`
 	SecretName    string `json:"secret_name,omitempty"`
 	HasCredential bool   `json:"has_credential"`
+}
+
+// transportName names the transport an auth mode implies.
+func transportName(auth AuthMode) string {
+	switch auth {
+	case AuthGraph:
+		return "graph"
+	case AuthOAuth2:
+		return "oauth2"
+	}
+	return "imap"
 }
 
 // scan reads one mailbox and returns the messages that were addressed to
@@ -480,9 +497,14 @@ func (p *ProviderImpl) targets() ([]Target, error) {
 		}
 		// One mailbox is read one way. OAuth2 is checked first because a
 		// hand-edited document can declare both, and a Microsoft mailbox only
-		// answers the token method.
+		// answers the token method; Graph follows, because it is the same
+		// credential spent on the other resource.
 		connection, ok := config.Connections[supply.NatureOAuth2]
 		auth := AuthOAuth2
+		if !ok {
+			connection, ok = config.Connections[supply.NatureGraph]
+			auth = AuthGraph
+		}
 		if !ok {
 			connection, ok = config.Connections[supply.NatureIMAP]
 			auth = AuthPassword
@@ -490,7 +512,12 @@ func (p *ProviderImpl) targets() ([]Target, error) {
 		if !ok {
 			continue
 		}
-		if strings.TrimSpace(connection.Account) == "" || strings.TrimSpace(connection.Endpoint) == "" {
+		if strings.TrimSpace(connection.Account) == "" {
+			continue
+		}
+		// Graph has one fixed endpoint, so a Graph channel carries none; the
+		// protocol ones cannot work without one.
+		if auth != AuthGraph && strings.TrimSpace(connection.Endpoint) == "" {
 			continue
 		}
 		// The category decides whether this mailbox stands in for a whole domain
@@ -508,7 +535,7 @@ func (p *ProviderImpl) targets() ([]Target, error) {
 		secret := strings.TrimSpace(connection.Secret)
 		if secret == "" {
 			secret = supply.EmailCredentialName(connection.Account)
-			if auth == AuthOAuth2 {
+			if auth == AuthOAuth2 || auth == AuthGraph {
 				secret = supply.EmailOAuth2CredentialName(connection.Account)
 			}
 		}
@@ -622,12 +649,30 @@ func ProbeOAuth2(ctx context.Context, host, account, clientID, refreshToken stri
 	})
 }
 
+// ProbeGraph checks that a mailbox can be read through Microsoft Graph.
+//
+// It is a separate entry point rather than a flag because the two transports
+// answer different questions: an IMAP token opens IMAP and is refused by Graph,
+// and a Graph token is the reverse. Reporting one as the other would tell the
+// operator their credential is broken when it is simply the wrong kind.
+func ProbeGraph(ctx context.Context, account, clientID, refreshToken string) (string, error) {
+	if strings.TrimSpace(clientID) == "" {
+		return "", fmt.Errorf("%w: no OAuth2 application id", ErrProbeUnready)
+	}
+	return probeMailbox(ctx, Target{
+		Account:  account,
+		Auth:     AuthGraph,
+		ClientID: clientID,
+		Password: refreshToken,
+	})
+}
+
 // probeMailbox opens a session, lists its folders, and closes again.
 //
 // It is read-only: nothing is sent anywhere, so it needs no passphrase — and it
 // never repeats the credential in a detail or an error.
 func probeMailbox(ctx context.Context, target Target) (string, error) {
-	if strings.TrimSpace(target.Host) == "" {
+	if target.Auth != AuthGraph && strings.TrimSpace(target.Host) == "" {
 		return "", fmt.Errorf("%w: no mailbox host", ErrProbeUnready)
 	}
 	if strings.TrimSpace(target.Account) == "" {

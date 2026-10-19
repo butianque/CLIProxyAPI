@@ -67,6 +67,7 @@ func (h *Handler) GetSupplyEmailStatus(c *gin.Context) {
 			"label":          view.Label,
 			"mailbox":        view.Mailbox,
 			"host":           view.Host,
+			"transport":      view.Transport,
 			"domain":         view.Domain,
 			"usage":          view.Usage,
 			"secret_name":    view.SecretName,
@@ -190,7 +191,7 @@ func (h *Handler) PostSupplyEmailCredential(c *gin.Context) {
 	if name == "" {
 		// The mailbox names the entry: the operator only supplies the login, and
 		// the panel does not have to invent a name for the credential.
-		if supply.Nature(strings.ToLower(strings.TrimSpace(body.Nature))) == supply.NatureOAuth2 {
+		if supply.Nature(strings.ToLower(strings.TrimSpace(body.Nature))).UsesRefreshToken() {
 			name = supply.EmailOAuth2CredentialName(body.Account)
 		} else {
 			name = supply.EmailCredentialName(body.Account)

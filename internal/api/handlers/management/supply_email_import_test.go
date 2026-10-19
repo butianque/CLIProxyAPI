@@ -167,6 +167,97 @@ func TestImportMailboxesRefusesALockedStore(t *testing.T) {
 	}
 }
 
+// A batch pasted for Graph must be stored as a Graph channel: no endpoint (Graph
+// has one fixed one), the application id kept, and the credential under the
+// token entry — a Graph channel that stored its token under the password entry
+// would be handed to an IMAP LOGIN that can never accept it.
+func TestImportMailboxesStoresTheChosenReceivingMethod(t *testing.T) {
+	_, r, stateDir := setupImportTest(t)
+	unlockedEmptyStore(t)
+
+	body := `{"text":"alice@outlook.com----pw----11111111-1111-1111-1111-111111111111----tok-graph","probe":false,"nature":"graph"}`
+	code, resp := importMailboxes(t, r, body)
+	if code != http.StatusOK {
+		t.Fatalf("import: %d %v", code, resp)
+	}
+	if resp["nature"] != "graph" {
+		t.Fatalf("answer nature = %v, want graph", resp["nature"])
+	}
+
+	channels, errLoad := supply.LoadChannels(supply.ChannelPath(stateDir))
+	if errLoad != nil {
+		t.Fatalf("load channels: %v", errLoad)
+	}
+	stored := channels.List(supply.KindEmail)
+	if len(stored) != 1 {
+		t.Fatalf("email channels = %d, want 1", len(stored))
+	}
+	connection, ok := stored[0].Email.Connections[supply.NatureGraph]
+	if !ok {
+		t.Fatalf("channel natures = %v, want a graph connection", stored[0].Email.Natures)
+	}
+	if connection.Endpoint != "" {
+		t.Fatalf("graph endpoint = %q, want none", connection.Endpoint)
+	}
+	if connection.ClientID != "11111111-1111-1111-1111-111111111111" {
+		t.Fatalf("graph application id = %q", connection.ClientID)
+	}
+	if want := supply.EmailOAuth2CredentialName("alice@outlook.com"); connection.Secret != want {
+		t.Fatalf("graph credential entry = %q, want %q", connection.Secret, want)
+	}
+}
+
+// The receiving method is a decision the operator makes, so an unknown value is
+// refused instead of silently falling back to IMAP.
+func TestImportMailboxesRejectsAnUnknownReceivingMethod(t *testing.T) {
+	_, r, stateDir := setupImportTest(t)
+	unlockedEmptyStore(t)
+
+	body := `{"text":"alice@outlook.com----pw----11111111-1111-1111-1111-111111111111----tok","probe":false,"nature":"carrier-pigeon"}`
+	code, _ := importMailboxes(t, r, body)
+	if code != http.StatusBadRequest {
+		t.Fatalf("unknown receiving method: %d, want %d", code, http.StatusBadRequest)
+	}
+	channels, errLoad := supply.LoadChannels(supply.ChannelPath(stateDir))
+	if errLoad != nil {
+		t.Fatalf("load channels: %v", errLoad)
+	}
+	if len(channels.All()) != 0 {
+		t.Fatalf("a refused import wrote %d channels", len(channels.All()))
+	}
+}
+
+// Re-importing the same mailbox with a different receiving method replaces the
+// method instead of leaving a channel with two of them: one mailbox is read one
+// way, and a stale second connection is a row nobody can reason about.
+func TestImportMailboxesSwitchesTheReceivingMethodInPlace(t *testing.T) {
+	_, r, stateDir := setupImportTest(t)
+	unlockedEmptyStore(t)
+
+	line := "alice@outlook.com----pw----11111111-1111-1111-1111-111111111111----tok"
+	if code, resp := importMailboxes(t, r, `{"text":"`+line+`","probe":false,"nature":"graph"}`); code != http.StatusOK {
+		t.Fatalf("graph import: %d %v", code, resp)
+	}
+	if code, resp := importMailboxes(t, r, `{"text":"`+line+`","probe":false,"nature":"oauth2"}`); code != http.StatusOK {
+		t.Fatalf("imap import: %d %v", code, resp)
+	}
+
+	channels, errLoad := supply.LoadChannels(supply.ChannelPath(stateDir))
+	if errLoad != nil {
+		t.Fatalf("load channels: %v", errLoad)
+	}
+	stored := channels.List(supply.KindEmail)
+	if len(stored) != 1 {
+		t.Fatalf("email channels = %d, want 1", len(stored))
+	}
+	if _, ok := stored[0].Email.Connections[supply.NatureOAuth2]; !ok {
+		t.Fatalf("natures = %v, want the oauth2 connection", stored[0].Email.Natures)
+	}
+	if _, ok := stored[0].Email.Connections[supply.NatureGraph]; ok {
+		t.Fatalf("natures = %v, the graph connection was left behind", stored[0].Email.Natures)
+	}
+}
+
 func TestImportMailboxesRejectsAnEmptyPaste(t *testing.T) {
 	_, r, _ := setupImportTest(t)
 	unlockedEmptyStore(t)

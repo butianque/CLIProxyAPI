@@ -101,6 +101,12 @@ const (
 	// mailboxes refuse LOGIN outright — their server answers LOGINDISABLED and
 	// advertises AUTH=XOAUTH2 alone — so this is the only way into them.
 	AuthOAuth2 AuthMode = "oauth2"
+	// AuthGraph reads the same mailbox through Microsoft Graph's REST API
+	// instead of IMAP. It is not a second way to authenticate — the credential
+	// is still a refresh token — but a different resource: a token whose grant
+	// covers Graph scopes is refused by the IMAP server, and the token endpoint
+	// will not mint an IMAP token from it.
+	AuthGraph AuthMode = "graph"
 )
 
 // Target is one configured mailbox the host can read.
@@ -165,8 +171,11 @@ type imapSession struct {
 	client *imapclient.Client
 }
 
-// dialSession opens an authenticated IMAP session over implicit TLS.
+// dialSession opens an authenticated session with the protocol the target names.
 func dialSession(ctx context.Context, target Target) (Session, error) {
+	if target.Auth == AuthGraph {
+		return dialGraphSession(ctx, target)
+	}
 	address := strings.TrimSpace(target.Host)
 	if address == "" {
 		return nil, errors.New("email: the mailbox has no host")
@@ -205,18 +214,23 @@ func dialSession(ctx context.Context, target Target) (Session, error) {
 
 // authenticate proves the session's identity by the method the target names.
 func authenticate(ctx context.Context, client *imapclient.Client, target Target) error {
-	if target.Auth != AuthOAuth2 {
-		if errLogin := client.Login(target.Account, target.Password).Wait(); errLogin != nil {
-			return fmt.Errorf("%w: %v", ErrLoginRejected, errLogin)
+	switch target.Auth {
+	case AuthGraph:
+		// dialSession never gets here for a Graph target; refusing loudly keeps a
+		// future caller from sending a Graph token to an IMAP LOGIN.
+		return errors.New("email: a Graph mailbox is not opened over IMAP")
+	case AuthOAuth2:
+		token, errToken := oauth2Bearer(ctx, target.ClientID, target.Password)
+		if errToken != nil {
+			return fmt.Errorf("%w: %v", ErrLoginRejected, errToken)
+		}
+		if errAuth := client.Authenticate(xoauth2Client{account: target.Account, token: token}); errAuth != nil {
+			return fmt.Errorf("%w: %v", ErrLoginRejected, errAuth)
 		}
 		return nil
 	}
-	token, errToken := oauth2Bearer(ctx, target.ClientID, target.Password)
-	if errToken != nil {
-		return fmt.Errorf("%w: %v", ErrLoginRejected, errToken)
-	}
-	if errAuth := client.Authenticate(xoauth2Client{account: target.Account, token: token}); errAuth != nil {
-		return fmt.Errorf("%w: %v", ErrLoginRejected, errAuth)
+	if errLogin := client.Login(target.Account, target.Password).Wait(); errLogin != nil {
+		return fmt.Errorf("%w: %v", ErrLoginRejected, errLogin)
 	}
 	return nil
 }

@@ -520,23 +520,89 @@ func TestOAuth2AccessTokenExchangesRefreshToken(t *testing.T) {
 // A refused exchange has to say what the operator can do about it, and it must
 // not repeat Microsoft's free-text description: that text can echo the request,
 // and this string ends up in a channel row.
+//
+// The two refusals an operator actually meets are told apart: an expired refresh
+// token needs a new mailbox, while a grant that never covered IMAP needs the
+// other receiving method — and reporting the second as the first sends someone
+// shopping for a mailbox that was fine all along.
 func TestOAuth2AccessTokenReportsRefusal(t *testing.T) {
+	cases := []struct {
+		name        string
+		description string
+		want        string
+	}{
+		{
+			name:        "expired",
+			description: "AADSTS700082: The refresh token has expired due to inactivity.",
+			want:        "expired or been revoked",
+		},
+		{
+			name:        "no imap scope",
+			description: "AADSTS70000: The request was denied because one or more scopes requested are unauthorized or expired.",
+			want:        "choose Graph",
+		},
+	}
+	for _, testCase := range cases {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"invalid_grant","error_description":"` + testCase.description + `"}`))
+		}))
+
+		_, _, errToken := oauth2AccessToken(context.Background(), server.URL, "app-123", "rt-1")
+		server.Close()
+		if errToken == nil {
+			t.Fatalf("%s: a refused exchange reported success", testCase.name)
+		}
+		if !strings.Contains(errToken.Error(), testCase.want) {
+			t.Fatalf("%s: error = %q, want it to mention %q", testCase.name, errToken, testCase.want)
+		}
+		if strings.Contains(errToken.Error(), "AADSTS") {
+			t.Fatalf("%s: error = %q, want the endpoint's description left out", testCase.name, errToken)
+		}
+	}
+}
+
+// A token exchange can succeed and still hand back a token the IMAP server will
+// refuse, because without a named scope Microsoft returns whatever the grant
+// covers. Catching that here is what turns a bare "AUTHENTICATE failed" into the
+// one instruction that fixes it.
+func TestOAuth2AccessTokenRejectsAGraphOnlyGrant(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write([]byte(`{"error":"invalid_grant","error_description":"AADSTS70000: the grant is expired"}`))
+		_, _ = w.Write([]byte(`{"access_token":"at-1","token_type":"Bearer","expires_in":3600,` +
+			`"scope":"https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/User.ReadWrite"}`))
 	}))
 	defer server.Close()
 
 	_, _, errToken := oauth2AccessToken(context.Background(), server.URL, "app-123", "rt-1")
 	if errToken == nil {
-		t.Fatal("a refused exchange reported success")
+		t.Fatal("a Graph-only grant produced an IMAP token")
 	}
-	if !strings.Contains(errToken.Error(), "expired or been revoked") {
-		t.Fatalf("error = %q, want it to name the cause", errToken)
+	if !strings.Contains(errToken.Error(), "choose Graph") {
+		t.Fatalf("error = %q, want it to point at the other receiving method", errToken)
 	}
-	if strings.Contains(errToken.Error(), "AADSTS") {
-		t.Fatalf("error = %q, want the endpoint's description left out", errToken)
+}
+
+// A token that carries the IMAP scope, or one whose answer omits the scope list
+// entirely, is accepted: the scope list is a diagnostic, not a gate.
+func TestOAuth2AccessTokenAcceptsImapScopeOrNoScopeList(t *testing.T) {
+	for _, body := range []string{
+		`{"access_token":"at-1","token_type":"Bearer","expires_in":3600,"scope":"https://outlook.office.com/IMAP.AccessAsUser.All offline_access"}`,
+		`{"access_token":"at-1","token_type":"Bearer","expires_in":3600}`,
+	} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(body))
+		}))
+		token, _, errToken := oauth2AccessToken(context.Background(), server.URL, "app-123", "rt-1")
+		server.Close()
+		if errToken != nil {
+			t.Fatalf("a usable token was refused: %v", errToken)
+		}
+		if token != "at-1" {
+			t.Fatalf("access token = %q, want at-1", token)
+		}
 	}
 }
 

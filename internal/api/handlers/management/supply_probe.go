@@ -125,6 +125,8 @@ func probeNature(ctx context.Context, kind supply.Kind, nature supply.Nature, co
 		detail, errProbe = email.ProbeIMAP(ctxProbe, connection.Endpoint, connection.Account, credential)
 	case kind == supply.KindEmail && nature == supply.NatureOAuth2:
 		detail, errProbe = email.ProbeOAuth2(ctxProbe, connection.Endpoint, connection.Account, connection.ClientID, credential)
+	case kind == supply.KindEmail && nature == supply.NatureGraph:
+		detail, errProbe = email.ProbeGraph(ctxProbe, connection.Account, connection.ClientID, credential)
 	case kind == supply.KindPhone && nature == supply.NatureAPI:
 		detail, errProbe = phone.ProbeAPI(ctxProbe, connection.Endpoint, credential)
 	case kind == supply.KindPhone && nature == supply.NatureWeb:

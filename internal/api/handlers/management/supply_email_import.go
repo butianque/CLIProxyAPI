@@ -67,11 +67,17 @@ func (h *Handler) PostSupplyEmailImport(c *gin.Context) {
 	var body struct {
 		Text       string `json:"text"`
 		Host       string `json:"host"`
+		Nature     string `json:"nature"`
 		Passphrase string `json:"passphrase"`
 		Probe      *bool  `json:"probe"`
 	}
 	if errBind := c.ShouldBindJSON(&body); errBind != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid JSON body"})
+		return
+	}
+	nature, okNature := importMailboxNature(body.Nature)
+	if !okNature {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "unknown receiving method"})
 		return
 	}
 	lines := parseMailboxLines(body.Text)
@@ -82,6 +88,10 @@ func (h *Handler) PostSupplyEmailImport(c *gin.Context) {
 	host := strings.TrimSpace(body.Host)
 	if host == "" {
 		host = defaultImportedMailboxHost
+	}
+	// Graph has one endpoint, so a host from the panel is not stored for it.
+	if nature == supply.NatureGraph {
+		host = ""
 	}
 	// The gate runs once for the whole batch: it is the same secret store for
 	// every mailbox, and asking per line would turn one unlock into a hundred.
@@ -115,7 +125,13 @@ func (h *Handler) PostSupplyEmailImport(c *gin.Context) {
 				defer func() { <-sem }()
 				ctx, cancel := context.WithTimeout(c.Request.Context(), importProbeTimeout)
 				defer cancel()
-				if _, errProbe := email.ProbeOAuth2(ctx, host, line.Account, line.ClientID, line.Refresh); errProbe != nil {
+				var errProbe error
+				if nature == supply.NatureGraph {
+					_, errProbe = email.ProbeGraph(ctx, line.Account, line.ClientID, line.Refresh)
+				} else {
+					_, errProbe = email.ProbeOAuth2(ctx, host, line.Account, line.ClientID, line.Refresh)
+				}
+				if errProbe != nil {
 					probeDetails[index] = probeDetail(errProbe)
 				}
 			})
@@ -159,9 +175,9 @@ func (h *Handler) PostSupplyEmailImport(c *gin.Context) {
 			Category: "third-party",
 			Email: &supply.KindConfig{
 				Enabled: true,
-				Natures: []supply.Nature{supply.NatureOAuth2},
+				Natures: []supply.Nature{nature},
 				Connections: map[supply.Nature]supply.Connection{
-					supply.NatureOAuth2: {
+					nature: {
 						Endpoint: host,
 						Account:  line.Account,
 						ClientID: line.ClientID,
@@ -195,11 +211,27 @@ func (h *Handler) PostSupplyEmailImport(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"status":   "ok",
 		"host":     host,
+		"nature":   string(nature),
 		"imported": imported,
 		"updated":  updated,
 		"failed":   failed,
 		"results":  results,
 	})
+}
+
+// importMailboxNature reads the receiving method a batch was pasted for.
+//
+// The empty answer means the older default: a refresh token spent on IMAP. It
+// stays the default because a panel that predates Graph sends nothing, and those
+// batches are still IMAP batches.
+func importMailboxNature(value string) (supply.Nature, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", string(supply.NatureOAuth2), "imap":
+		return supply.NatureOAuth2, true
+	case string(supply.NatureGraph):
+		return supply.NatureGraph, true
+	}
+	return "", false
 }
 
 // parseMailboxLines reads the paste into one entry per line. Blank lines and
@@ -302,7 +334,7 @@ func findMailboxChannel(channels []supply.Channel, account string) (supply.Chann
 			continue
 		}
 		for _, nature := range channel.Email.Natures {
-			if !nature.ReadsMailbox() {
+			if !nature.IsMailbox() {
 				continue
 			}
 			connection := channel.Email.Connections[nature]

@@ -49,13 +49,20 @@ const (
 	// a different failure ("the refresh token expired" is not "the password is
 	// wrong") — and because the panel asks for one connection method at a time.
 	NatureOAuth2 Nature = "oauth2"
+	// NatureGraph reads the same mailbox through Microsoft Graph's REST API.
+	//
+	// It exists because a refresh token's grant decides what the token can be
+	// spent on: one minted for Graph scopes is refused by the IMAP server and
+	// cannot be exchanged for an IMAP token, so a channel that only speaks IMAP
+	// cannot use that mailbox at all.
+	NatureGraph Nature = "graph"
 	// NatureWeb drives a website's own endpoints with a session cookie. Phone
 	// only: it is how a code platform's channel list is managed.
 	NatureWeb Nature = "web"
 )
 
 // natures lists every supported nature, in the order the panel offers them.
-var natures = []Nature{NatureAPI, NatureIMAP, NatureOAuth2, NatureWeb}
+var natures = []Nature{NatureAPI, NatureIMAP, NatureOAuth2, NatureGraph, NatureWeb}
 
 // Natures returns the supported natures.
 func Natures() []Nature {
@@ -80,7 +87,7 @@ func (n Nature) SupportsKind(kind Kind) bool {
 	case KindPhone:
 		return n == NatureAPI || n == NatureWeb
 	case KindEmail:
-		return n == NatureAPI || n == NatureIMAP || n == NatureOAuth2
+		return n == NatureAPI || n == NatureIMAP || n == NatureOAuth2 || n == NatureGraph
 	}
 	return false
 }
@@ -90,9 +97,28 @@ func (n Nature) SupportsKind(kind Kind) bool {
 // Both IMAP and OAuth2 speak the same protocol, so they share the address
 // rules, the derived credential name shape, and the catch-all domain question.
 // They differ only in what proves the session's identity, which is why the
-// stored credential cannot be shared between them.
+// stored credential cannot be shared between them. Graph reads the same mailbox
+// but not over IMAP, so it is a mailbox without being one of these — see
+// IsMailbox.
 func (n Nature) ReadsMailbox() bool {
 	return n == NatureIMAP || n == NatureOAuth2
+}
+
+// IsMailbox reports whether this nature reads a mailbox at all, over either
+// protocol. Everything that holds for a mailbox regardless of transport — the
+// catch-all domain, the derived credential entry, the one-credential-per-mailbox
+// rule — hangs off this rather than off the IMAP pair.
+func (n Nature) IsMailbox() bool {
+	return n.ReadsMailbox() || n == NatureGraph
+}
+
+// UsesRefreshToken reports whether the stored credential is an OAuth2 refresh
+// token rather than a password or an authorization code.
+//
+// The token is the same for both token-based transports; only the resource it is
+// spent on differs.
+func (n Nature) UsesRefreshToken() bool {
+	return n == NatureOAuth2 || n == NatureGraph
 }
 
 // Connection holds the per-nature details for reaching a channel.
@@ -264,41 +290,46 @@ func normalizeConnection(nature Nature, conn Connection, catchAll bool) (Connect
 	conn.Usage = strings.TrimSpace(conn.Usage)
 	conn.Domain = strings.TrimSpace(conn.Domain)
 	conn.ClientID = strings.TrimSpace(conn.ClientID)
-	if nature.ReadsMailbox() {
+	switch {
+	case nature == NatureGraph:
+		// Graph answers at one fixed endpoint. A stored one would be a second
+		// place to get it wrong, so it is cleared rather than validated.
+		conn.Endpoint = ""
+	case nature.ReadsMailbox():
 		endpoint, errEndpoint := normalizeIMAPEndpoint(conn.Endpoint)
 		if errEndpoint != nil {
 			return Connection{}, errEndpoint
 		}
 		conn.Endpoint = endpoint
-	} else {
+	default:
 		endpoint, errEndpoint := normalizeEndpoint(conn.Endpoint)
 		if errEndpoint != nil {
 			return Connection{}, errEndpoint
 		}
 		conn.Endpoint = endpoint
 	}
-	if !nature.ReadsMailbox() {
+	if !nature.IsMailbox() {
 		conn.Usage = ""
 		conn.Domain = ""
 		conn.ClientID = ""
 		return conn, nil
 	}
-	if nature != NatureOAuth2 {
+	if !nature.UsesRefreshToken() {
 		conn.ClientID = ""
 	}
-	// An OAuth2 mailbox mints its access token from the refresh token, and the
-	// token endpoint needs to know which application is asking. Without it the
-	// connection can never authenticate, so it is refused here instead of
+	// A token-based mailbox mints its access token from the refresh token, and
+	// the token endpoint needs to know which application is asking. Without it
+	// the connection can never authenticate, so it is refused here instead of
 	// becoming a channel that silently reads nothing.
-	if nature == NatureOAuth2 && conn.ClientID == "" {
-		return Connection{}, errors.New("supply: an OAuth2 mailbox needs the application id the refresh token belongs to")
+	if nature.UsesRefreshToken() && conn.ClientID == "" {
+		return Connection{}, errors.New("supply: a mailbox read with a refresh token needs the application id it belongs to")
 	}
 	// A mailbox credential belongs to the mailbox, so its entry name is derived
 	// from the login instead of being configured. A name already on the
 	// connection is kept: it may name an entry that exists under an older rule,
 	// and renaming the pointer would orphan the credential.
 	if conn.Secret == "" {
-		if nature == NatureOAuth2 {
+		if nature.UsesRefreshToken() {
 			conn.Secret = EmailOAuth2CredentialName(conn.Account)
 		} else {
 			conn.Secret = EmailCredentialName(conn.Account)

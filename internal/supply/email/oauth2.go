@@ -2,8 +2,12 @@ package email
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -18,9 +22,13 @@ import (
 // is exchanged here for a short-lived access token that the SASL exchange
 // carries.
 //
+// The same refresh token can also be spent on a Graph token, which is how a
+// mailbox whose grant only covers Graph is read. Both are minted here so there
+// is one place that talks to the token endpoint.
+//
 // Nothing in this file logs or returns a token, a refresh token, or a client
 // id's secret half. The only thing that leaves it is a bearer token handed
-// straight to the IMAP client.
+// straight to the protocol client that needs it.
 
 const (
 	// oauth2TokenURL is Microsoft's token endpoint. The "common" tenant routes
@@ -34,6 +42,10 @@ const (
 	// an expiry. It is deliberately short: re-minting is cheap, and trusting a
 	// token that might already be dead is not.
 	oauth2AssumedLifetime = 5 * time.Minute
+	// maxTokenResponseBytes caps how much of a token response is read. A real
+	// answer is about two kilobytes; the cap only stops a wrong endpoint from
+	// streaming something unbounded into memory.
+	maxTokenResponseBytes = 1 << 20
 )
 
 // xoauth2Client is the SASL XOAUTH2 mechanism as Microsoft implements it: one
@@ -80,6 +92,23 @@ var accessTokens = struct {
 // oauth2Bearer returns a usable access token for one mailbox, minting one when
 // the cache has nothing recent.
 func oauth2Bearer(ctx context.Context, clientID, refreshToken string) (string, error) {
+	return bearerFor(ctx, "imap", clientID, refreshToken)
+}
+
+// graphBearer returns a usable Graph access token for one mailbox.
+//
+// It is a separate token from the IMAP one even though both come from the same
+// refresh token: a bearer token is minted for one resource, and the token
+// endpoint refuses a scope the original grant never asked for. Graph therefore
+// names its scope explicitly, while the IMAP exchange sends none.
+func graphBearer(ctx context.Context, clientID, refreshToken string) (string, error) {
+	return bearerFor(ctx, "graph", clientID, refreshToken)
+}
+
+// bearerFor mints (or reuses) one access token. kind separates the two
+// resources in the cache: an IMAP token is not a Graph token, and handing one to
+// the other is a 401 that looks like a bad credential.
+func bearerFor(ctx context.Context, kind, clientID, refreshToken string) (string, error) {
 	clientID = strings.TrimSpace(clientID)
 	refreshToken = strings.TrimSpace(refreshToken)
 	if clientID == "" {
@@ -90,14 +119,14 @@ func oauth2Bearer(ctx context.Context, clientID, refreshToken string) (string, e
 	}
 	// The key includes the refresh token so that replacing it takes effect at
 	// once instead of after the previous token expires.
-	key := clientID + "\x00" + refreshToken
+	key := kind + "\x00" + clientID + "\x00" + refreshToken
 	accessTokens.mu.Lock()
 	cached, ok := accessTokens.tokens[key]
 	accessTokens.mu.Unlock()
 	if ok && time.Now().Add(oauth2RenewBefore).Before(cached.expires) {
 		return cached.value, nil
 	}
-	value, expires, errMint := oauth2AccessToken(ctx, oauth2TokenURL, clientID, refreshToken)
+	value, expires, errMint := mintAccessToken(ctx, kind, clientID, refreshToken)
 	if errMint != nil {
 		return "", errMint
 	}
@@ -112,6 +141,66 @@ func oauth2Bearer(ctx context.Context, clientID, refreshToken string) (string, e
 	accessTokens.tokens[key] = cachedToken{value: value, expires: expires}
 	accessTokens.mu.Unlock()
 	return value, nil
+}
+
+// mintAccessToken exchanges a refresh token for an access token for one
+// resource, and reports when it expires.
+//
+// The IMAP exchange sends no scope: the refresh grant carries the permissions it
+// was issued with, so the token the operator stores must already have been
+// granted IMAP.AccessAsUser.All. Graph names its scope because that is the only
+// way to ask for a Graph token — the same refresh token is refused when a scope
+// outside its original grant is named.
+//
+// The client id goes in the body rather than in a Basic header, because this is
+// a public client: there is no secret to send, and Microsoft reads the id from
+// the form.
+func mintAccessToken(ctx context.Context, kind, clientID, refreshToken string) (string, time.Time, error) {
+	if kind != "graph" {
+		return oauth2AccessToken(ctx, oauth2TokenURL, clientID, refreshToken)
+	}
+	form := url.Values{}
+	form.Set("client_id", clientID)
+	form.Set("grant_type", "refresh_token")
+	form.Set("refresh_token", refreshToken)
+	form.Set("scope", graphScope)
+	request, errRequest := http.NewRequestWithContext(ctx, http.MethodPost, oauth2TokenURL, strings.NewReader(form.Encode()))
+	if errRequest != nil {
+		return "", time.Time{}, fmt.Errorf("the token request could not be built: %w", errRequest)
+	}
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response, errDo := graphHTTPClient.Do(request)
+	if errDo != nil {
+		return "", time.Time{}, fmt.Errorf("the token endpoint could not be reached: %w", errDo)
+	}
+	defer func() { _ = response.Body.Close() }()
+	body, errRead := io.ReadAll(io.LimitReader(response.Body, maxTokenResponseBytes))
+	if errRead != nil {
+		return "", time.Time{}, fmt.Errorf("the token response could not be read: %w", errRead)
+	}
+	var payload struct {
+		AccessToken      string `json:"access_token"`
+		RefreshToken     string `json:"refresh_token"`
+		ExpiresIn        int    `json:"expires_in"`
+		Error            string `json:"error"`
+		ErrorDescription string `json:"error_description"`
+	}
+	_ = json.Unmarshal(body, &payload)
+	if response.StatusCode != http.StatusOK || strings.TrimSpace(payload.AccessToken) == "" {
+		// The body is handed to the error describer, which quotes only the
+		// error code: a response body is not a place a credential may reach.
+		return "", time.Time{}, describeTokenError(&oauth2.RetrieveError{
+			ErrorCode:        payload.Error,
+			ErrorDescription: payload.ErrorDescription,
+			Response:         response,
+			Body:             body,
+		}, "graph")
+	}
+	expires := time.Now().Add(oauth2AssumedLifetime)
+	if payload.ExpiresIn > 0 {
+		expires = time.Now().Add(time.Duration(payload.ExpiresIn) * time.Second)
+	}
+	return payload.AccessToken, expires, nil
 }
 
 // oauth2AccessToken exchanges a refresh token for an access token, and reports
@@ -129,10 +218,19 @@ func oauth2AccessToken(ctx context.Context, tokenURL, clientID, refreshToken str
 	}
 	token, errToken := config.TokenSource(ctx, &oauth2.Token{RefreshToken: refreshToken}).Token()
 	if errToken != nil {
-		return "", time.Time{}, describeTokenError(errToken)
+		return "", time.Time{}, describeTokenError(errToken, "imap")
 	}
 	if strings.TrimSpace(token.AccessToken) == "" {
 		return "", time.Time{}, errors.New("the token endpoint returned no access token")
+	}
+	// The exchange succeeds even when the grant only covers Graph: without a
+	// named scope Microsoft hands back whatever the grant has, and the IMAP
+	// server then answers a bare "AUTHENTICATE failed". Reporting that as a bad
+	// credential sends the operator looking for a new mailbox when the fix is to
+	// pick the other receiving method, so the granted scopes are checked here.
+	if granted, ok := token.Extra("scope").(string); ok && strings.TrimSpace(granted) != "" &&
+		!strings.Contains(strings.ToLower(granted), "imap") {
+		return "", time.Time{}, errors.New("the refresh token was not granted IMAP access; choose Graph as the receiving method")
 	}
 	expires := token.Expiry
 	if expires.IsZero() {
@@ -147,7 +245,12 @@ func oauth2AccessToken(ctx context.Context, tokenURL, clientID, refreshToken str
 // Only Microsoft's error code is repeated. The description is free text that can
 // echo the request, and this string ends up in a channel row and in the probe's
 // detail — neither is a place a credential may appear.
-func describeTokenError(err error) error {
+//
+// The one description fragment that is read is AADSTS70000/65001: that is the
+// answer for "the grant does not cover the scope this exchange asked for", which
+// is not an expired credential and must not be reported as one — the operator's
+// next step is the other receiving method, not a new mailbox.
+func describeTokenError(err error, kind string) error {
 	var retrieve *oauth2.RetrieveError
 	if !errors.As(err, &retrieve) {
 		// A transport failure: no response was read, so there is nothing to
@@ -156,6 +259,13 @@ func describeTokenError(err error) error {
 	}
 	switch retrieve.ErrorCode {
 	case "invalid_grant":
+		if strings.Contains(retrieve.ErrorDescription, "AADSTS70000") ||
+			strings.Contains(retrieve.ErrorDescription, "AADSTS65001") {
+			if kind == "graph" {
+				return errors.New("the refresh token was not granted Graph access")
+			}
+			return errors.New("the refresh token was not granted IMAP access; choose Graph as the receiving method")
+		}
 		return errors.New("the refresh token was rejected: it has expired or been revoked")
 	case "invalid_client":
 		return errors.New("the application id was rejected")
