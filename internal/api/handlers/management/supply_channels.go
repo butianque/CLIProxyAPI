@@ -242,27 +242,22 @@ func (h *Handler) keepStoredEgress(store *supply.ChannelStore, channel *supply.C
 	if !ok {
 		return
 	}
-	for _, kind := range []*supply.KindConfig{channel.Phone, channel.Email} {
-		if kind == nil {
-			continue
+	carry := func(submitted, stored *supply.KindConfig) {
+		if submitted == nil || stored == nil {
+			return
 		}
-		previous := existing.Phone
-		if kind == channel.Email {
-			previous = existing.Email
-		}
-		if previous == nil {
-			continue
-		}
-		for nature, conn := range kind.Connections {
+		for nature, conn := range submitted.Connections {
 			if strings.TrimSpace(conn.Egress) != "" {
 				continue
 			}
-			if stored, ok := previous.Connections[nature]; ok && strings.TrimSpace(stored.Egress) != "" {
-				conn.Egress = stored.Egress
-				kind.Connections[nature] = conn
+			if previous, ok := stored.Connections[nature]; ok && strings.TrimSpace(previous.Egress) != "" {
+				conn.Egress = previous.Egress
+				submitted.Connections[nature] = conn
 			}
 		}
 	}
+	carry(channel.Phone, existing.Phone)
+	carry(channel.Email, existing.Email)
 }
 
 // stampPhoneCredentialNames names the phone kind's single platform credential on
