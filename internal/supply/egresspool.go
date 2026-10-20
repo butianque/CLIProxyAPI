@@ -111,15 +111,17 @@ func LoadEgressPool(path string) (*EgressPool, error) {
 		pool.doc.Version = egressPoolVersion
 	}
 	// A document written before ids were allocated, or one edited by hand, may
-	// carry entries without a NextID. Deriving it here keeps Add from handing out
-	// an id that is already taken.
-	if pool.doc.NextID <= 0 {
-		highest := 0
-		for _, entry := range pool.doc.Entries {
-			if entry.ID > highest {
-				highest = entry.ID
-			}
+	// carry entries without a NextID, or a NextID that is behind the ids already
+	// in use. Either way an id that is already taken must never be handed out
+	// again: bindings are held by id, so a duplicate would make two exits answer
+	// to one number and resolve to whichever came first.
+	highest := 0
+	for _, entry := range pool.doc.Entries {
+		if entry.ID > highest {
+			highest = entry.ID
 		}
+	}
+	if pool.doc.NextID <= highest {
 		pool.doc.NextID = highest + 1
 	}
 	return pool, nil

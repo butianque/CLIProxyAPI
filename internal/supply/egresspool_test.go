@@ -263,23 +263,33 @@ func TestLoadEgressPoolOnAMissingFileIsEmpty(t *testing.T) {
 	}
 }
 
-// TestLoadEgressPoolDerivesAMissingNextID pins that a hand-edited document
-// cannot hand out an id that is already taken.
-func TestLoadEgressPoolDerivesAMissingNextID(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "egress-pool.json")
-	document := `{"version":1,"entries":[{"id":7,"url":"socks5://u:p@10.0.0.7:1080","enabled":true}]}`
-	if err := os.WriteFile(path, []byte(document), 0o600); err != nil {
-		t.Fatal(err)
+// TestLoadEgressPoolNeverReusesATakenID pins that a document whose counter is
+// missing, or behind the ids already in use, cannot hand out an id that is
+// taken. Bindings are held by id, so a duplicate would make two exits answer to
+// one number and resolve to whichever came first.
+func TestLoadEgressPoolNeverReusesATakenID(t *testing.T) {
+	cases := map[string]string{
+		"missing counter": `{"version":1,"entries":[{"id":7,"url":"socks5://u:p@10.0.0.7:1080","enabled":true}]}`,
+		"stale counter":   `{"version":1,"next_id":3,"entries":[{"id":7,"url":"socks5://u:p@10.0.0.7:1080","enabled":true}]}`,
 	}
-	pool, err := LoadEgressPool(path)
-	if err != nil {
-		t.Fatalf("LoadEgressPool: %v", err)
-	}
-	added, err := pool.Add("socks5://u:p@10.0.0.8:1080", "", "")
-	if err != nil {
-		t.Fatalf("Add: %v", err)
-	}
-	if added.ID != 8 {
-		t.Fatalf("id = %d, want 8 (derived from the highest stored id)", added.ID)
+	for name, document := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "egress-pool.json")
+			if err := os.WriteFile(path, []byte(document), 0o600); err != nil {
+				t.Fatalf("write pool document: %v", err)
+			}
+			pool, err := LoadEgressPool(path)
+			if err != nil {
+				t.Fatalf("LoadEgressPool: %v", err)
+			}
+
+			added, errAdd := pool.Add("socks5://u:p@10.0.0.8:1080", "", "")
+			if errAdd != nil {
+				t.Fatalf("Add: %v", errAdd)
+			}
+			if added.ID != 8 {
+				t.Fatalf("id = %d, want 8 (after the highest stored id)", added.ID)
+			}
+		})
 	}
 }
