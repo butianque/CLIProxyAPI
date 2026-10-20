@@ -62,6 +62,11 @@ func connectionView(nature supply.Nature, conn supply.Connection, secretNames []
 	if conn.Egress != "" {
 		view["egress"] = proxyutil.Redact(conn.Egress)
 	}
+	// The pool id is not a secret, and it is what the panel shows instead of an
+	// address: it is the durable name, and it survives the address changing.
+	if conn.EgressID > 0 {
+		view["egress_id"] = conn.EgressID
+	}
 	return view
 }
 
@@ -247,13 +252,20 @@ func (h *Handler) keepStoredEgress(store *supply.ChannelStore, channel *supply.C
 			return
 		}
 		for nature, conn := range submitted.Connections {
-			if strings.TrimSpace(conn.Egress) != "" {
+			previous, hadPrevious := stored.Connections[nature]
+			if !hadPrevious {
 				continue
 			}
-			if previous, ok := stored.Connections[nature]; ok && strings.TrimSpace(previous.Egress) != "" {
-				conn.Egress = previous.Egress
-				submitted.Connections[nature] = conn
+			// The pool id is the durable reference and the panel always reads it
+			// back in full, so an omitted one means "unchanged" for the same
+			// reason an omitted address does.
+			if conn.EgressID == 0 && previous.EgressID > 0 {
+				conn.EgressID = previous.EgressID
 			}
+			if strings.TrimSpace(conn.Egress) == "" && strings.TrimSpace(previous.Egress) != "" {
+				conn.Egress = previous.Egress
+			}
+			submitted.Connections[nature] = conn
 		}
 	}
 	carry(channel.Phone, existing.Phone)
@@ -329,6 +341,9 @@ type connectionBody struct {
 	Domain   string `json:"domain"`
 	ClientID string `json:"client_id"`
 	Egress   string `json:"egress"`
+	// EgressID names a proxy-pool entry. It wins over Egress, so a channel that
+	// sends one gets its address from the pool rather than from the panel.
+	EgressID int `json:"egress_id"`
 }
 
 func toKindConfig(body *kindConfigBody) *supply.KindConfig {
@@ -350,6 +365,7 @@ func toKindConfig(body *kindConfigBody) *supply.KindConfig {
 			Domain:   cb.Domain,
 			ClientID: cb.ClientID,
 			Egress:   cb.Egress,
+			EgressID: cb.EgressID,
 		}
 	}
 	return &supply.KindConfig{

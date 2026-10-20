@@ -173,6 +173,13 @@ type Connection struct {
 	// sources stay apart, so a burnt address on one cannot taint the other.
 	// Empty inherits the supply-wide exit.
 	Egress string `json:"egress,omitempty"`
+	// EgressID names an exit in the proxy pool instead of spelling its address.
+	//
+	// This is the managed form and it wins over Egress when set. The address
+	// stays in the pool, so replacing a burnt exit is one edit there rather than
+	// one edit per channel, and an id that no longer exists is an error instead
+	// of a silent fall back to a direct connection.
+	EgressID int `json:"egress_id,omitempty"`
 }
 
 // KindConfig is the per-kind block inside a channel: which natures it speaks

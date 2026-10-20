@@ -54,6 +54,14 @@ type Config struct {
 	// Egress is the supply-wide exit every mailbox uses unless its channel names
 	// one. Empty inherits the process environment.
 	Egress string
+
+	// ResolveEgress turns a proxy-pool id into the address it names.
+	//
+	// It is injected rather than loaded here because the pool is one document
+	// shared by every kind and by the host: a provider reading its own copy
+	// would drift from the others. Nil means no pool is available, in which case
+	// an id cannot be honoured and the connection fails closed.
+	ResolveEgress func(id int) (string, error)
 }
 
 // ProviderImpl is the email supply provider.
@@ -560,10 +568,33 @@ func (p *ProviderImpl) targets() ([]Target, error) {
 			Domain:     domain,
 			Usage:      usage,
 			SecretName: secret,
-			Egress:     firstNonEmpty(connection.Egress, p.cfg.Egress),
+			Egress:     p.connectionEgress(connection),
 		})
 	}
 	return append(targets, p.poolTargets(targets)...), nil
+}
+
+// connectionEgress returns the exit one channel connection leaves through.
+//
+// A pool id wins over an address stored beside it: the address is a cache that
+// goes stale the moment the exit is replaced, and honouring it would keep
+// sending traffic from an address the operator already retired.
+//
+// An id that cannot be resolved fails closed. It does not fall back to the
+// stored address and it does not fall back to a direct connection, because
+// either would put the mailbox on an address nobody chose.
+func (p *ProviderImpl) connectionEgress(connection supply.Connection) string {
+	if connection.EgressID <= 0 {
+		return firstNonEmpty(connection.Egress, p.cfg.Egress)
+	}
+	if p.cfg.ResolveEgress == nil {
+		return supply.UnresolvedEgress
+	}
+	url, errResolve := p.cfg.ResolveEgress(connection.EgressID)
+	if errResolve != nil || strings.TrimSpace(url) == "" {
+		return supply.UnresolvedEgress
+	}
+	return url
 }
 
 // poolTargets turns the individually-held email identities into readable

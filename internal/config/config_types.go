@@ -311,6 +311,14 @@ type SupplyConfig struct {
 	// Set it only to give supply traffic a different address than model traffic.
 	Egress string `yaml:"egress" json:"egress"`
 
+	// EgressID names an exit in the proxy pool instead of spelling its address.
+	//
+	// This is the managed form: the address lives in the pool, so replacing a
+	// burnt exit is one edit there and everything bound to it follows. It wins
+	// over Egress when set, and an id that no longer exists is an error rather
+	// than a silent fall back to Egress or to a direct connection.
+	EgressID int `yaml:"egress-id,omitempty" json:"egress-id,omitempty"`
+
 	// Phone configures the phone supply kind.
 	Phone SupplyPhoneConfig `yaml:"phone" json:"phone"`
 

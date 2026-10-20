@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/supply"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
 )
 
@@ -68,15 +69,23 @@ type egressEcho struct {
 
 // supplyExit resolves the address supply traffic leaves through.
 //
-// It mirrors the server's own resolution (see internal/cmd supplyEgress):
-// supply.egress wins, otherwise the host's proxy is inherited. The probe has to
-// resolve it the same way or the panel would report on an exit the server never
-// uses.
+// It mirrors the server's own resolution (see internal/cmd supplyEgress): a pool
+// id wins, then supply.egress, otherwise the host's proxy is inherited. The
+// probe has to resolve it the same way or the panel would report on an exit the
+// server never uses.
 func (h *Handler) supplyExit() string {
 	if h == nil || h.cfg == nil {
 		return ""
 	}
-	if egress := strings.TrimSpace(h.cfg.Supply.Egress); egress != "" {
+	supplyCfg := h.cfg.Supply.WithDefaults()
+	if supplyCfg.EgressID > 0 {
+		url, errResolve := h.resolveEgress(supplyCfg.EgressID)
+		if errResolve != nil || strings.TrimSpace(url) == "" {
+			return supply.UnresolvedEgress
+		}
+		return url
+	}
+	if egress := strings.TrimSpace(supplyCfg.Egress); egress != "" {
 		return egress
 	}
 	return strings.TrimSpace(h.cfg.ProxyURL)

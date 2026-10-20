@@ -67,7 +67,10 @@ func (h *Handler) PostSupplyChannelProbe(c *gin.Context) {
 		if len(wanted) > 0 && !wanted[channel.ID] {
 			continue
 		}
-		selected = append(selected, channel)
+		// A probe must reach the same address the real read will, so a channel
+		// that names an exit by id is resolved here rather than read as the
+		// address it used to hold.
+		selected = append(selected, h.applyEgressIDs(channel))
 	}
 
 	ctx := c.Request.Context()

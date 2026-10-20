@@ -22,6 +22,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/supply"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/supply/email"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/supply/phone"
+	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy"
 	log "github.com/sirupsen/logrus"
 )
@@ -118,6 +119,11 @@ func startSealRotation(store *secretstore.Store) {
 func initSupply(cfg *config.Config, configPath string) {
 	installSupply(cfg, configPath)
 	management.SetSupplyReloader(func() { installSupply(cfg, configPath) })
+	// Credentials name their exit by pool id, and this is where the pool lives,
+	// so the resolver is installed here rather than inside the auth store. It is
+	// installed before the service is built, which is before any auth file is
+	// read, so no credential is ever loaded with an unresolved id.
+	sdkAuth.SetEgressResolver(egressResolver(supplyStateDir(cfg, configPath)))
 }
 
 // installSupply (re)builds and installs the process-wide supply service.
@@ -159,13 +165,30 @@ func buildEmailProvider(cfg *config.Config, configPath string, pool *supply.Pool
 	}
 	stateDir := supplyStateDir(cfg, configPath)
 	return email.New(email.Config{
-		ChannelsPath: supply.ChannelPath(stateDir),
-		Pool:         pool,
-		PoolPath:     supply.PoolPath(stateDir),
-		PollWindow:   time.Duration(supplyCfg.Email.PollWindowHours) * time.Hour,
-		MaxMessages:  supplyCfg.Email.MaxMessages,
-		Egress:       supplyEgress(cfg),
+		ChannelsPath:  supply.ChannelPath(stateDir),
+		Pool:          pool,
+		PoolPath:      supply.PoolPath(stateDir),
+		PollWindow:    time.Duration(supplyCfg.Email.PollWindowHours) * time.Hour,
+		MaxMessages:   supplyCfg.Email.MaxMessages,
+		Egress:        supplyEgress(cfg, stateDir),
+		ResolveEgress: egressResolver(stateDir),
 	})
+}
+
+// egressResolver reads the proxy pool once per call and resolves an id.
+//
+// Reading per call rather than caching is deliberate: an exit can be replaced
+// while the process runs, and a cached address would keep sending traffic from
+// the retired one until the next restart.
+func egressResolver(stateDir string) func(id int) (string, error) {
+	poolPath := supply.EgressPoolPath(stateDir)
+	return func(id int) (string, error) {
+		pool, errLoad := supply.LoadEgressPool(poolPath)
+		if errLoad != nil {
+			return "", errLoad
+		}
+		return pool.ResolveRef(supply.EgressRef{ID: id})
+	}
 }
 
 // supplyStateDir resolves where the supply service keeps its on-disk state.
@@ -179,18 +202,35 @@ func supplyStateDir(cfg *config.Config, configPath string) string {
 
 // supplyEgress resolves the address supply traffic leaves through.
 //
-// supply.egress wins when set; otherwise the host's own proxy (requests.proxy-url)
-// is inherited, so an installation that already routes its traffic through one
-// address does not have to configure a second one. That default is the intended
-// behaviour rather than a fallback: renting a number and using the account it
-// registered look like one machine only when they share an address.
+// A pool id wins over a spelled-out address: the address lives in the pool, so
+// replacing a burnt exit is one edit there and everything bound to it follows.
+//
+// supply.egress wins when no id is set; otherwise the host's own proxy
+// (requests.proxy-url) is inherited, so an installation that already routes its
+// traffic through one address does not have to configure a second one. That
+// default is the intended behaviour rather than a fallback: renting a number and
+// using the account it registered look like one machine only when they share an
+// address.
 //
 // A channel may still override this per connection.
-func supplyEgress(cfg *config.Config) string {
+func supplyEgress(cfg *config.Config, stateDir string) string {
 	if cfg == nil {
 		return ""
 	}
-	if egress := strings.TrimSpace(cfg.Supply.WithDefaults().Egress); egress != "" {
+	supplyCfg := cfg.Supply.WithDefaults()
+	if supplyCfg.EgressID > 0 {
+		pool, errLoad := supply.LoadEgressPool(supply.EgressPoolPath(stateDir))
+		if errLoad == nil {
+			if url, errResolve := pool.ResolveRef(supply.EgressRef{ID: supplyCfg.EgressID}); errResolve == nil {
+				return url
+			}
+		}
+		// An id that cannot be resolved fails closed. Falling back to the
+		// spelled-out address, or to a direct connection, would send supply
+		// traffic from an exit the operator did not choose.
+		return supply.UnresolvedEgress
+	}
+	if egress := strings.TrimSpace(supplyCfg.Egress); egress != "" {
 		return egress
 	}
 	return strings.TrimSpace(cfg.ProxyURL)
@@ -306,7 +346,7 @@ func buildPhoneProvider(cfg *config.Config, configPath string, pool *supply.Pool
 		},
 		CoolDownSeconds: supplyCfg.Phone.CooldownSeconds,
 		Guardrail:       supplyCfg.Phone.GuardrailEnabled(),
-		Egress:          supplyEgress(cfg),
+		Egress:          supplyEgress(cfg, stateDir),
 	})
 }
 

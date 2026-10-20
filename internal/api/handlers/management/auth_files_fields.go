@@ -649,6 +649,19 @@ func syncAuthFileMetadataFields(auth *coreauth.Auth, touchedRoots map[string]str
 			auth.ProxyURL = strings.TrimSpace(proxyURL)
 		}
 	}
+	// A pool id wins over the address beside it, so an edit that sets one has to
+	// take effect on the resolved field the runtime reads. Clearing the id puts
+	// the account back on whatever address is stored, or on no proxy at all.
+	if _, ok := touchedRoots["egress_id"]; ok {
+		if id, okID := sdkAuth.EgressIDFromMetadata(auth.Metadata); okID {
+			auth.ProxyURL = sdkAuth.ResolveEgressID(id)
+		} else {
+			auth.ProxyURL = ""
+			if proxyURL, okString := auth.Metadata["proxy_url"].(string); okString {
+				auth.ProxyURL = strings.TrimSpace(proxyURL)
+			}
+		}
+	}
 	if _, ok := touchedRoots["headers"]; ok {
 		syncAuthFileHeaderAttributes(auth)
 	}

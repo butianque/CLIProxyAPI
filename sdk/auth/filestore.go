@@ -292,6 +292,12 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 				if p, ok := metadata["proxy_url"].(string); ok && auth.ProxyURL == "" {
 					auth.ProxyURL = strings.TrimSpace(p)
 				}
+				// A pool id wins over the address beside it: the address is a
+				// cache that goes stale when the exit is replaced, so honouring
+				// it would keep sending traffic from a retired address.
+				if egressID, okID := EgressIDFromMetadata(metadata); okID {
+					auth.ProxyURL = ResolveEgressID(egressID)
+				}
 				if pref, ok := metadata["prefix"].(string); ok && auth.Prefix == "" {
 					auth.Prefix = strings.Trim(strings.TrimSpace(pref), "/")
 				}
@@ -325,6 +331,10 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 	proxyURL := ""
 	if p, ok := metadata["proxy_url"].(string); ok {
 		proxyURL = strings.TrimSpace(p)
+	}
+	// A pool id wins over the address beside it; see the multi-auth path above.
+	if egressID, okID := EgressIDFromMetadata(metadata); okID {
+		proxyURL = ResolveEgressID(egressID)
 	}
 	prefix := ""
 	if rawPrefix, ok := metadata["prefix"].(string); ok {

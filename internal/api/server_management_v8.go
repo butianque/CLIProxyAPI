@@ -91,6 +91,26 @@ func (s *Server) registerManagementV8Routes() {
 	// from the far side. Omitting the URL probes the exit supply traffic uses.
 	v8.POST("/egress/probe", s.mgmt.PostEgressProbe)
 
+	// The exits this installation owns. An exit is identified by a small number
+	// because it is replaced as a unit: when an address is retired, everything
+	// bound to it moves together.
+	v8.GET("/egress/pool", s.mgmt.GetEgressPool)
+	v8.POST("/egress/pool", s.mgmt.PostEgressPool)
+	// Which exit a new identity would be given right now.
+	v8.POST("/egress/pool/next", s.mgmt.PostEgressPoolNext)
+	v8.PATCH("/egress/pool/:id", s.mgmt.PatchEgressPool)
+	v8.DELETE("/egress/pool/:id", s.mgmt.DeleteEgressPool)
+	// Asking one exit what address it presents, and remembering the answer.
+	v8.POST("/egress/pool/:id/probe", s.mgmt.PostEgressPoolProbe)
+	// Exactly what is bound to one exit.
+	v8.GET("/egress/pool/:id/members", s.mgmt.GetEgressPoolMembers)
+	// Making and releasing a binding. Automation and the panel both go through
+	// here, so an exit is assigned in one place instead of once per target.
+	v8.POST("/egress/pool/:id/bind", s.mgmt.PostEgressPoolBind)
+	// Releasing is not about one exit, so it lives beside the pool rather than
+	// under an id: a target can only be bound to one exit at a time.
+	v8.POST("/egress/unbind", s.mgmt.PostEgressPoolUnbind)
+
 	// The cross-kind identity pool: which identity is behind a credential,
 	// and which platform it registered on. It is also the pool view: ?kind=
 	// narrows it to one kind's handed-out identities.
