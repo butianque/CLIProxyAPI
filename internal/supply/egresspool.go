@@ -3,6 +3,7 @@ package supply
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -84,6 +85,16 @@ type EgressPoolDocument struct {
 	Version int           `json:"version"`
 	NextID  int           `json:"next_id"`
 	Entries []EgressEntry `json:"entries,omitempty"`
+	// Default is the exit the whole process leaves through unless something
+	// more specific (a credential, a channel) says otherwise. Zero means the
+	// installation still spells its address out by hand, which is what
+	// "requests.proxy-url" holds.
+	//
+	// It lives here rather than in config.yaml on purpose: the pool owns the
+	// address, so it also owns which address is in force. Keeping the choice in
+	// the config file would let a stale config document point at a retired
+	// exit after the pool had already replaced it.
+	Default int `json:"default,omitempty"`
 }
 
 // EgressPool is the proxy list, persisted as one JSON document.
@@ -144,6 +155,34 @@ func (p *EgressPool) Get(id int) (EgressEntry, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.getLocked(id)
+}
+
+// DefaultID returns the exit the process leaves through, or zero when the
+// installation still spells its address out by hand.
+func (p *EgressPool) DefaultID() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.doc.Default
+}
+
+// SetDefault makes one exit the process-wide default. Zero clears it.
+//
+// Naming an id that does not exist is refused: the default is the address every
+// request leaves from, so accepting a dangling one would take the whole
+// installation offline rather than one account.
+func (p *EgressPool) SetDefault(id int) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if id != 0 {
+		if _, ok := p.getLocked(id); !ok {
+			return fmt.Errorf("supply: no exit #%d", id)
+		}
+	}
+	if p.doc.Default == id {
+		return nil
+	}
+	p.doc.Default = id
+	return p.saveLocked()
 }
 
 func (p *EgressPool) getLocked(id int) (EgressEntry, bool) {
@@ -284,6 +323,12 @@ func (p *EgressPool) Delete(id int) error {
 		return nil
 	}
 	p.doc.Entries = kept
+	// The management surface refuses this while the entry is the default, so
+	// reaching here means a hand edit. Clearing the pointer keeps the file
+	// consistent instead of leaving a default that resolves to nothing.
+	if p.doc.Default == id {
+		p.doc.Default = 0
+	}
 	return p.saveLocked()
 }
 
@@ -365,6 +410,77 @@ func (p *EgressPool) ResolveRef(ref EgressRef) (string, error) {
 	return url, nil
 }
 
+// globalEgressCache is the last answer GlobalEgress gave, keyed by the identity
+// of the file it came from.
+//
+// The cache exists because the answer is asked for on every outbound request,
+// and reading a small JSON document each time would be wasteful. The file's
+// modification time and size are enough to notice a change: the pool is only
+// ever written whole, by this package, and a hand edit moves the mtime too.
+type globalEgressCache struct {
+	mu      sync.Mutex
+	path    string
+	modTime time.Time
+	size    int64
+	url     string
+	set     bool
+}
+
+var cachedGlobalEgress globalEgressCache
+
+// GlobalEgress returns the address the whole process leaves through.
+//
+// The second result is false when the pool designates no default, in which case
+// the caller keeps whatever address it already has. That split is what lets an
+// installation which never opened the pool behave exactly as before.
+//
+// A default whose entry has been removed resolves to UnresolvedEgress rather
+// than falling back: every request leaving from an address nobody chose is worse
+// than every request failing loudly.
+func GlobalEgress(poolPath string) (string, bool) {
+	info, errStat := os.Stat(poolPath)
+	if errStat != nil {
+		cachedGlobalEgress.invalidate()
+		return "", false
+	}
+	cachedGlobalEgress.mu.Lock()
+	defer cachedGlobalEgress.mu.Unlock()
+	if cachedGlobalEgress.path == poolPath &&
+		cachedGlobalEgress.modTime.Equal(info.ModTime()) &&
+		cachedGlobalEgress.size == info.Size() {
+		return cachedGlobalEgress.url, cachedGlobalEgress.set
+	}
+	pool, errLoad := LoadEgressPool(poolPath)
+	if errLoad != nil {
+		// An unreadable pool keeps the last good answer. Guessing "direct" here
+		// would move traffic off the exit the operator chose.
+		return cachedGlobalEgress.url, cachedGlobalEgress.set
+	}
+	url, set := "", false
+	if id := pool.DefaultID(); id > 0 {
+		resolved, errResolve := pool.ResolveRef(EgressRef{ID: id})
+		if errResolve != nil {
+			resolved = UnresolvedEgress
+		}
+		url, set = resolved, true
+	}
+	cachedGlobalEgress.path = poolPath
+	cachedGlobalEgress.modTime = info.ModTime()
+	cachedGlobalEgress.size = info.Size()
+	cachedGlobalEgress.url, cachedGlobalEgress.set = url, set
+	return url, set
+}
+
+// invalidate drops the cached answer.
+func (c *globalEgressCache) invalidate() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.path = ""
+	c.modTime = time.Time{}
+	c.size = 0
+	c.url, c.set = "", false
+}
+
 // Next returns the exit a new identity should be bound to.
 //
 // The rule is deliberately boring: among enabled entries, the one with the
@@ -422,5 +538,11 @@ func (p *EgressPool) saveLocked() error {
 	if p.doc.Version == 0 {
 		p.doc.Version = egressPoolVersion
 	}
-	return saveJSON(p.path, p.doc)
+	if errSave := saveJSON(p.path, p.doc); errSave != nil {
+		return errSave
+	}
+	// A write can land inside the same modification-time tick as the previous
+	// one, so the next reader must not trust the cached answer.
+	cachedGlobalEgress.invalidate()
+	return nil
 }

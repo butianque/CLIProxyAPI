@@ -701,7 +701,7 @@ func proxyURLForAuth(cfg *config.Config, selected *auth.Auth) string {
 		return strings.TrimSpace(selected.ProxyURL)
 	}
 	if cfg != nil {
-		return strings.TrimSpace(cfg.ProxyURL)
+		return cfg.EffectiveProxyURL()
 	}
 	return ""
 }

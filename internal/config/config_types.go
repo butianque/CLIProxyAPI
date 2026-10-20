@@ -291,33 +291,17 @@ type PprofConfig struct {
 // email address for verification mail — and reads the message it receives.
 // Credentials are never held here: they live in the host secret store, named by
 // Phone.APISecret / Phone.CookieSecret and read through host.secret.*.
+//
+// There is no exit setting here. Supply traffic leaves from the process-wide
+// exit (the proxy pool's default, or the hand-written proxy address), which is
+// the same address the accounts it registers use: a supply identity and the
+// account it registers are judged together, and renting a number from one
+// address while signing up from another is the pattern fraud scoring looks for.
+// A channel may still override the exit for its own connections.
 type SupplyConfig struct {
 	// StorageDir is where supply state documents live (the phone pool and the
 	// channel cache). Empty means "<config dir>/supply".
 	StorageDir string `yaml:"storage-dir" json:"storage-dir"`
-
-	// Egress is the proxy every supply connection exits through: the IMAP and
-	// Graph reads that fetch a verification mail, and the platform calls that
-	// rent a number. A channel may override it per connection.
-	//
-	// This exists because a supply identity and the account it registers are
-	// judged together: renting a number or reading a mailbox from one address
-	// while the signup itself comes from another is the pattern fraud scoring
-	// looks for.
-	//
-	// Empty inherits requests.proxy-url, so an installation that already routes
-	// its traffic through one address does not configure a second one; when that
-	// is empty too, the process environment applies ("direct" forces a bypass).
-	// Set it only to give supply traffic a different address than model traffic.
-	Egress string `yaml:"egress" json:"egress"`
-
-	// EgressID names an exit in the proxy pool instead of spelling its address.
-	//
-	// This is the managed form: the address lives in the pool, so replacing a
-	// burnt exit is one edit there and everything bound to it follows. It wins
-	// over Egress when set, and an id that no longer exists is an error rather
-	// than a silent fall back to Egress or to a direct connection.
-	EgressID int `yaml:"egress-id,omitempty" json:"egress-id,omitempty"`
 
 	// Phone configures the phone supply kind.
 	Phone SupplyPhoneConfig `yaml:"phone" json:"phone"`

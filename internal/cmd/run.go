@@ -117,6 +117,10 @@ func startSealRotation(store *secretstore.Store) {
 // unconfigured kind is the honest state, and the management surface reports it
 // as such.
 func initSupply(cfg *config.Config, configPath string) {
+	// Install the process-wide exit before anything is built: every consumer
+	// asks EffectiveProxyURL, and that is what makes "one exit, one edit" true
+	// without touching those call sites.
+	installGlobalEgress(cfg, configPath)
 	installSupply(cfg, configPath)
 	management.SetSupplyReloader(func() { installSupply(cfg, configPath) })
 	// Credentials name their exit by pool id, and this is where the pool lives,
@@ -170,7 +174,7 @@ func buildEmailProvider(cfg *config.Config, configPath string, pool *supply.Pool
 		PoolPath:      supply.PoolPath(stateDir),
 		PollWindow:    time.Duration(supplyCfg.Email.PollWindowHours) * time.Hour,
 		MaxMessages:   supplyCfg.Email.MaxMessages,
-		Egress:        supplyEgress(cfg, stateDir),
+		Egress:        supplyEgress(cfg),
 		ResolveEgress: egressResolver(stateDir),
 	})
 }
@@ -200,40 +204,31 @@ func supplyStateDir(cfg *config.Config, configPath string) string {
 	return supply.StateDir(filepath.Dir(configPath), configured)
 }
 
-// supplyEgress resolves the address supply traffic leaves through.
+// supplyEgress is the address supply traffic leaves through.
 //
-// A pool id wins over a spelled-out address: the address lives in the pool, so
-// replacing a burnt exit is one edit there and everything bound to it follows.
-//
-// supply.egress wins when no id is set; otherwise the host's own proxy
-// (requests.proxy-url) is inherited, so an installation that already routes its
-// traffic through one address does not have to configure a second one. That
-// default is the intended behaviour rather than a fallback: renting a number and
-// using the account it registered look like one machine only when they share an
-// address.
-//
-// A channel may still override this per connection.
-func supplyEgress(cfg *config.Config, stateDir string) string {
+// Supply has no exit of its own: it leaves from the process-wide one, because a
+// rented number and the account it registers are judged together, and reading a
+// mailbox from one address while signing up from another is the pattern fraud
+// scoring looks for. A channel may still override this per connection.
+func supplyEgress(cfg *config.Config) string {
 	if cfg == nil {
 		return ""
 	}
-	supplyCfg := cfg.Supply.WithDefaults()
-	if supplyCfg.EgressID > 0 {
-		pool, errLoad := supply.LoadEgressPool(supply.EgressPoolPath(stateDir))
-		if errLoad == nil {
-			if url, errResolve := pool.ResolveRef(supply.EgressRef{ID: supplyCfg.EgressID}); errResolve == nil {
-				return url
-			}
-		}
-		// An id that cannot be resolved fails closed. Falling back to the
-		// spelled-out address, or to a direct connection, would send supply
-		// traffic from an exit the operator did not choose.
-		return supply.UnresolvedEgress
+	return cfg.EffectiveProxyURL()
+}
+
+// installGlobalEgress points the process at the exit the pool designates.
+//
+// The resolver is installed once rather than resolved once: the pool's default
+// can change while the server runs (that is the point of it), and every consumer
+// asks EffectiveProxyURL on its own request. Nothing has to be re-applied, and a
+// stale copy can never outlive the edit.
+func installGlobalEgress(cfg *config.Config, configPath string) {
+	if cfg == nil {
+		return
 	}
-	if egress := strings.TrimSpace(supplyCfg.Egress); egress != "" {
-		return egress
-	}
-	return strings.TrimSpace(cfg.ProxyURL)
+	poolPath := supply.EgressPoolPath(supplyStateDir(cfg, configPath))
+	config.SetEgressDefaultResolver(func() (string, bool) { return supply.GlobalEgress(poolPath) })
 }
 
 // loadSupplyPool reads the cross-kind identity pool.
@@ -346,7 +341,7 @@ func buildPhoneProvider(cfg *config.Config, configPath string, pool *supply.Pool
 		},
 		CoolDownSeconds: supplyCfg.Phone.CooldownSeconds,
 		Guardrail:       supplyCfg.Phone.GuardrailEnabled(),
-		Egress:          supplyEgress(cfg, stateDir),
+		Egress:          supplyEgress(cfg),
 	})
 }
 

@@ -41,31 +41,23 @@ func TestDescribeEgress(t *testing.T) {
 	}
 }
 
-// The probe has to resolve the exit the same way the server does, or the panel
-// would test an address no traffic ever uses. Supply traffic inherits the host
-// proxy unless it names its own.
-func TestSupplyExitInheritsHostProxy(t *testing.T) {
+// The probe has to report the exit the server actually uses, or the panel would
+// test an address no traffic ever uses. Supply has no exit of its own: it leaves
+// from the process-wide one, which was resolved from the pool at startup.
+func TestSupplyExitReportsTheProcessWideExit(t *testing.T) {
 	cases := []struct {
-		name      string
-		supply    string
-		hostProxy string
-		want      string
+		name  string
+		proxy string
+		want  string
 	}{
 		{name: "nothing configured", want: ""},
-		{name: "inherits host proxy", hostProxy: "http://127.0.0.1:7890", want: "http://127.0.0.1:7890"},
-		{
-			name:      "own exit wins",
-			supply:    "socks5://127.0.0.1:1080",
-			hostProxy: "http://127.0.0.1:7890",
-			want:      "socks5://127.0.0.1:1080",
-		},
-		{name: "blank supply inherits", supply: "   ", hostProxy: "direct", want: "direct"},
-		{name: "whitespace is trimmed", supply: " http://a:1 ", want: "http://a:1"},
+		{name: "pool or hand-written address", proxy: "http://127.0.0.1:7890", want: "http://127.0.0.1:7890"},
+		{name: "explicit direct is reported as written", proxy: "direct", want: "direct"},
+		{name: "whitespace is trimmed", proxy: " http://a:1 ", want: "http://a:1"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			handler := &Handler{cfg: &config.Config{SDKConfig: config.SDKConfig{ProxyURL: tc.hostProxy}}}
-			handler.cfg.Supply.Egress = tc.supply
+			handler := &Handler{cfg: &config.Config{SDKConfig: config.SDKConfig{ProxyURL: tc.proxy}}}
 			if got := handler.supplyExit(); got != tc.want {
 				t.Fatalf("supplyExit() = %q, want %q", got, tc.want)
 			}

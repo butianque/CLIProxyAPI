@@ -805,7 +805,7 @@ var newPluginStoreClient = func(cfg *config.Config) sdkpluginstore.Client {
 	var storeAuth []sdkpluginstore.AuthConfig
 	var proxyURL string
 	if cfg != nil {
-		proxyURL = strings.TrimSpace(cfg.ProxyURL)
+		proxyURL = cfg.EffectiveProxyURL()
 		storeAuth = cfg.Plugins.StoreAuth
 	}
 	if proxyURL != "" {
@@ -818,7 +818,7 @@ var newResolvedPluginStoreClient = func(cfg *config.Config, auth []sdkpluginstor
 	client := &http.Client{}
 	var proxyURL string
 	if cfg != nil {
-		proxyURL = strings.TrimSpace(cfg.ProxyURL)
+		proxyURL = cfg.EffectiveProxyURL()
 	}
 	if proxyURL != "" {
 		util.SetProxy(&sdkconfig.SDKConfig{ProxyURL: proxyURL}, client)

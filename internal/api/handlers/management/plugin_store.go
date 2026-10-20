@@ -525,7 +525,7 @@ func (h *Handler) pluginStoreSnapshot() (bool, string, string, []string, []plugi
 	}
 	pluginsEnabled := h.cfg.Plugins.Enabled
 	pluginsDir := normalizedPluginsDir(h.cfg.Plugins.Dir)
-	proxyURL := strings.TrimSpace(h.cfg.ProxyURL)
+	proxyURL := h.cfg.EffectiveProxyURL()
 	sourceConfigs := append([]string(nil), h.cfg.Plugins.StoreSources...)
 	storeAuth := append([]pluginstore.AuthConfig(nil), h.cfg.Plugins.StoreAuth...)
 	configs := make(map[string]config.PluginInstanceConfig, len(h.cfg.Plugins.Configs))

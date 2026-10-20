@@ -4,6 +4,11 @@
 // debug settings, proxy configuration, and API keys.
 package config
 
+import (
+	"strings"
+	"sync/atomic"
+)
+
 // Config represents the application's configuration, loaded from a YAML file.
 type Config struct {
 	// Models selects optional catalog sources independently for each catalog.
@@ -197,4 +202,49 @@ type Config struct {
 
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
+}
+
+// egressDefault answers "which exit does this process leave through" from the
+// proxy pool. It is installed once by the server so this package can answer the
+// question without importing the pool's storage.
+//
+// It is swapped on config reload while requests are being served, so it is held
+// atomically rather than assigned: a request must never read a half-written
+// function value.
+var egressDefault atomic.Pointer[func() (string, bool)]
+
+// SetEgressDefaultResolver installs the source of the process-wide exit.
+//
+// The resolver reports false when the pool designates no default, which is the
+// signal to keep the address the config file spells out. It is read on every
+// outbound request, so it must be cheap.
+func SetEgressDefaultResolver(resolve func() (string, bool)) {
+	if resolve == nil {
+		egressDefault.Store(nil)
+		return
+	}
+	egressDefault.Store(&resolve)
+}
+
+// EffectiveProxyURL is the address outbound requests leave through.
+//
+// Two inputs decide it: the proxy pool's default exit, and the address the
+// config file spells out by hand. The pool wins whenever it designates an exit,
+// because the address lives there — replacing a burnt exit is one edit in the
+// pool, and every request follows immediately, without a restart and without
+// the address being copied into the config file.
+//
+// A default that no longer resolves comes back as-is: it is not a usable
+// address, so the transport rejects it and traffic fails loudly instead of
+// quietly leaving from the host's own address.
+func (cfg *Config) EffectiveProxyURL() string {
+	if cfg == nil {
+		return ""
+	}
+	if resolve := egressDefault.Load(); resolve != nil {
+		if resolved, ok := (*resolve)(); ok {
+			return resolved
+		}
+	}
+	return strings.TrimSpace(cfg.ProxyURL)
 }
