@@ -12,6 +12,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/supply"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
 )
 
 // This file is the account-centric view. A credential's data lives in five
@@ -44,6 +45,14 @@ type accountView struct {
 	Enabled         bool   `json:"enabled"`
 	SupportsRefresh *bool  `json:"supports_refresh"`
 	AuthState       string `json:"auth_state"`
+
+	// EgressID names the proxy-pool exit this credential leaves through, and
+	// Egress is the address actually in force, redacted. Both are reported
+	// because a credential can be bound by id or typed by hand, and the panel
+	// has to show which of the two it is looking at instead of assuming a pool
+	// entry exists for every account.
+	EgressID int    `json:"egress_id,omitempty"`
+	Egress   string `json:"egress,omitempty"`
 
 	Eligible         bool   `json:"eligible"`
 	ManuallyDisabled bool   `json:"manually_disabled"`
@@ -191,6 +200,12 @@ func buildAccountView(auth *coreauth.Auth, poolRecord supply.Record, hasPoolReco
 	}
 	if hasPoolRecord {
 		view.SourceKind = string(poolRecord.Kind)
+	}
+	if id, ok := egressIDValue(auth.Metadata["egress_id"]); ok {
+		view.EgressID = id
+	}
+	if proxy := strings.TrimSpace(auth.ProxyURL); proxy != "" {
+		view.Egress = proxyutil.Redact(proxy)
 	}
 
 	// The routing policy is account metadata, so an operator can move a
