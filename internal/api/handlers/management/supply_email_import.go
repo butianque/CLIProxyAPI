@@ -134,10 +134,13 @@ func (h *Handler) PostSupplyEmailImport(c *gin.Context) {
 				ctx, cancel := context.WithTimeout(c.Request.Context(), importProbeTimeout)
 				defer cancel()
 				var errProbe error
+				// The probe takes the supply exit: an import runs before any
+				// channel exists, so there is no per-channel override to read.
+				egress := h.supplyExit()
 				if nature == supply.NatureGraph {
-					_, errProbe = email.ProbeGraph(ctx, line.Account, line.ClientID, line.Refresh)
+					_, errProbe = email.ProbeGraph(ctx, line.Account, line.ClientID, line.Refresh, egress)
 				} else {
-					_, errProbe = email.ProbeOAuth2(ctx, host, line.Account, line.ClientID, line.Refresh)
+					_, errProbe = email.ProbeOAuth2(ctx, host, line.Account, line.ClientID, line.Refresh, egress)
 				}
 				if errProbe != nil {
 					probeDetails[index] = probeDetail(errProbe)

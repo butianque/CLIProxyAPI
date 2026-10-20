@@ -74,10 +74,13 @@ func (h *Handler) PostSupplyChannelProbe(c *gin.Context) {
 	// The probe reads the named credential, so it runs with the calling session's
 	// authority: a session that has not unlocked the store probes nothing.
 	vault := sessionVault(c)
+	// A probe must take the route the real read will take, so it resolves the
+	// same way the provider does: the channel's own exit, else the supply-wide one.
+	egress := h.supplyExit()
 	probes := make([]gin.H, len(selected))
 	var wg sync.WaitGroup
 	for i, channel := range selected {
-		wg.Go(func() { probes[i] = probeChannel(ctx, channel, vault) })
+		wg.Go(func() { probes[i] = probeChannel(ctx, channel, vault, egress) })
 	}
 	wg.Wait()
 
@@ -85,7 +88,7 @@ func (h *Handler) PostSupplyChannelProbe(c *gin.Context) {
 }
 
 // probeChannel probes every nature the channel declares, concurrently.
-func probeChannel(ctx context.Context, channel supply.Channel, vault secretstore.Vault) gin.H {
+func probeChannel(ctx context.Context, channel supply.Channel, vault secretstore.Vault, egress string) gin.H {
 	natures := map[string]gin.H{}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -100,7 +103,7 @@ func probeChannel(ctx context.Context, channel supply.Channel, vault secretstore
 		for _, nature := range config.Natures {
 			connection := config.Connections[nature]
 			wg.Go(func() {
-				result := probeNature(ctx, kind, nature, connection, vault)
+				result := probeNature(ctx, kind, nature, connection, vault, egress)
 				mu.Lock()
 				natures[string(nature)] = result
 				mu.Unlock()
@@ -113,7 +116,7 @@ func probeChannel(ctx context.Context, channel supply.Channel, vault secretstore
 
 // probeNature runs one nature's probe. Only the natures a kind declares are
 // ever probed, so an undeclared one never appears in the answer.
-func probeNature(ctx context.Context, kind supply.Kind, nature supply.Nature, connection supply.Connection, vault secretstore.Vault) gin.H {
+func probeNature(ctx context.Context, kind supply.Kind, nature supply.Nature, connection supply.Connection, vault secretstore.Vault, supplyEgress string) gin.H {
 	credential, reason := probeCredential(vault, connection.Secret)
 	if reason != "" {
 		return gin.H{"state": probeUnready, "detail": reason}
@@ -121,19 +124,24 @@ func probeNature(ctx context.Context, kind supply.Kind, nature supply.Nature, co
 	ctxProbe, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 
+	egress := strings.TrimSpace(connection.Egress)
+	if egress == "" {
+		egress = supplyEgress
+	}
+
 	var detail string
 	var errProbe error
 	switch {
 	case kind == supply.KindEmail && nature == supply.NatureIMAP:
-		detail, errProbe = email.ProbeIMAP(ctxProbe, connection.Endpoint, connection.Account, credential)
+		detail, errProbe = email.ProbeIMAP(ctxProbe, connection.Endpoint, connection.Account, credential, egress)
 	case kind == supply.KindEmail && nature == supply.NatureOAuth2:
-		detail, errProbe = email.ProbeOAuth2(ctxProbe, connection.Endpoint, connection.Account, connection.ClientID, credential)
+		detail, errProbe = email.ProbeOAuth2(ctxProbe, connection.Endpoint, connection.Account, connection.ClientID, credential, egress)
 	case kind == supply.KindEmail && nature == supply.NatureGraph:
-		detail, errProbe = email.ProbeGraph(ctxProbe, connection.Account, connection.ClientID, credential)
+		detail, errProbe = email.ProbeGraph(ctxProbe, connection.Account, connection.ClientID, credential, egress)
 	case kind == supply.KindPhone && nature == supply.NatureAPI:
-		detail, errProbe = phone.ProbeAPI(ctxProbe, connection.Endpoint, credential)
+		detail, errProbe = phone.ProbeAPI(ctxProbe, connection.Endpoint, credential, egress)
 	case kind == supply.KindPhone && nature == supply.NatureWeb:
-		detail, errProbe = phone.ProbeWeb(ctxProbe, connection.Endpoint, credential)
+		detail, errProbe = phone.ProbeWeb(ctxProbe, connection.Endpoint, credential, egress)
 	default:
 		return gin.H{"state": probeUnsupported}
 	}

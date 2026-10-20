@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -55,6 +56,9 @@ type Config struct {
 	// and shared with every other kind. It is injected rather than loaded here
 	// so one in-memory document backs the one file.
 	Pool *supply.Pool
+	// Egress is the proxy every platform call exits through. Empty inherits the
+	// process environment; "direct" forces a bypass.
+	Egress string
 }
 
 // ProviderImpl is the base-side supply provider for the phone kind. It adapts
@@ -65,6 +69,10 @@ type ProviderImpl struct {
 	project   Project
 	secret    HaozhumaSecret
 	guardrail bool
+	// http is the platform exit, shared with the service and reused by the
+	// management surface so a web login leaves through the same address as a
+	// rental.
+	http *http.Client
 
 	// delivered tracks numbers whose delivery has already been credited to
 	// their channel, so a repeated poll of the same inbox does not inflate the
@@ -80,7 +88,11 @@ func New(cfg Config) (*ProviderImpl, error) {
 	if strings.TrimSpace(cfg.Provider) != "" && !strings.EqualFold(strings.TrimSpace(cfg.Provider), "haozhuma") {
 		return nil, fmt.Errorf("phone: unsupported provider %q", cfg.Provider)
 	}
-	platform, errPlatform := NewHaozhuma(cfg.Secret, nil)
+	client, errClient := clientForEgress(cfg.Egress)
+	if errClient != nil {
+		return nil, fmt.Errorf("phone: the platform exit is misconfigured: %w", errClient)
+	}
+	platform, errPlatform := NewHaozhuma(cfg.Secret, client)
 	if errPlatform != nil {
 		return nil, errPlatform
 	}
@@ -97,6 +109,7 @@ func New(cfg Config) (*ProviderImpl, error) {
 		project:   cfg.Project,
 		secret:    cfg.Secret,
 		guardrail: cfg.Guardrail,
+		http:      client,
 		delivered: map[string]bool{},
 	}, nil
 }

@@ -164,6 +164,7 @@ func buildEmailProvider(cfg *config.Config, configPath string, pool *supply.Pool
 		PoolPath:     supply.PoolPath(stateDir),
 		PollWindow:   time.Duration(supplyCfg.Email.PollWindowHours) * time.Hour,
 		MaxMessages:  supplyCfg.Email.MaxMessages,
+		Egress:       supplyEgress(cfg),
 	})
 }
 
@@ -174,6 +175,25 @@ func supplyStateDir(cfg *config.Config, configPath string) string {
 		configured = cfg.Supply.WithDefaults().StorageDir
 	}
 	return supply.StateDir(filepath.Dir(configPath), configured)
+}
+
+// supplyEgress resolves the address supply traffic leaves through.
+//
+// supply.egress wins when set; otherwise the host's own proxy (requests.proxy-url)
+// is inherited, so an installation that already routes its traffic through one
+// address does not have to configure a second one. That default is the intended
+// behaviour rather than a fallback: renting a number and using the account it
+// registered look like one machine only when they share an address.
+//
+// A channel may still override this per connection.
+func supplyEgress(cfg *config.Config) string {
+	if cfg == nil {
+		return ""
+	}
+	if egress := strings.TrimSpace(cfg.Supply.WithDefaults().Egress); egress != "" {
+		return egress
+	}
+	return strings.TrimSpace(cfg.ProxyURL)
 }
 
 // loadSupplyPool reads the cross-kind identity pool.
@@ -286,6 +306,7 @@ func buildPhoneProvider(cfg *config.Config, configPath string, pool *supply.Pool
 		},
 		CoolDownSeconds: supplyCfg.Phone.CooldownSeconds,
 		Guardrail:       supplyCfg.Phone.GuardrailEnabled(),
+		Egress:          supplyEgress(cfg),
 	})
 }
 

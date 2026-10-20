@@ -166,6 +166,13 @@ type Connection struct {
 	// a secret — the refresh token is — and an operator editing the channel
 	// should see which application it belongs to without retyping it.
 	ClientID string `json:"client_id,omitempty"`
+	// Egress overrides the supply-wide exit for this connection.
+	//
+	// A channel is one identity source, and its addresses are judged together
+	// with the accounts they registered. Giving it its own exit lets two
+	// sources stay apart, so a burnt address on one cannot taint the other.
+	// Empty inherits the supply-wide exit.
+	Egress string `json:"egress,omitempty"`
 }
 
 // KindConfig is the per-kind block inside a channel: which natures it speaks

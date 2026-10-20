@@ -505,7 +505,7 @@ func TestOAuth2AccessTokenExchangesRefreshToken(t *testing.T) {
 	}))
 	defer server.Close()
 
-	token, expires, errToken := oauth2AccessToken(context.Background(), server.URL, "app-123", "rt-1")
+	token, expires, errToken := oauth2AccessToken(context.Background(), server.URL, "app-123", "rt-1", nil)
 	if errToken != nil {
 		t.Fatalf("oauth2AccessToken: %v", errToken)
 	}
@@ -549,7 +549,7 @@ func TestOAuth2AccessTokenReportsRefusal(t *testing.T) {
 			_, _ = w.Write([]byte(`{"error":"invalid_grant","error_description":"` + testCase.description + `"}`))
 		}))
 
-		_, _, errToken := oauth2AccessToken(context.Background(), server.URL, "app-123", "rt-1")
+		_, _, errToken := oauth2AccessToken(context.Background(), server.URL, "app-123", "rt-1", nil)
 		server.Close()
 		if errToken == nil {
 			t.Fatalf("%s: a refused exchange reported success", testCase.name)
@@ -575,7 +575,7 @@ func TestOAuth2AccessTokenRejectsAGraphOnlyGrant(t *testing.T) {
 	}))
 	defer server.Close()
 
-	_, _, errToken := oauth2AccessToken(context.Background(), server.URL, "app-123", "rt-1")
+	_, _, errToken := oauth2AccessToken(context.Background(), server.URL, "app-123", "rt-1", nil)
 	if errToken == nil {
 		t.Fatal("a Graph-only grant produced an IMAP token")
 	}
@@ -595,7 +595,7 @@ func TestOAuth2AccessTokenAcceptsImapScopeOrNoScopeList(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(body))
 		}))
-		token, _, errToken := oauth2AccessToken(context.Background(), server.URL, "app-123", "rt-1")
+		token, _, errToken := oauth2AccessToken(context.Background(), server.URL, "app-123", "rt-1", nil)
 		server.Close()
 		if errToken != nil {
 			t.Fatalf("a usable token was refused: %v", errToken)

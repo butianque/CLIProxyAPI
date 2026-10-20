@@ -136,6 +136,10 @@ type Target struct {
 	Usage string
 	// SecretName is the secret-store entry the credential is read from.
 	SecretName string
+	// Egress is the proxy this mailbox exits through, resolved from the
+	// channel's connection and falling back to the supply-wide setting. Empty
+	// inherits the process environment.
+	Egress string
 }
 
 // Covers reports whether an address could arrive at this mailbox: either it is
@@ -184,8 +188,11 @@ func dialSession(ctx context.Context, target Target) (Session, error) {
 	if errSplit != nil {
 		host, port = address, defaultPort
 	}
-	dialer := &net.Dialer{Timeout: dialTimeout}
-	conn, errDial := dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, port))
+	dial, errDialer := dialForEgress(target.Egress)
+	if errDialer != nil {
+		return nil, fmt.Errorf("email: the mailbox exit is misconfigured: %w", errDialer)
+	}
+	conn, errDial := dial(ctx, "tcp", net.JoinHostPort(host, port))
 	if errDial != nil {
 		return nil, fmt.Errorf("email: cannot reach %s: %w", address, errDial)
 	}
@@ -220,7 +227,14 @@ func authenticate(ctx context.Context, client *imapclient.Client, target Target)
 		// future caller from sending a Graph token to an IMAP LOGIN.
 		return errors.New("email: a Graph mailbox is not opened over IMAP")
 	case AuthOAuth2:
-		token, errToken := oauth2Bearer(ctx, target.ClientID, target.Password)
+		// The token exchange is an outbound HTTP call of its own, so it has to
+		// take the mailbox's exit too; minting it from the host's default route
+		// would leak the address the rest of the session avoids.
+		httpClient, errClient := clientForEgress(target.Egress)
+		if errClient != nil {
+			return fmt.Errorf("%w: %v", ErrProbeUnready, errClient)
+		}
+		token, errToken := oauth2Bearer(ctx, target.ClientID, target.Password, httpClient)
 		if errToken != nil {
 			return fmt.Errorf("%w: %v", ErrLoginRejected, errToken)
 		}

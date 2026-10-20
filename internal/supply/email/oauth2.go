@@ -90,9 +90,10 @@ var accessTokens = struct {
 }{tokens: map[string]cachedToken{}}
 
 // oauth2Bearer returns a usable access token for one mailbox, minting one when
-// the cache has nothing recent.
-func oauth2Bearer(ctx context.Context, clientID, refreshToken string) (string, error) {
-	return bearerFor(ctx, "imap", clientID, refreshToken)
+// the cache has nothing recent. client is the mailbox's egress; nil means the
+// package default.
+func oauth2Bearer(ctx context.Context, clientID, refreshToken string, client *http.Client) (string, error) {
+	return bearerFor(ctx, "imap", clientID, refreshToken, client)
 }
 
 // graphBearer returns a usable Graph access token for one mailbox.
@@ -101,14 +102,14 @@ func oauth2Bearer(ctx context.Context, clientID, refreshToken string) (string, e
 // refresh token: a bearer token is minted for one resource, and the token
 // endpoint refuses a scope the original grant never asked for. Graph therefore
 // names its scope explicitly, while the IMAP exchange sends none.
-func graphBearer(ctx context.Context, clientID, refreshToken string) (string, error) {
-	return bearerFor(ctx, "graph", clientID, refreshToken)
+func graphBearer(ctx context.Context, clientID, refreshToken string, client *http.Client) (string, error) {
+	return bearerFor(ctx, "graph", clientID, refreshToken, client)
 }
 
 // bearerFor mints (or reuses) one access token. kind separates the two
 // resources in the cache: an IMAP token is not a Graph token, and handing one to
 // the other is a 401 that looks like a bad credential.
-func bearerFor(ctx context.Context, kind, clientID, refreshToken string) (string, error) {
+func bearerFor(ctx context.Context, kind, clientID, refreshToken string, client *http.Client) (string, error) {
 	clientID = strings.TrimSpace(clientID)
 	refreshToken = strings.TrimSpace(refreshToken)
 	if clientID == "" {
@@ -126,7 +127,7 @@ func bearerFor(ctx context.Context, kind, clientID, refreshToken string) (string
 	if ok && time.Now().Add(oauth2RenewBefore).Before(cached.expires) {
 		return cached.value, nil
 	}
-	value, expires, errMint := mintAccessToken(ctx, kind, clientID, refreshToken)
+	value, expires, errMint := mintAccessToken(ctx, kind, clientID, refreshToken, client)
 	if errMint != nil {
 		return "", errMint
 	}
@@ -155,9 +156,9 @@ func bearerFor(ctx context.Context, kind, clientID, refreshToken string) (string
 // The client id goes in the body rather than in a Basic header, because this is
 // a public client: there is no secret to send, and Microsoft reads the id from
 // the form.
-func mintAccessToken(ctx context.Context, kind, clientID, refreshToken string) (string, time.Time, error) {
+func mintAccessToken(ctx context.Context, kind, clientID, refreshToken string, client *http.Client) (string, time.Time, error) {
 	if kind != "graph" {
-		return oauth2AccessToken(ctx, oauth2TokenURL, clientID, refreshToken)
+		return oauth2AccessToken(ctx, oauth2TokenURL, clientID, refreshToken, client)
 	}
 	form := url.Values{}
 	form.Set("client_id", clientID)
@@ -169,7 +170,7 @@ func mintAccessToken(ctx context.Context, kind, clientID, refreshToken string) (
 		return "", time.Time{}, fmt.Errorf("the token request could not be built: %w", errRequest)
 	}
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	response, errDo := graphHTTPClient.Do(request)
+	response, errDo := clientOr(graphHTTPClient, client).Do(request)
 	if errDo != nil {
 		return "", time.Time{}, fmt.Errorf("the token endpoint could not be reached: %w", errDo)
 	}
@@ -211,10 +212,15 @@ func mintAccessToken(ctx context.Context, kind, clientID, refreshToken string) (
 // IMAP.AccessAsUser.All. The client id goes in the body rather than in a Basic
 // header, because this is a public client — there is no secret to send, and
 // Microsoft reads the id from the form.
-func oauth2AccessToken(ctx context.Context, tokenURL, clientID, refreshToken string) (string, time.Time, error) {
+func oauth2AccessToken(ctx context.Context, tokenURL, clientID, refreshToken string, client *http.Client) (string, time.Time, error) {
 	config := oauth2.Config{
 		ClientID: clientID,
 		Endpoint: oauth2.Endpoint{TokenURL: tokenURL, AuthStyle: oauth2.AuthStyleInParams},
+	}
+	// x/oauth2 reads its HTTP client from the context, so the mailbox's exit
+	// travels with the exchange rather than being fixed package-wide.
+	if client != nil {
+		ctx = context.WithValue(ctx, oauth2.HTTPClient, client)
 	}
 	token, errToken := config.TokenSource(ctx, &oauth2.Token{RefreshToken: refreshToken}).Token()
 	if errToken != nil {

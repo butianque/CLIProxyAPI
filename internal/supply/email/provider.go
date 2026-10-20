@@ -50,6 +50,10 @@ type Config struct {
 	// Credential resolves a secret-store entry name to its value. Tests replace
 	// it; nil means the host secret store.
 	Credential func(name string) (string, error)
+
+	// Egress is the supply-wide exit every mailbox uses unless its channel names
+	// one. Empty inherits the process environment.
+	Egress string
 }
 
 // ProviderImpl is the email supply provider.
@@ -556,6 +560,7 @@ func (p *ProviderImpl) targets() ([]Target, error) {
 			Domain:     domain,
 			Usage:      usage,
 			SecretName: secret,
+			Egress:     firstNonEmpty(connection.Egress, p.cfg.Egress),
 		})
 	}
 	return append(targets, p.poolTargets(targets)...), nil
@@ -630,6 +635,7 @@ func (p *ProviderImpl) poolTargets(configured []Target) []Target {
 			ClientID:   box.ClientID,
 			Usage:      "personal",
 			SecretName: secret,
+			Egress:     p.cfg.Egress,
 		})
 	}
 	return targets
@@ -708,8 +714,12 @@ func randomLocalPart() (string, error) {
 }
 
 // ProbeIMAP checks that a mailbox can be opened with an authorization code.
-func ProbeIMAP(ctx context.Context, host, account, password string) (string, error) {
-	return probeMailbox(ctx, Target{Host: host, Account: account, Password: password})
+//
+// egress is the channel's exit; empty means the process environment. The probe
+// is the one call that can prove an exit works, so it has to take the same
+// route the real read will.
+func ProbeIMAP(ctx context.Context, host, account, password, egress string) (string, error) {
+	return probeMailbox(ctx, Target{Host: host, Account: account, Password: password, Egress: egress})
 }
 
 // ProbeOAuth2 checks that a mailbox can be opened with an OAuth2 refresh token.
@@ -717,7 +727,7 @@ func ProbeIMAP(ctx context.Context, host, account, password string) (string, err
 // The token exchange runs here too, so an expired or revoked refresh token is
 // reported as a credential problem — which is what it is — instead of as an
 // unreachable mailbox.
-func ProbeOAuth2(ctx context.Context, host, account, clientID, refreshToken string) (string, error) {
+func ProbeOAuth2(ctx context.Context, host, account, clientID, refreshToken, egress string) (string, error) {
 	if strings.TrimSpace(clientID) == "" {
 		return "", fmt.Errorf("%w: no OAuth2 application id", ErrProbeUnready)
 	}
@@ -727,6 +737,7 @@ func ProbeOAuth2(ctx context.Context, host, account, clientID, refreshToken stri
 		Auth:     AuthOAuth2,
 		ClientID: clientID,
 		Password: refreshToken,
+		Egress:   egress,
 	})
 }
 
@@ -736,7 +747,7 @@ func ProbeOAuth2(ctx context.Context, host, account, clientID, refreshToken stri
 // answer different questions: an IMAP token opens IMAP and is refused by Graph,
 // and a Graph token is the reverse. Reporting one as the other would tell the
 // operator their credential is broken when it is simply the wrong kind.
-func ProbeGraph(ctx context.Context, account, clientID, refreshToken string) (string, error) {
+func ProbeGraph(ctx context.Context, account, clientID, refreshToken, egress string) (string, error) {
 	if strings.TrimSpace(clientID) == "" {
 		return "", fmt.Errorf("%w: no OAuth2 application id", ErrProbeUnready)
 	}
@@ -745,6 +756,7 @@ func ProbeGraph(ctx context.Context, account, clientID, refreshToken string) (st
 		Auth:     AuthGraph,
 		ClientID: clientID,
 		Password: refreshToken,
+		Egress:   egress,
 	})
 }
 

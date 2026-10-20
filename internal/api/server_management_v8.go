@@ -87,6 +87,10 @@ func (s *Server) registerManagementV8Routes() {
 	v8.DELETE("/secrets/:name", s.mgmt.DeleteSecret)
 
 	v8.GET("/supply/status", s.mgmt.GetSupplyStatus)
+	// The one call that proves an exit is what it claims: an echo service asked
+	// from the far side. Omitting the URL probes the exit supply traffic uses.
+	v8.POST("/egress/probe", s.mgmt.PostEgressProbe)
+
 	// The cross-kind identity pool: which identity is behind a credential,
 	// and which platform it registered on. It is also the pool view: ?kind=
 	// narrows it to one kind's handed-out identities.

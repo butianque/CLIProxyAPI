@@ -8,6 +8,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/supply"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
 )
 
 // This file is the channel surface: the configured sources of identities.
@@ -55,6 +56,11 @@ func connectionView(nature supply.Nature, conn supply.Connection, secretNames []
 	// The application id is not a secret: the refresh token in the store is.
 	if conn.ClientID != "" {
 		view["client_id"] = conn.ClientID
+	}
+	// The egress is a proxy URL, so it is redacted: it can carry a password,
+	// and this view is read by anyone who can open the panel.
+	if conn.Egress != "" {
+		view["egress"] = proxyutil.Redact(conn.Egress)
 	}
 	return view
 }
@@ -203,6 +209,11 @@ func (h *Handler) PostSupplyChannel(c *gin.Context) {
 		Phone:    phone,
 		Email:    toKindConfig(body.Email),
 	}
+	// An exit is a proxy URL, so the panel only ever reads it back redacted and
+	// cannot send the original value again. Treat an omitted exit as "keep the
+	// stored one" — the same rule the credential fields already follow — so
+	// editing a channel from the panel cannot silently drop a per-channel exit.
+	h.keepStoredEgress(store, &channel)
 	saved, errSave := store.Upsert(channel, time.Now().Unix())
 	if errSave != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": errSave.Error()})
@@ -213,6 +224,45 @@ func (h *Handler) PostSupplyChannel(c *gin.Context) {
 		"status":  "ok",
 		"channel": channelView(saved, status.Names, status.Enabled, pooledCounts([]supply.Channel{saved})),
 	})
+}
+
+// keepStoredEgress carries a channel's existing per-connection exits onto a
+// submission that leaves them out.
+//
+// The reason is a read/write asymmetry: an exit is a proxy URL and may carry a
+// password, so it is redacted on read, which means a client that just renders
+// and re-submits what it was given can never echo the real value. Without this,
+// every panel edit would erase a per-channel exit. An omitted exit therefore
+// means "unchanged"; clearing one is an edit of the channel document.
+func (h *Handler) keepStoredEgress(store *supply.ChannelStore, channel *supply.Channel) {
+	if store == nil || channel == nil || channel.ID == "" {
+		return
+	}
+	existing, ok := store.Get(channel.ID)
+	if !ok {
+		return
+	}
+	for _, kind := range []*supply.KindConfig{channel.Phone, channel.Email} {
+		if kind == nil {
+			continue
+		}
+		previous := existing.Phone
+		if kind == channel.Email {
+			previous = existing.Email
+		}
+		if previous == nil {
+			continue
+		}
+		for nature, conn := range kind.Connections {
+			if strings.TrimSpace(conn.Egress) != "" {
+				continue
+			}
+			if stored, ok := previous.Connections[nature]; ok && strings.TrimSpace(stored.Egress) != "" {
+				conn.Egress = stored.Egress
+				kind.Connections[nature] = conn
+			}
+		}
+	}
 }
 
 // stampPhoneCredentialNames names the phone kind's single platform credential on
@@ -283,6 +333,7 @@ type connectionBody struct {
 	Usage    string `json:"usage"`
 	Domain   string `json:"domain"`
 	ClientID string `json:"client_id"`
+	Egress   string `json:"egress"`
 }
 
 func toKindConfig(body *kindConfigBody) *supply.KindConfig {
@@ -303,6 +354,7 @@ func toKindConfig(body *kindConfigBody) *supply.KindConfig {
 			Usage:    cb.Usage,
 			Domain:   cb.Domain,
 			ClientID: cb.ClientID,
+			Egress:   cb.Egress,
 		}
 	}
 	return &supply.KindConfig{

@@ -39,8 +39,15 @@ var ErrProbeUnready = errors.New("sms: probe credential is not ready")
 //
 // The detail is English, like every other string this management surface emits;
 // the panel is what localizes it.
-func ProbeAPI(ctx context.Context, endpoint, credential string) (string, error) {
-	return probeAPI(ctx, nil, endpoint, credential)
+//
+// egress is the channel's exit; empty means the process environment. The probe
+// is what proves an exit works, so it has to take the same route a rental will.
+func ProbeAPI(ctx context.Context, endpoint, credential, egress string) (string, error) {
+	client, errClient := clientForEgress(egress)
+	if errClient != nil {
+		return "", probeNotReady(errClient)
+	}
+	return probeAPI(ctx, client, endpoint, credential)
 }
 
 // probeAPI is ProbeAPI with an explicit HTTP client, so a test can point it at
@@ -71,8 +78,12 @@ func probeAPI(ctx context.Context, client *http.Client, endpoint, credential str
 // The endpoint is the channel's own web address when it has one. Unlike the API
 // surface, the web surface authenticates with the session cookie alone, so a
 // cookie-only credential is a usable one.
-func ProbeWeb(ctx context.Context, endpoint, credential string) (string, error) {
-	return probeWeb(ctx, nil, endpoint, credential)
+func ProbeWeb(ctx context.Context, endpoint, credential, egress string) (string, error) {
+	client, errClient := clientForEgress(egress)
+	if errClient != nil {
+		return "", probeNotReady(errClient)
+	}
+	return probeWeb(ctx, client, endpoint, credential)
 }
 
 // probeWeb is ProbeWeb with an explicit HTTP client, so a test can point it at

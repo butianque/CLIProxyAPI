@@ -425,6 +425,51 @@ func TestSupplyChannelLeavesEmailConnectionsAlone(t *testing.T) {
 	}
 }
 
+// A per-connection exit survives an edit that does not mention it.
+//
+// The asymmetry is the reason: an exit is a proxy URL and may carry a password,
+// so it is redacted on read, which means the panel can never send the original
+// value back. Without this rule every edit made from the panel would erase it.
+func TestSupplyChannelKeepsOmittedEgress(t *testing.T) {
+	h, r := setupChannelTest(t)
+
+	const egress = "http://pxuser:pxpass@127.0.0.1:8899"
+	id := createChannel(t, r, `{"label":"Exit","category":"self-built","email":{"enabled":true,"natures":["imap"],"connections":{"imap":{"account":"box@example.com","domain":"ormnes.com","egress":"`+egress+`"}}}}`)
+	if got := storedChannel(t, h, id).Email.Connections[supply.NatureIMAP].Egress; got != egress {
+		t.Fatalf("stored egress = %q, want the submitted value", got)
+	}
+
+	// The panel reads the exit redacted, so its next submission leaves the field
+	// out entirely.
+	body := `{"id":"` + id + `","label":"Renamed","category":"self-built","email":{"enabled":true,"natures":["imap"],"connections":{"imap":{"account":"box@example.com","domain":"ormnes.com"}}}}`
+	req := httptest.NewRequest(http.MethodPost, "/supply/channels", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("POST: %d %s", rr.Code, rr.Body.String())
+	}
+
+	kept := storedChannel(t, h, id)
+	if kept.Label != "Renamed" {
+		t.Fatalf("label = %q, want the edit to apply", kept.Label)
+	}
+	if got := kept.Email.Connections[supply.NatureIMAP].Egress; got != egress {
+		t.Fatalf("omitted egress erased the stored one: %q", got)
+	}
+
+	// A read reports it redacted, never the password.
+	req = httptest.NewRequest(http.MethodGet, "/supply/channels", nil)
+	rr = httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+	if strings.Contains(rr.Body.String(), "pxpass") {
+		t.Fatal("the channel list echoed the proxy password")
+	}
+	if !strings.Contains(rr.Body.String(), "redacted") {
+		t.Fatal("the channel list does not show the configured exit at all")
+	}
+}
+
 // The stamped name is the configured one, not the built-in default: an install
 // that names its phone credentials differently must get those names.
 func TestSupplyChannelStampsConfiguredCredentialNames(t *testing.T) {

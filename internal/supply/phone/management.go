@@ -78,7 +78,7 @@ func (p *ProviderImpl) Blacklist(ctx context.Context, phone string) error {
 // password, solving its click-order captcha, and returns the session cookie and
 // the number of channels it can now see. The caller persists the cookie.
 func (p *ProviderImpl) WebLogin(ctx context.Context, user, pass string) (string, int, error) {
-	provider, errProvider := NewHaozhuma(p.secret, nil)
+	provider, errProvider := NewHaozhuma(p.secret, p.http)
 	if errProvider != nil {
 		return "", 0, errProvider
 	}

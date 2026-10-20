@@ -63,6 +63,10 @@ type graphSession struct {
 	refresh  string
 	token    string
 
+	// http is the mailbox's exit. Graph holds no connection of its own, so this
+	// is the only thing that decides where the reads come from.
+	http *http.Client
+
 	// folders maps a lowercased display name to the folder id Graph wants in the
 	// path. It is filled on first use: a scan asks for two folders, and listing
 	// them once is cheaper than resolving each name with its own request.
@@ -85,7 +89,11 @@ func dialGraphSession(ctx context.Context, target Target) (Session, error) {
 	if strings.TrimSpace(target.Password) == "" {
 		return nil, fmt.Errorf("%w: no mailbox credential", ErrProbeUnready)
 	}
-	token, errToken := graphBearer(ctx, target.ClientID, target.Password)
+	client, errClient := clientForEgress(target.Egress)
+	if errClient != nil {
+		return nil, fmt.Errorf("%w: %v", ErrProbeUnready, errClient)
+	}
+	token, errToken := graphBearer(ctx, target.ClientID, target.Password, client)
 	if errToken != nil {
 		return nil, fmt.Errorf("%w: %v", ErrLoginRejected, errToken)
 	}
@@ -94,6 +102,7 @@ func dialGraphSession(ctx context.Context, target Target) (Session, error) {
 		clientID: target.ClientID,
 		refresh:  target.Password,
 		token:    token,
+		http:     client,
 	}, nil
 }
 
@@ -215,7 +224,7 @@ func (s *graphSession) get(ctx context.Context, address string, into any) error 
 		// after the fact would throw away exactly the whitespace that separates a
 		// code from the words around it.
 		request.Header.Set("Prefer", `outlook.body-content-type="text"`)
-		response, errDo := graphHTTPClient.Do(request)
+		response, errDo := clientOr(graphHTTPClient, s.http).Do(request)
 		if errDo != nil {
 			return fmt.Errorf("email: Graph could not be reached: %w", errDo)
 		}
@@ -225,7 +234,7 @@ func (s *graphSession) get(ctx context.Context, address string, into any) error 
 			return fmt.Errorf("email: the Graph answer could not be read: %w", errRead)
 		}
 		if response.StatusCode == http.StatusUnauthorized && attempt == 0 {
-			token, errToken := graphBearer(ctx, s.clientID, s.refresh)
+			token, errToken := graphBearer(ctx, s.clientID, s.refresh, s.http)
 			if errToken != nil {
 				return fmt.Errorf("%w: %v", ErrLoginRejected, errToken)
 			}

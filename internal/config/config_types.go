@@ -296,6 +296,21 @@ type SupplyConfig struct {
 	// channel cache). Empty means "<config dir>/supply".
 	StorageDir string `yaml:"storage-dir" json:"storage-dir"`
 
+	// Egress is the proxy every supply connection exits through: the IMAP and
+	// Graph reads that fetch a verification mail, and the platform calls that
+	// rent a number. A channel may override it per connection.
+	//
+	// This exists because a supply identity and the account it registers are
+	// judged together: renting a number or reading a mailbox from one address
+	// while the signup itself comes from another is the pattern fraud scoring
+	// looks for.
+	//
+	// Empty inherits requests.proxy-url, so an installation that already routes
+	// its traffic through one address does not configure a second one; when that
+	// is empty too, the process environment applies ("direct" forces a bypass).
+	// Set it only to give supply traffic a different address than model traffic.
+	Egress string `yaml:"egress" json:"egress"`
+
 	// Phone configures the phone supply kind.
 	Phone SupplyPhoneConfig `yaml:"phone" json:"phone"`
 
