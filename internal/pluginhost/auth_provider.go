@@ -25,7 +25,7 @@ func (h *Host) hostConfigSummaryLocked() pluginapi.HostConfigSummary {
 	cfg := h.runtimeConfig
 	return pluginapi.HostConfigSummary{
 		AuthDir:          strings.TrimSpace(cfg.AuthDir),
-		ProxyURL:         cfg.EffectiveProxyURL(),
+		ProxyURL:         strings.TrimSpace(cfg.ProxyURL),
 		ForceModelPrefix: cfg.ForceModelPrefix,
 		OAuthModelAlias:  pluginOAuthModelAliases(cfg.OAuthModelAlias),
 		ExcludedModels:   cloneStringSliceMap(cfg.OAuthExcludedModels),

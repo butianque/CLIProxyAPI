@@ -96,11 +96,6 @@ func (s *Server) registerManagementV8Routes() {
 	// bound to it moves together.
 	v8.GET("/egress/pool", s.mgmt.GetEgressPool)
 	v8.POST("/egress/pool", s.mgmt.PostEgressPool)
-	// Which exit everything leaves through. One address in force, chosen here.
-	v8.POST("/egress/pool/default", s.mgmt.PostEgressPoolDefault)
-	// Folding a hand-written proxy address into the list, so it stops being a
-	// second record of an exit the list already owns.
-	v8.POST("/egress/pool/import", s.mgmt.PostEgressPoolImport)
 	// Which exit a new identity would be given right now.
 	v8.POST("/egress/pool/next", s.mgmt.PostEgressPoolNext)
 	v8.PATCH("/egress/pool/:id", s.mgmt.PatchEgressPool)

@@ -22,7 +22,7 @@ import (
 // It answers two questions and nothing else:
 //
 //   - which exit is #n, and does it work (last probe)
-//   - what is bound to #n (accounts, channels, the supply-wide exit)
+//   - what is bound to #n (accounts and channels)
 //
 // Bindings are counted from where they actually live rather than stored here.
 // A copy in the pool would be a second source of truth that goes stale as soon
@@ -105,13 +105,6 @@ type egressMember struct {
 // egressBindingIndex is every binding found in one scan.
 type egressBindingIndex struct {
 	Refs []egressRef
-	// GlobalRef is the process-wide exit: the pool entry the pool designates as
-	// default, or a hand-typed address when no default is set. Empty means the
-	// process leaves directly.
-	GlobalRef string
-	// GlobalSource is "pool" when GlobalRef is a pool id, "custom" when it is a
-	// hand-typed address, and empty when there is no process-wide exit.
-	GlobalSource string
 }
 
 // egressBindings scans every place an exit can be named.
@@ -123,24 +116,6 @@ func (h *Handler) egressBindings() egressBindingIndex {
 	index := egressBindingIndex{}
 	index.Refs = append(index.Refs, h.accountEgressRefs()...)
 	index.Refs = append(index.Refs, h.channelEgressRefs()...)
-	if h.cfg == nil {
-		return index
-	}
-	// The process-wide exit is the pool's default. It is read from the pool
-	// rather than from the config file because the pool owns the address, and a
-	// config document that still carries an older address must not be reported
-	// as the exit in force.
-	if pool, errPool := h.egressPool(); errPool == nil {
-		if id := pool.DefaultID(); id > 0 {
-			index.GlobalRef = strconv.Itoa(id)
-			index.GlobalSource = "pool"
-			return index
-		}
-	}
-	if typed := strings.TrimSpace(h.cfg.ProxyURL); typed != "" && typed != supply.UnresolvedEgress {
-		index.GlobalRef = typed
-		index.GlobalSource = "custom"
-	}
 	return index
 }
 
@@ -264,17 +239,15 @@ func sameEgress(ref, url string) bool {
 }
 
 // membersFor collects what is bound to one entry.
-func (index egressBindingIndex) membersFor(entry supply.EgressEntry) (members []egressMember, globalBound bool) {
+func (index egressBindingIndex) membersFor(entry supply.EgressEntry) []egressMember {
 	id := strconv.Itoa(entry.ID)
+	var members []egressMember
 	for _, ref := range index.Refs {
 		if ref.Ref == id || sameEgress(ref.Ref, entry.URL) {
 			members = append(members, ref.Member)
 		}
 	}
-	if index.GlobalRef != "" && (index.GlobalRef == id || sameEgress(index.GlobalRef, entry.URL)) {
-		globalBound = true
-	}
-	return members, globalBound
+	return members
 }
 
 // countsFor returns how many identities each entry holds, which is what the
@@ -282,21 +255,13 @@ func (index egressBindingIndex) membersFor(entry supply.EgressEntry) (members []
 func (index egressBindingIndex) countsFor(entries []supply.EgressEntry) map[int]int {
 	counts := make(map[int]int, len(entries))
 	for _, entry := range entries {
-		members, globalBound := index.membersFor(entry)
-		count := len(members)
-		if globalBound {
-			count++
-		}
-		counts[entry.ID] = count
+		counts[entry.ID] = len(index.membersFor(entry))
 	}
 	return counts
 }
 
 // egressEntryView renders one entry: never the password, only the address shape.
-//
-// isDefault marks the exit the whole process leaves through. It is passed in
-// rather than read here so a list of entries costs one pool read, not one each.
-func egressEntryView(entry supply.EgressEntry, isDefault bool) gin.H {
+func egressEntryView(entry supply.EgressEntry) gin.H {
 	view := gin.H{
 		"id":      entry.ID,
 		"url":     proxyutil.Redact(entry.URL),
@@ -304,7 +269,6 @@ func egressEntryView(entry supply.EgressEntry, isDefault bool) gin.H {
 		"note":    entry.Note,
 		"enabled": entry.Enabled,
 		"created": entry.Created,
-		"default": isDefault,
 	}
 	if entry.LastProbe != nil {
 		view["last_probe"] = gin.H{
@@ -323,15 +287,6 @@ func egressEntryView(entry supply.EgressEntry, isDefault bool) gin.H {
 	return view
 }
 
-// egressDefaultID is the pool's designated default, zero when none is set.
-func (h *Handler) egressDefaultID() int {
-	pool, errPool := h.egressPool()
-	if errPool != nil {
-		return 0
-	}
-	return pool.DefaultID()
-}
-
 // GetEgressPool lists the pool with its binding counts.
 func (h *Handler) GetEgressPool(c *gin.Context) {
 	pool, errPool := h.egressPool()
@@ -342,38 +297,22 @@ func (h *Handler) GetEgressPool(c *gin.Context) {
 	entries := pool.List()
 	index := h.egressBindings()
 	counts := index.countsFor(entries)
-	defaultID := pool.DefaultID()
 
 	out := make([]gin.H, 0, len(entries))
 	for _, entry := range entries {
-		view := egressEntryView(entry, entry.ID == defaultID)
-		members, globalBound := index.membersFor(entry)
+		view := egressEntryView(entry)
+		members := index.membersFor(entry)
 		byKind := map[string]int{}
 		for _, member := range members {
 			byKind[member.Kind]++
-		}
-		if globalBound {
-			byKind["global"] = 1
 		}
 		view["counts"] = byKind
 		view["total"] = counts[entry.ID]
 		out = append(out, view)
 	}
-	// The global block is what the panel needs to answer "where does everything
-	// leave from" without scanning the entries itself: an id when the pool
-	// designates one, a redacted address when the installation still spells it
-	// out by hand, and neither when the process leaves directly.
-	global := gin.H{"source": index.GlobalSource}
-	if defaultID > 0 {
-		global["default_id"] = defaultID
-	}
-	if address := strings.TrimSpace(h.cfg.ProxyURL); address != "" && address != supply.UnresolvedEgress {
-		global["address"] = proxyutil.Redact(address)
-	}
 	c.JSON(http.StatusOK, gin.H{
 		"status":  "ok",
 		"entries": out,
-		"global":  global,
 	})
 }
 
@@ -398,7 +337,7 @@ func (h *Handler) PostEgressPool(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": errAdd.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "entry": egressEntryView(entry, false)})
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "entry": egressEntryView(entry)})
 }
 
 // egressEntryWithCounts renders one entry plus what is bound to it.
@@ -407,17 +346,14 @@ func (h *Handler) PostEgressPool(c *gin.Context) {
 // scan instead, because rescanning the auth directory per entry would make the
 // pool page cost grow with the number of exits.
 func (h *Handler) egressEntryWithCounts(entry supply.EgressEntry) gin.H {
-	view := egressEntryView(entry, entry.ID == h.egressDefaultID())
-	members, globalBound := h.egressBindings().membersFor(entry)
+	view := egressEntryView(entry)
+	members := h.egressBindings().membersFor(entry)
 	byKind := map[string]int{}
 	for _, member := range members {
 		byKind[member.Kind]++
 	}
-	if globalBound {
-		byKind["global"] = 1
-	}
 	view["counts"] = byKind
-	view["total"] = len(members) + boolToInt(globalBound)
+	view["total"] = len(members)
 	return view
 }
 
@@ -493,8 +429,8 @@ func (h *Handler) DeleteEgressPool(c *gin.Context) {
 		return
 	}
 	index := h.egressBindings()
-	members, globalBound := index.membersFor(entry)
-	if total := len(members) + boolToInt(globalBound); total > 0 {
+	members := index.membersFor(entry)
+	if total := len(members); total > 0 {
 		c.JSON(http.StatusConflict, gin.H{
 			"status": "error",
 			"error":  "this exit still has identities bound to it; move or unbind them first",
@@ -565,7 +501,7 @@ func (h *Handler) PostEgressPoolProbe(c *gin.Context) {
 		return
 	}
 
-	view := egressEntryView(recorded, recorded.ID == h.egressDefaultID())
+	view := egressEntryView(recorded)
 	view["via"] = service
 	if errProbe != nil {
 		// No echo service confirmed an address. That is not the same as the exit
@@ -593,104 +529,15 @@ func (h *Handler) GetEgressPoolMembers(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"status": "error", "error": "no such exit"})
 		return
 	}
-	members, globalBound := h.egressBindings().membersFor(entry)
+	members := h.egressBindings().membersFor(entry)
 	if members == nil {
 		members = []egressMember{}
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"status":  "ok",
-		"entry":   egressEntryView(entry, entry.ID == pool.DefaultID()),
+		"entry":   egressEntryView(entry),
 		"members": members,
-		"global":  globalBound,
 	})
-}
-
-// PostEgressPoolDefault makes one exit the process-wide default, or clears it
-// when id is zero.
-//
-// This is the whole "one place" promise: with a default set, every request
-// leaves through that address, and replacing the address later is one edit in
-// the pool rather than one edit per consumer. With no default the installation
-// keeps whatever address the config file spells out, which is what an
-// installation that never opened the pool has.
-func (h *Handler) PostEgressPoolDefault(c *gin.Context) {
-	var body struct {
-		ID int `json:"id"`
-	}
-	if errBind := c.ShouldBindJSON(&body); errBind != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid JSON body"})
-		return
-	}
-	pool, errPool := h.egressPool()
-	if errPool != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": errPool.Error()})
-		return
-	}
-	if errSet := pool.SetDefault(body.ID); errSet != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": errSet.Error()})
-		return
-	}
-	// The new default is in force from the next request on; no reload needed.
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "default_id": body.ID})
-}
-
-// PostEgressPoolImport moves the hand-written proxy address into the pool.
-//
-// An installation that predates the pool spells its exit out in the config file.
-// That address is a real exit, so folding it in is one step: take it into the
-// list, make it the default, and clear the file's copy. The address then has one
-// home, and replacing it later is one edit in the list rather than an edit in a
-// file nobody opens.
-func (h *Handler) PostEgressPoolImport(c *gin.Context) {
-	if h == nil || h.cfg == nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "no config loaded"})
-		return
-	}
-	typed := strings.TrimSpace(h.cfg.ProxyURL)
-	if typed == "" || typed == supply.UnresolvedEgress {
-		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "there is no hand-written address to move"})
-		return
-	}
-	normalized, errURL := supply.NormalizeEgressURL(typed)
-	if errURL != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": errURL.Error()})
-		return
-	}
-	pool, errPool := h.egressPool()
-	if errPool != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": errPool.Error()})
-		return
-	}
-	// The same address already in the list is the same exit. Point at that row
-	// instead of adding a second one that says nothing new.
-	target := 0
-	for _, entry := range pool.List() {
-		if entry.URL == normalized {
-			target = entry.ID
-			break
-		}
-	}
-	if target == 0 {
-		entry, errAdd := pool.Add(normalized, "", "")
-		if errAdd != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": errAdd.Error()})
-			return
-		}
-		target = entry.ID
-	}
-	if errSet := pool.SetDefault(target); errSet != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": errSet.Error()})
-		return
-	}
-	// Clear the file's copy so one exit does not end up recorded twice. The pool
-	// already owns the address in force, so a failed save leaves traffic correct
-	// and only the stale copy behind.
-	h.mu.Lock()
-	h.cfg.ProxyURL = ""
-	h.mu.Unlock()
-	// persist answers the request itself. The caller re-reads the list to pick up
-	// the new entry, which is where the exit is now visible.
-	h.persist(c)
 }
 
 // PostEgressPoolNext reports which exit a new identity would be given right now.
@@ -710,7 +557,7 @@ func (h *Handler) PostEgressPoolNext(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok", "entry": nil})
 		return
 	}
-	view := egressEntryView(next, next.ID == pool.DefaultID())
+	view := egressEntryView(next)
 	view["total"] = index.countsFor(entries)[next.ID]
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "entry": view})
 }
@@ -723,11 +570,4 @@ func egressPathID(c *gin.Context) (int, error) {
 		return 0, errNoEgressID
 	}
 	return id, nil
-}
-
-func boolToInt(value bool) int {
-	if value {
-		return 1
-	}
-	return 0
 }

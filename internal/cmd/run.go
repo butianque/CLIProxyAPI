@@ -117,10 +117,6 @@ func startSealRotation(store *secretstore.Store) {
 // unconfigured kind is the honest state, and the management surface reports it
 // as such.
 func initSupply(cfg *config.Config, configPath string) {
-	// Install the process-wide exit before anything is built: every consumer
-	// asks EffectiveProxyURL, and that is what makes "one exit, one edit" true
-	// without touching those call sites.
-	installGlobalEgress(cfg, configPath)
 	installSupply(cfg, configPath)
 	management.SetSupplyReloader(func() { installSupply(cfg, configPath) })
 	// Credentials name their exit by pool id, and this is where the pool lives,
@@ -214,21 +210,7 @@ func supplyEgress(cfg *config.Config) string {
 	if cfg == nil {
 		return ""
 	}
-	return cfg.EffectiveProxyURL()
-}
-
-// installGlobalEgress points the process at the exit the pool designates.
-//
-// The resolver is installed once rather than resolved once: the pool's default
-// can change while the server runs (that is the point of it), and every consumer
-// asks EffectiveProxyURL on its own request. Nothing has to be re-applied, and a
-// stale copy can never outlive the edit.
-func installGlobalEgress(cfg *config.Config, configPath string) {
-	if cfg == nil {
-		return
-	}
-	poolPath := supply.EgressPoolPath(supplyStateDir(cfg, configPath))
-	config.SetEgressDefaultResolver(func() (string, bool) { return supply.GlobalEgress(poolPath) })
+	return strings.TrimSpace(cfg.ProxyURL)
 }
 
 // loadSupplyPool reads the cross-kind identity pool.

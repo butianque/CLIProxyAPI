@@ -483,7 +483,7 @@ func antigravityProxyURL(ctx context.Context, cfg *config.Config, auth *cliproxy
 		}
 	}
 	if cfg != nil {
-		return cfg.EffectiveProxyURL()
+		return strings.TrimSpace(cfg.ProxyURL)
 	}
 	return ""
 }

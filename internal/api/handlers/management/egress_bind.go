@@ -66,7 +66,7 @@ func (h *Handler) PostEgressPoolBind(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": errApply.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "bound": bound, "exit": egressEntryView(entry, entry.ID == h.egressDefaultID())})
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "bound": bound, "exit": egressEntryView(entry)})
 }
 
 // PostEgressPoolUnbind releases one target from whatever exit it names.

@@ -68,14 +68,14 @@ type egressEcho struct {
 
 // supplyExit is the address supply traffic leaves through.
 //
-// Supply has no exit of its own: it inherits the process-wide one, which was
-// already resolved from the pool when the server started. Reporting anything
-// else here would make the panel describe an exit the server never uses.
+// Supply has no exit of its own: it inherits the process-wide one. Reporting
+// anything else here would make the panel describe an exit the server never
+// uses.
 func (h *Handler) supplyExit() string {
 	if h == nil || h.cfg == nil {
 		return ""
 	}
-	return h.cfg.EffectiveProxyURL()
+	return strings.TrimSpace(h.cfg.ProxyURL)
 }
 
 // describeEgress turns a configured value into what the panel shows.

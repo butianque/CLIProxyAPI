@@ -37,7 +37,7 @@ func NewXAIAuthWithProxyURL(cfg *config.Config, proxyURL string) *XAIAuth {
 	if cfg != nil {
 		sdkCfg = cfg.SDKConfig
 		if effectiveProxyURL == "" {
-			effectiveProxyURL = cfg.EffectiveProxyURL()
+			effectiveProxyURL = strings.TrimSpace(cfg.ProxyURL)
 		}
 	}
 	sdkCfg.ProxyURL = effectiveProxyURL

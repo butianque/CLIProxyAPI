@@ -134,7 +134,7 @@ func effectiveProxyURL(ctx context.Context, cfg *config.Config, auth *cliproxyau
 		}
 	}
 	if cfg != nil {
-		return cfg.EffectiveProxyURL()
+		return strings.TrimSpace(cfg.ProxyURL)
 	}
 	return ""
 }

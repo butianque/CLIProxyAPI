@@ -45,8 +45,6 @@ func setupEgressPool(t *testing.T) egressPoolFixture {
 	r := gin.New()
 	r.GET("/egress/pool", h.GetEgressPool)
 	r.POST("/egress/pool", h.PostEgressPool)
-	r.POST("/egress/pool/default", h.PostEgressPoolDefault)
-	r.POST("/egress/pool/import", h.PostEgressPoolImport)
 	r.POST("/egress/pool/next", h.PostEgressPoolNext)
 	r.PATCH("/egress/pool/:id", h.PatchEgressPool)
 	r.DELETE("/egress/pool/:id", h.DeleteEgressPool)
@@ -109,85 +107,6 @@ func (f egressPoolFixture) stored(t *testing.T) supply.EgressPoolDocument {
 
 const testEgressURL = "socks5://probeuser:probeSecret@10.0.0.1:1080"
 
-// TestEgressPoolImportMovesTheHandWrittenAddressIntoTheList pins that folding a
-// pre-pool installation in leaves the exit recorded in exactly one place: the
-// list owns the address, and the config file stops spelling it out.
-func TestEgressPoolImportMovesTheHandWrittenAddressIntoTheList(t *testing.T) {
-	f := setupEgressPool(t)
-	f.handler.cfg.ProxyURL = testEgressURL
-
-	status, out := f.do(t, http.MethodPost, "/egress/pool/import", "")
-	if status != http.StatusOK {
-		t.Fatalf("POST /egress/pool/import = %d %v", status, out)
-	}
-	if got := f.handler.cfg.ProxyURL; got != "" {
-		t.Fatalf("cfg.ProxyURL = %q, want it cleared so the address has one home", got)
-	}
-
-	status, out = f.do(t, http.MethodGet, "/egress/pool", "")
-	if status != http.StatusOK {
-		t.Fatalf("GET /egress/pool = %d %v", status, out)
-	}
-	entries, _ := out["entries"].([]any)
-	if len(entries) != 1 {
-		t.Fatalf("entries = %v, want the moved address as the only one", entries)
-	}
-	entry, _ := entries[0].(map[string]any)
-	if entry["default"] != true {
-		t.Fatalf("entry default = %v, want the moved address to be the exit in force", entry["default"])
-	}
-	if shown, _ := entry["url"].(string); strings.Contains(shown, "probeSecret") {
-		t.Fatalf("entry url = %q, want the password redacted", shown)
-	}
-	global, _ := out["global"].(map[string]any)
-	if global["source"] != "pool" || global["default_id"] != float64(1) {
-		t.Fatalf("global = %v, want the moved address as the pool default", global)
-	}
-
-	// The file must not keep a second copy of the address, password included.
-	raw, err := os.ReadFile(f.handler.configFilePath)
-	if err != nil {
-		t.Fatalf("read config: %v", err)
-	}
-	if strings.Contains(string(raw), "probeSecret") {
-		t.Fatalf("config file still carries the address:\n%s", raw)
-	}
-
-	// Nothing left to move the second time.
-	if status, _ := f.do(t, http.MethodPost, "/egress/pool/import", ""); status != http.StatusBadRequest {
-		t.Fatalf("second import = %d, want 400 because the address is already in the list", status)
-	}
-}
-
-// TestEgressPoolImportReusesTheRowItAlreadyHas pins that moving an address the
-// list already holds points at that row instead of adding a twin: two rows with
-// one address would make "which one is bound" ambiguous.
-func TestEgressPoolImportReusesTheRowItAlreadyHas(t *testing.T) {
-	f := setupEgressPool(t)
-	existing := f.add(t, `{"url":"`+testEgressURL+`","label":"香港 #1"}`)
-	f.handler.cfg.ProxyURL = testEgressURL
-
-	if status, out := f.do(t, http.MethodPost, "/egress/pool/import", ""); status != http.StatusOK {
-		t.Fatalf("POST /egress/pool/import = %d %v", status, out)
-	}
-	if got := f.handler.cfg.ProxyURL; got != "" {
-		t.Fatalf("cfg.ProxyURL = %q, want it cleared", got)
-	}
-
-	status, out := f.do(t, http.MethodGet, "/egress/pool", "")
-	if status != http.StatusOK {
-		t.Fatalf("GET /egress/pool = %d %v", status, out)
-	}
-	entries, _ := out["entries"].([]any)
-	if len(entries) != 1 {
-		t.Fatalf("entries = %v, want the address to stay one row", entries)
-	}
-	global, _ := out["global"].(map[string]any)
-	if global["source"] != "pool" || global["default_id"] != float64(existing) {
-		t.Fatalf("global = %v, want the existing row #%d as the default", global, existing)
-	}
-}
-
 // TestEgressPoolStartsEmpty pins that a fresh installation reports an empty
 // list rather than a missing field: "nothing configured" is an answer.
 func TestEgressPoolStartsEmpty(t *testing.T) {
@@ -202,10 +121,6 @@ func TestEgressPoolStartsEmpty(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("empty pool listed %d entries", len(entries))
-	}
-	supplyView, _ := out["supply"].(map[string]any)
-	if bound, _ := supplyView["bound"].(bool); bound {
-		t.Fatal("an unconfigured supply exit was reported as bound")
 	}
 }
 
@@ -321,75 +236,10 @@ func TestEgressPoolCountsBindings(t *testing.T) {
 	if len(members) != 3 {
 		t.Fatalf("members = %v, want three", members)
 	}
-}
 
-// TestEgressPoolCountsTheDefaultExit pins that the process-wide exit is a
-// binding too, and that it is named by id rather than by the address a resolved
-// copy would suggest.
-func TestEgressPoolCountsTheDefaultExit(t *testing.T) {
-	f := setupEgressPool(t)
-	id := f.add(t, `{"url":"`+testEgressURL+`","label":"香港 #1"}`)
-
-	status, out := f.do(t, http.MethodPost, "/egress/pool/default", `{"id":`+itoa(id)+`}`)
-	if status != http.StatusOK {
-		t.Fatalf("POST /egress/pool/default = %d %v", status, out)
-	}
-	// The handler does not copy the address anywhere: consumers ask for it on
-	// each request, so the config file keeps only what the operator wrote.
-	if got := f.handler.cfg.ProxyURL; got != "" {
-		t.Fatalf("cfg.ProxyURL = %q, want it untouched", got)
-	}
-
-	status, out = f.do(t, http.MethodGet, "/egress/pool", "")
-	if status != http.StatusOK {
-		t.Fatalf("GET /egress/pool = %d", status)
-	}
-	global, _ := out["global"].(map[string]any)
-	if got, _ := global["default_id"].(float64); int(got) != id {
-		t.Fatalf("global.default_id = %v, want %d", global["default_id"], id)
-	}
-	entry, _ := out["entries"].([]any)[0].(map[string]any)
-	if isDefault, _ := entry["default"].(bool); !isDefault {
-		t.Fatal("the default exit was not marked as the default")
-	}
-	counts, _ := entry["counts"].(map[string]any)
-	if got, _ := counts["global"].(float64); int(got) != 1 {
-		t.Fatalf("global = %v, want 1", counts["global"])
-	}
-
-	status, _ = f.do(t, http.MethodDelete, "/egress/pool/"+itoa(id), "")
-	if status != http.StatusConflict {
-		t.Fatalf("DELETE of the default exit = %d, want 409", status)
-	}
-}
-
-// TestEgressPoolReportsAHandWrittenExit pins that an installation which still
-// spells its address out in config.yaml is not reported as "direct": the address
-// is shown, as a custom exit rather than a pool one.
-func TestEgressPoolReportsAHandWrittenExit(t *testing.T) {
-	f := setupEgressPool(t)
-	id := f.add(t, `{"url":"`+testEgressURL+`","label":"香港 #1"}`)
-	f.handler.cfg.ProxyURL = testEgressURL
-
-	status, out := f.do(t, http.MethodGet, "/egress/pool", "")
-	if status != http.StatusOK {
-		t.Fatalf("GET /egress/pool = %d", status)
-	}
-	global, _ := out["global"].(map[string]any)
-	if source, _ := global["source"].(string); source != "custom" {
-		t.Fatalf("global.source = %v, want custom", global["source"])
-	}
-	if address, _ := global["address"].(string); address == "" {
-		t.Fatal("the hand-written address was not reported")
-	}
-	entry, _ := out["entries"].([]any)[0].(map[string]any)
-	counts, _ := entry["counts"].(map[string]any)
-	if got, _ := counts["global"].(float64); int(got) != 1 {
-		t.Fatalf("global = %v, want 1", counts["global"])
-	}
-
-	// Deleting an exit the whole process leaves through would take every request
-	// offline, so it is refused until the address is moved.
+	// An exit with identities on it cannot be deleted: that would leave them
+	// resolving to nothing, and the operator would find out from a failing
+	// signup rather than from this call.
 	status, out = f.do(t, http.MethodDelete, "/egress/pool/"+itoa(id), "")
 	if status != http.StatusConflict {
 		t.Fatalf("DELETE of a bound exit = %d %v, want 409", status, out)

@@ -187,7 +187,7 @@ func executionProxyURL(ctx context.Context, cfg *config.Config, auth *cliproxyau
 		proxyURL = strings.TrimSpace(auth.ProxyURL)
 	}
 	if proxyURL == "" && cfg != nil {
-		proxyURL = cfg.EffectiveProxyURL()
+		proxyURL = strings.TrimSpace(cfg.ProxyURL)
 	}
 	return proxyURL
 }

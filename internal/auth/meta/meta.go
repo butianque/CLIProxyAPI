@@ -239,7 +239,7 @@ func NewMetaAuthWithProxyURL(cfg *config.Config, proxyURL string) *MetaAuth {
 	if cfg != nil {
 		sdkCfg = cfg.SDKConfig
 		if effectiveProxyURL == "" {
-			effectiveProxyURL = cfg.EffectiveProxyURL()
+			effectiveProxyURL = strings.TrimSpace(cfg.ProxyURL)
 		}
 	}
 	sdkCfg.ProxyURL = effectiveProxyURL

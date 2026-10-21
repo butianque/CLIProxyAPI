@@ -230,7 +230,7 @@ func (c *hostHTTPClient) newHTTPClientForRequest(ctx context.Context, cfg *confi
 		proxyStr = strings.TrimSpace(c.auth.ProxyURL)
 	}
 	if proxyStr == "" && cfg != nil {
-		proxyStr = cfg.EffectiveProxyURL()
+		proxyStr = strings.TrimSpace(cfg.ProxyURL)
 	}
 
 	var baseTransport *http.Transport
@@ -560,8 +560,8 @@ func resolveProxyForRequest(r *http.Request, auth *coreauth.Auth, cfg *config.Co
 			return setting.URL, nil
 		}
 	}
-	if cfg != nil && cfg.EffectiveProxyURL() != "" {
-		setting, errParse := proxyutil.Parse(cfg.EffectiveProxyURL())
+	if cfg != nil && strings.TrimSpace(cfg.ProxyURL) != "" {
+		setting, errParse := proxyutil.Parse(strings.TrimSpace(cfg.ProxyURL))
 		if errParse != nil {
 			return nil, fmt.Errorf("pluginhost: parse config proxy: %w", errParse)
 		}
