@@ -1,6 +1,11 @@
 package management
 
 import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
@@ -167,5 +172,72 @@ func TestNormalizeNetwork(t *testing.T) {
 			t.Fatalf("normalizeNetwork(%q, %q) = (%q, %q), want (%q, %q)",
 				tc.asn, tc.org, asn, org, tc.wantASN, tc.wantOrg)
 		}
+	}
+}
+
+// A probe that fails everywhere has to say so about every service it asked. The
+// panel used to show only the last attempt, which made one site look like the
+// problem when all four had refused.
+func TestEgressProbeFailuresNamesEveryService(t *testing.T) {
+	identical := egressProbeFailures{}
+	identical.add("https://ipwho.is/", errors.New("EOF"))
+	identical.add("https://api.ip.sb/geoip", errors.New("EOF"))
+	if got := identical.Error(); got != "all 2 checks failed: EOF" {
+		t.Fatalf("identical reasons = %q", got)
+	}
+
+	mixed := egressProbeFailures{}
+	mixed.add("https://ipwho.is/", errors.New("EOF"))
+	mixed.add("https://api.ip.sb/geoip", errors.New("answered 403 Forbidden"))
+	want := "2 checks failed: ipwho.is: EOF; api.ip.sb: answered 403 Forbidden"
+	if got := mixed.Error(); got != want {
+		t.Fatalf("mixed reasons = %q, want %q", got, want)
+	}
+}
+
+// The first service to answer wins: one that refuses is skipped, not reported
+// as the exit being broken.
+func TestProbeExitSkipsRefusingServices(t *testing.T) {
+	refusing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer refusing.Close()
+	answering := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"ip":"203.0.113.9","country":"Hong Kong"}`))
+	}))
+	defer answering.Close()
+
+	restore := egressEchoServices
+	egressEchoServices = []string{refusing.URL, answering.URL}
+	t.Cleanup(func() { egressEchoServices = restore })
+
+	echo, service, errProbe := probeExit(context.Background(), &http.Client{})
+	if errProbe != nil {
+		t.Fatalf("probeExit() error = %v", errProbe)
+	}
+	if echo.IP != "203.0.113.9" || service != answering.URL {
+		t.Fatalf("probeExit() = (%+v, %q), want the second service", echo, service)
+	}
+}
+
+// When every service refuses, the report covers all of them and keeps the
+// reason, so the operator can tell a dead exit from a blocked one.
+func TestProbeExitReportsEveryServiceWhenAllFail(t *testing.T) {
+	refusing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer refusing.Close()
+
+	restore := egressEchoServices
+	egressEchoServices = []string{refusing.URL, refusing.URL + "/geoip"}
+	t.Cleanup(func() { egressEchoServices = restore })
+
+	_, _, errProbe := probeExit(context.Background(), &http.Client{})
+	if errProbe == nil {
+		t.Fatal("probeExit() succeeded, want a failure")
+	}
+	got := errProbe.Error()
+	if !strings.HasPrefix(got, "all 2 checks failed: ") || !strings.Contains(got, "503") {
+		t.Fatalf("probeExit() error = %q", got)
 	}
 }

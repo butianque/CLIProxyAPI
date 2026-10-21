@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -33,10 +35,7 @@ import (
 const egressProbeTimeout = 12 * time.Second
 
 // Errors the probe can report about itself rather than about the exit.
-var (
-	errEgressNoAddress  = errors.New("no echo service reported an address")
-	errEgressEchoStatus = errors.New("an echo service answered with a non-200 status")
-)
+var errEgressNoAddress = errors.New("answered without an address")
 
 // egressEchoServices are asked in order until one answers.
 //
@@ -164,30 +163,87 @@ func (h *Handler) PostEgressProbe(c *gin.Context) {
 
 // probeExit asks each echo service in turn and returns the first answer.
 //
-// A service that cannot be reached is skipped rather than reported: from the
-// operator's side, "one of four echo services was down" says nothing about
-// their exit. Only when every one fails is there something to report.
+// A service that cannot be reached is skipped rather than reported on its own:
+// from the operator's side, "one of four services was down" says nothing about
+// their exit. Only when every one fails is there something to report, and then
+// the report has to name all of them — otherwise the panel shows whichever
+// service happened to be asked last, which reads like that site is the problem.
 func probeExit(ctx context.Context, client *http.Client) (egressEcho, string, error) {
-	var lastErr error
+	var failures egressProbeFailures
 	for _, service := range egressEchoServices {
 		if ctx.Err() != nil {
-			return egressEcho{}, "", ctx.Err()
+			if len(failures.attempts) == 0 {
+				return egressEcho{}, "", ctx.Err()
+			}
+			break
 		}
 		echo, errProbe := askEchoService(ctx, client, service)
 		if errProbe != nil {
-			lastErr = errProbe
+			failures.add(service, errProbe)
 			continue
 		}
 		if echo.IP == "" {
-			lastErr = errEgressNoAddress
+			failures.add(service, errEgressNoAddress)
 			continue
 		}
 		return echo, service, nil
 	}
-	if lastErr == nil {
-		lastErr = errEgressNoAddress
+	return egressEcho{}, "", &failures
+}
+
+// egressProbeFailures is why no service could name the address.
+//
+// Each service fails on its own terms: one refuses the exit, another is rate
+// limited, a third cannot be reached at all. Keeping every attempt is what lets
+// the panel say "all four failed" instead of blaming one of them.
+type egressProbeFailures struct {
+	attempts []egressProbeAttempt
+}
+
+type egressProbeAttempt struct {
+	service string
+	err     error
+}
+
+func (f *egressProbeFailures) add(service string, err error) {
+	f.attempts = append(f.attempts, egressProbeAttempt{service: echoHost(service), err: err})
+}
+
+func (f *egressProbeFailures) Error() string {
+	if len(f.attempts) == 0 {
+		return errEgressNoAddress.Error()
 	}
-	return egressEcho{}, "", lastErr
+	first := f.attempts[0].err.Error()
+	identical := true
+	for _, attempt := range f.attempts[1:] {
+		if attempt.err.Error() != first {
+			identical = false
+			break
+		}
+	}
+	// One reason repeated for every service is the exit failing, not several
+	// sites: saying it once keeps the message readable in a table cell.
+	if identical {
+		return fmt.Sprintf("all %d checks failed: %s", len(f.attempts), first)
+	}
+	var summary strings.Builder
+	fmt.Fprintf(&summary, "%d checks failed:", len(f.attempts))
+	for i, attempt := range f.attempts {
+		if i > 0 {
+			summary.WriteString(";")
+		}
+		fmt.Fprintf(&summary, " %s: %v", attempt.service, attempt.err)
+	}
+	return summary.String()
+}
+
+// echoHost is the service name the panel shows, without the scheme and path.
+func echoHost(service string) string {
+	parsed, errParse := url.Parse(service)
+	if errParse != nil || parsed.Host == "" {
+		return service
+	}
+	return parsed.Host
 }
 
 // askEchoService performs one echo request. The body is capped because the
@@ -205,7 +261,7 @@ func askEchoService(ctx context.Context, client *http.Client, service string) (e
 	}
 	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusOK {
-		return egressEcho{}, errEgressEchoStatus
+		return egressEcho{}, fmt.Errorf("answered %s", response.Status)
 	}
 	body, errRead := io.ReadAll(io.LimitReader(response.Body, 32<<10))
 	if errRead != nil {
@@ -218,18 +274,28 @@ func askEchoService(ctx context.Context, client *http.Client, service string) (e
 	return normalizeEcho(payload), nil
 }
 
-// unwrapURLError drops the request URL from a transport error.
+// unwrapURLError reduces a failed request to the reason it failed.
 //
-// The URL is whichever echo service the probe happened to try, and it says
-// nothing about the operator's exit. Leaving it in would make a wrong proxy port
-// read like the panel were fetching that address for its own reasons, which
-// buries the one part of the message that is actionable.
+// The wrappers on the way down say nothing about the operator's exit: the URL is
+// whichever echo service the probe happened to try, and the operation name and
+// address pair ("socks connect tcp <proxy>-><target>") describe the route the
+// probe took, not the fault. Leaving them in would make a wrong proxy port read
+// like the panel were fetching that address for its own reasons, and would let
+// one service's hostname stand in for the verdict on all of them.
 func unwrapURLError(err error) error {
-	var urlErr *url.Error
-	if errors.As(err, &urlErr) && urlErr.Err != nil {
-		return urlErr.Err
+	for {
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) && urlErr.Err != nil {
+			err = urlErr.Err
+			continue
+		}
+		var opErr *net.OpError
+		if errors.As(err, &opErr) && opErr.Err != nil {
+			err = opErr.Err
+			continue
+		}
+		return err
 	}
-	return err
 }
 
 // normalizeEcho maps an echo service's payload onto the probe's fields.
