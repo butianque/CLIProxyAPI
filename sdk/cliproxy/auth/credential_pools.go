@@ -34,7 +34,10 @@ func setCredentialPools(pools map[string][]string) {
 		}
 		members := make(map[string]struct{}, len(names))
 		for _, name := range names {
-			name = strings.TrimSpace(name)
+			// Credential names are file base names, which are matched
+			// case-insensitively so a hand-written pool entry that differs only in
+			// case or padding still resolves to the credential it names.
+			name = strings.ToLower(strings.TrimSpace(name))
 			if name == "" {
 				continue
 			}
@@ -61,7 +64,7 @@ func credentialContains(pool, name string) bool {
 	if !ok {
 		return false
 	}
-	_, found := members[name]
+	_, found := members[strings.ToLower(strings.TrimSpace(name))]
 	return found
 }
 

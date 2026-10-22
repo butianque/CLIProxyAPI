@@ -232,7 +232,7 @@ func TestSessionAffinityDelayedSuccessDoesNotOverwriteReboundAuth(t *testing.T) 
 	}
 }
 
-func TestSessionAffinityOnResultWithMismatchedNamespaceFailsToUnbind(t *testing.T) {
+func TestSessionAffinityOnResultResolvesPropagatedNamespace(t *testing.T) {
 	affinity := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
 		Fallback: &RoundRobinSelector{},
 		TTL:      time.Hour,
@@ -246,9 +246,12 @@ func TestSessionAffinityOnResultWithMismatchedNamespaceFailsToUnbind(t *testing.
 	// Bind under "mixed" namespace
 	mixedKey := "mixed::" + sessionID + "::" + model
 	affinity.cache.Set(mixedKey, authID)
+	// A key under a different namespace must never be touched by this result.
+	otherKey := "other::" + sessionID + "::" + model
+	affinity.cache.Set(otherKey, "auth-2")
 
 	// Call OnResult with options carrying the propagated "mixed" namespace
-	res := Result{
+	transient := Result{
 		AuthID:   authID,
 		Provider: "gemini", // actual provider
 		Model:    model,
@@ -263,11 +266,25 @@ func TestSessionAffinityOnResultWithMismatchedNamespaceFailsToUnbind(t *testing.
 		},
 	}
 
-	affinity.OnResult(res)
+	affinity.OnResult(transient)
 
-	// Verify mixedKey is cleanly removed
+	// A transient failure only changes availability: the session keeps its binding
+	// so it does not lose its upstream prompt cache.
+	if got, ok := affinity.cache.Get(mixedKey); !ok || got != authID {
+		t.Fatalf("transient failure released the binding: got (%q, %v), want (%q, true)", got, ok, authID)
+	}
+
+	// A structural model-not-found result releases exactly the key the propagated
+	// namespace resolves to, which is what proves the namespace was honoured.
+	structural := transient
+	structural.Error = &Error{Code: "model_not_found", Message: "model not found"}
+	affinity.OnResult(structural)
+
 	if _, ok := affinity.cache.Get(mixedKey); ok {
-		t.Fatalf("expected mixed key to be removed after OnResult with propagated namespace")
+		t.Fatalf("expected mixed key to be removed after model_not_found")
+	}
+	if got, ok := affinity.cache.Get(otherKey); !ok || got != "auth-2" {
+		t.Fatalf("unrelated namespace was modified: got (%q, %v), want (auth-2, true)", got, ok)
 	}
 }
 

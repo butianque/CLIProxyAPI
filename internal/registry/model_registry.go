@@ -201,6 +201,11 @@ type ModelRegistry struct {
 	registrationEpoch atomic.Uint64
 	// hook is an optional callback sink for model registration changes
 	hook ModelRegistryHook
+	// providerAvailable reports which providers currently have at least one
+	// usable credential. Nil disables the availability filter. It is guarded by
+	// its own mutex so it can be read without holding r.mutex.
+	providerAvailable   func() []string
+	providerAvailableMu sync.RWMutex
 }
 
 // Global model registry instance
@@ -386,6 +391,89 @@ func (r *ModelRegistry) SetHook(hook ModelRegistryHook) {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 	r.hook = hook
+}
+
+// SetProviderAvailability installs a live source of "which providers currently
+// have at least one usable credential". Nil disables the filter.
+//
+// A model list is a promise to the client. Registration alone cannot decide
+// whether that promise still holds: a provider-level plugin registration
+// outlives every credential it may have, so a model can stay registered long
+// after the last account that could serve it is gone, and the client then gets
+// auth_not_found for a model the proxy itself advertised. The caller that owns
+// credential state therefore answers this question instead.
+//
+// The source is consulted on every read rather than folded into
+// availableModelsCache, so credentials appearing or disappearing take effect
+// immediately instead of waiting for a cache rebuild.
+func (r *ModelRegistry) SetProviderAvailability(available func() []string) {
+	if r == nil {
+		return
+	}
+	r.providerAvailableMu.Lock()
+	defer r.providerAvailableMu.Unlock()
+	r.providerAvailable = available
+}
+
+// servableProviderSnapshot returns the providers that can serve right now.
+//
+// Call it without holding r.mutex: the callback reads credential state under
+// its own lock, and that lock is already held while the registry is written
+// (client model projections), so invoking it inside the registry lock would
+// invert the lock order. A nil result means "filter disabled"; an empty non-nil
+// set means "nothing can serve anything", which is a real state once every
+// credential is gone.
+func (r *ModelRegistry) servableProviderSnapshot() map[string]struct{} {
+	r.providerAvailableMu.RLock()
+	available := r.providerAvailable
+	r.providerAvailableMu.RUnlock()
+	if available == nil {
+		return nil
+	}
+	providers := available()
+	set := make(map[string]struct{}, len(providers))
+	for _, provider := range providers {
+		set[provider] = struct{}{}
+	}
+	return set
+}
+
+// modelHasServableProvider reports whether any provider registered for the
+// model is in the servable set. Models with no provider information are kept:
+// the filter only removes what it can positively prove unservable.
+func modelHasServableProvider(registration *ModelRegistration, servable map[string]struct{}) bool {
+	if servable == nil {
+		return true
+	}
+	if registration == nil || len(registration.Providers) == 0 {
+		return true
+	}
+	for provider := range registration.Providers {
+		if _, ok := servable[provider]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// filterUnservableModels drops models that no provider can currently serve.
+// The caller must hold at least a read lock on r.mutex.
+func (r *ModelRegistry) filterUnservableModels(models []map[string]any, servable map[string]struct{}) []map[string]any {
+	if servable == nil || len(models) == 0 {
+		return models
+	}
+	kept := models[:0]
+	for _, model := range models {
+		if model == nil {
+			kept = append(kept, model)
+			continue
+		}
+		modelID, _ := model["id"].(string)
+		if modelID == "" || modelHasServableProvider(r.models[modelID], servable) {
+			kept = append(kept, model)
+		}
+	}
+	return kept
 }
 
 const defaultModelRegistryHookTimeout = 5 * time.Second
@@ -1275,10 +1363,12 @@ func (r *ModelRegistry) IsModelQuotaExceededForClient(clientID, modelID string) 
 //   - []map[string]any: List of available models in the requested format
 func (r *ModelRegistry) GetAvailableModels(handlerType string) []map[string]any {
 	now := time.Now()
+	// Resolved before taking r.mutex; see servableProviderSnapshot.
+	servable := r.servableProviderSnapshot()
 
 	r.mutex.RLock()
 	if cache, ok := r.availableModelsCache[handlerType]; ok && (cache.expiresAt.IsZero() || now.Before(cache.expiresAt)) {
-		models := cloneModelMaps(cache.models)
+		models := r.filterUnservableModels(cloneModelMaps(cache.models), servable)
 		r.mutex.RUnlock()
 		return models
 	}
@@ -1289,7 +1379,7 @@ func (r *ModelRegistry) GetAvailableModels(handlerType string) []map[string]any 
 	r.ensureAvailableModelsCacheLocked()
 
 	if cache, ok := r.availableModelsCache[handlerType]; ok && (cache.expiresAt.IsZero() || now.Before(cache.expiresAt)) {
-		return cloneModelMaps(cache.models)
+		return r.filterUnservableModels(cloneModelMaps(cache.models), servable)
 	}
 
 	models, expiresAt := r.buildAvailableModelsLocked(handlerType, now)
@@ -1298,7 +1388,7 @@ func (r *ModelRegistry) GetAvailableModels(handlerType string) []map[string]any 
 		expiresAt: expiresAt,
 	}
 
-	return models
+	return r.filterUnservableModels(models, servable)
 }
 
 func modelRegistrationAvailability(registration *ModelRegistration, now time.Time) (bool, time.Time) {
@@ -1352,6 +1442,9 @@ func modelRegistrationAvailability(registration *ModelRegistration, now time.Tim
 // GetAvailableModelInfos returns cloned metadata for all currently available models.
 func (r *ModelRegistry) GetAvailableModelInfos() []*ModelInfo {
 	now := time.Now()
+	// Resolved before taking r.mutex; see servableProviderSnapshot.
+	servable := r.servableProviderSnapshot()
+
 	r.mutex.RLock()
 	defer r.mutex.RUnlock()
 
@@ -1359,6 +1452,9 @@ func (r *ModelRegistry) GetAvailableModelInfos() []*ModelInfo {
 	for _, registration := range r.models {
 		available, _ := modelRegistrationAvailability(registration, now)
 		if !available || registration == nil || registration.Info == nil {
+			continue
+		}
+		if !modelHasServableProvider(registration, servable) {
 			continue
 		}
 		result = append(result, cloneModelInfo(registration.Info))

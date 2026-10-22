@@ -511,7 +511,11 @@ type RoutingConfig struct {
 	// Explicit Claude Code, Codex, OpenCode, and pi session headers are preferred,
 	// followed by prompt_cache_key, Responses conversation IDs, legacy body IDs,
 	// execution or derived session identity, and the existing message-content hash fallback.
-	// Automatic failover is always enabled when bound auth becomes unavailable.
+	// Automatic failover stays enabled when the bound auth becomes unavailable: the
+	// request is served by another auth and the session moves with it. A failed
+	// attempt on its own never drops the binding, so transient upstream errors do
+	// not migrate a conversation; only a credential that cannot serve the model at
+	// all, or one removed from the pool, releases it.
 	SessionAffinity bool `yaml:"session-affinity,omitempty" json:"session-affinity,omitempty"`
 
 	// SessionAffinityTTL specifies how long session-to-auth bindings are retained.

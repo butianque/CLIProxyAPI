@@ -235,9 +235,11 @@ func TestSessionAffinitySubagentFailureIsolation(t *testing.T) {
 		Options: subagentOpts,
 	})
 
-	// 4. Subagent's cache key must be cleared.
-	if bound, ok := selector.cache.Get(subagentCacheKey); ok {
-		t.Fatalf("subagent cache binding was not cleared after failure: got %q", bound)
+	// 4. The subagent's binding survives the failure: a failed attempt only changes
+	// availability, so the subagent keeps its credential and its upstream prompt
+	// cache instead of being migrated by a single upstream error.
+	if bound, ok := selector.cache.Get(subagentCacheKey); !ok || bound != "auth-1" {
+		t.Fatalf("subagent cache binding was dropped after failure: got (%q, %v), want (auth-1, true)", bound, ok)
 	}
 
 	// 5. Parent session binding in cache MUST still remain intact on auth-1.

@@ -86,9 +86,22 @@ func unmarshalJSONWithNumber(data []byte, v any) error {
 	return dec.Decode(v)
 }
 
+// firstErrorCause returns the first non-nil cause so an optional trailing error
+// can be threaded through without changing every existing call site.
+func firstErrorCause(causes []error) error {
+	for _, cause := range causes {
+		if cause != nil {
+			return cause
+		}
+	}
+	return nil
+}
+
 // BuildOpenAIResponsesStreamErrorChunk builds an OpenAI Responses streaming error chunk.
 // It matches the official responses streaming event shape where the error details are nested.
-func BuildOpenAIResponsesStreamErrorChunk(status int, errText string, sequenceNumber int) []byte {
+// An optional cause carries the internal error, whose own code takes precedence over
+// the status-derived one.
+func BuildOpenAIResponsesStreamErrorChunk(status int, errText string, sequenceNumber int, cause ...error) []byte {
 	if status <= 0 {
 		status = http.StatusInternalServerError
 	}
@@ -102,6 +115,15 @@ func BuildOpenAIResponsesStreamErrorChunk(status int, errText string, sequenceNu
 	}
 
 	code := openAIResponsesStreamErrorCode(status)
+
+	// internal_server_error is only a fallback for errors that carry no code of
+	// their own. Reporting a real condition such as auth_not_found as a CPA
+	// malfunction tells a streaming client to retry something a retry cannot fix,
+	// and hides the cause from the operator.
+	if classifiedCode, _, ok := classifyError(firstErrorCause(cause)); ok && (code == "" || code == "internal_server_error") {
+		code = classifiedCode
+		message = trimErrorCodePrefix(message, classifiedCode)
+	}
 
 	trimmed := strings.TrimSpace(errText)
 	if trimmed != "" && json.Valid([]byte(trimmed)) {
@@ -203,7 +225,7 @@ func openAIResponsesStreamFailedErrorDetail(status int, errText, code, message s
 
 // BuildOpenAIResponsesStreamFailedChunk builds the terminal Responses event used by official Codex clients.
 // It is intentionally separate from BuildOpenAIResponsesStreamErrorChunk so existing clients keep the legacy shape.
-func BuildOpenAIResponsesStreamFailedChunk(status int, errText string, sequenceNumber int) []byte {
+func BuildOpenAIResponsesStreamFailedChunk(status int, errText string, sequenceNumber int, cause ...error) []byte {
 	if status <= 0 {
 		status = http.StatusInternalServerError
 	}
@@ -211,7 +233,7 @@ func BuildOpenAIResponsesStreamFailedChunk(status int, errText string, sequenceN
 		sequenceNumber = 0
 	}
 
-	errorChunkBytes := BuildOpenAIResponsesStreamErrorChunk(status, errText, sequenceNumber)
+	errorChunkBytes := BuildOpenAIResponsesStreamErrorChunk(status, errText, sequenceNumber, cause...)
 	var errorChunk openAIResponsesStreamErrorChunk
 	_ = unmarshalJSONWithNumber(errorChunkBytes, &errorChunk)
 	sequenceNumber = errorChunk.SequenceNumber

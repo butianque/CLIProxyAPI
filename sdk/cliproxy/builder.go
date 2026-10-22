@@ -10,6 +10,7 @@ import (
 	configaccess "github.com/router-for-me/CLIProxyAPI/v8/internal/access/config_access"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
@@ -302,6 +303,10 @@ func (b *Builder) Build() (*Service, error) {
 			service.reloadConfigFromWatcher()
 		}),
 	)
+	// A model list is a promise to the client, so it must never advertise a model
+	// that no credential can serve. The registry cannot answer that question on
+	// its own; the manager owns credential state, so it answers it live.
+	registry.GetGlobalRegistry().SetProviderAvailability(coreManager.AvailableProviders)
 	return service, nil
 }
 

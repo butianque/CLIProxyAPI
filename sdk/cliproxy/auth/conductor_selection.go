@@ -128,24 +128,36 @@ func (e authSelectionEligibility) allows(auth *Auth) bool {
 }
 
 // allowsCredential reports whether an auth may serve a caller scoped to a set of
-// credential pools. An empty scope imposes no restriction. A scoped caller may
-// only use credentials the pools explicitly list, so a restricted key never
-// silently falls back onto an unrelated credential.
+// scope entries. An empty scope imposes no restriction. A scoped caller may only
+// use credentials one of the entries names, so a restricted key never silently
+// falls back onto an unrelated credential.
 //
-// Membership comes from the config's credential-pools table. It is deliberately
-// not inferred from a credential's provider: that inference made "why did this
-// key route here" unanswerable, because the same credential could belong to a
-// pool purely by virtue of its provider name.
+// An entry names either an account category or a declared credential pool:
+//
+//   - A category is the credential's provider — the same grouping the credentials
+//     page shows as its tabs. It is resolved against the live credential set, so a
+//     key scoped to a category follows accounts being added or removed without any
+//     configuration write.
+//   - A pool is an explicit member list from the config's credential-pools table.
+//     It stays supported for hand-written configurations, but nothing in the
+//     management UI creates one any more: the categories already describe the
+//     credentials, so a second membership table only added a way to disagree.
 func (e authSelectionEligibility) allowsCredential(auth *Auth) bool {
 	if len(e.allowedPools) == 0 {
 		return true
 	}
-	name := credentialName(auth)
-	if name == "" {
+	if auth == nil {
 		return false
 	}
-	for _, pool := range e.allowedPools {
-		if credentialContains(pool, name) {
+	name := credentialName(auth)
+	// Scope entries are lowercased by splitPoolList, so compare against the
+	// provider in the same form.
+	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	for _, scope := range e.allowedPools {
+		if credentialContains(scope, name) {
+			return true
+		}
+		if provider != "" && scope == provider {
 			return true
 		}
 	}
@@ -1798,6 +1810,57 @@ func (m *Manager) routeAwareSelectionRequired(auth *Auth, routeModel string) boo
 	return m.selectionModelKeyForAuth(auth, routeModel) != canonicalModelKey(routeModel)
 }
 
+// candidateRejections counts why credentials were filtered out of a candidate
+// set. Each counter names a different reason and therefore a different fix, so an
+// empty candidate set does not collapse into a bare "no auth available".
+type candidateRejections struct {
+	disabled        int
+	modelExcluded   int
+	triedExcluded   int
+	scopeExcluded   int
+	executorMissing int
+	pinnedAuthID    string
+}
+
+// noCandidateAuthMessage explains why no credential could serve the request.
+// authsPerProvider holds how many credentials exist per provider, which separates
+// "nothing is configured" from "what is configured cannot be used".
+func noCandidateAuthMessage(providers []string, model string, authsPerProvider map[string]int, rej candidateRejections) string {
+	missing := make([]string, 0, len(providers))
+	for _, provider := range providers {
+		if authsPerProvider[canonicalSchedulingProvider(provider)] == 0 {
+			missing = append(missing, provider)
+		}
+	}
+	parts := make([]string, 0, 6)
+	if len(missing) > 0 {
+		parts = append(parts, "no credentials registered for "+strings.Join(missing, ","))
+	}
+	if rej.disabled > 0 {
+		parts = append(parts, fmt.Sprintf("%d disabled", rej.disabled))
+	}
+	if rej.modelExcluded > 0 {
+		parts = append(parts, fmt.Sprintf("%d do not cover this model", rej.modelExcluded))
+	}
+	if rej.scopeExcluded > 0 {
+		parts = append(parts, fmt.Sprintf("%d outside the caller's scope", rej.scopeExcluded))
+	}
+	if rej.triedExcluded > 0 {
+		parts = append(parts, fmt.Sprintf("%d already tried in this request", rej.triedExcluded))
+	}
+	if rej.executorMissing > 0 {
+		parts = append(parts, fmt.Sprintf("%d have no registered executor", rej.executorMissing))
+	}
+	if strings.TrimSpace(rej.pinnedAuthID) != "" {
+		parts = append(parts, fmt.Sprintf("pinned to auth %q", rej.pinnedAuthID))
+	}
+	message := fmt.Sprintf("no credential can serve model %q", model)
+	if len(parts) > 0 {
+		message += " (" + strings.Join(parts, "; ") + ")"
+	}
+	return message
+}
+
 func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	if m.HomeEnabled() {
 		auth, exec, _, err := m.pickNextViaHome(ctx, model, opts, tried)
@@ -1830,27 +1893,71 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	}
 	registryRef := registry.GetGlobalRegistry()
 	targetKey := canonicalSchedulingProvider(provider)
+	authsPerProvider := map[string]int{targetKey: 0}
 	for _, candidate := range m.auths {
-		if candidate == nil || canonicalSchedulingProvider(executorKeyFromAuth(candidate)) != targetKey || candidate.Disabled {
+		if candidate != nil && canonicalSchedulingProvider(executorKeyFromAuth(candidate)) == targetKey {
+			authsPerProvider[targetKey]++
+		}
+	}
+	// scopeExcluded counts credentials that could have served this request but for
+	// the caller's scope. Every other filter is checked first so the count means
+	// exactly that; without it an empty candidate set is indistinguishable from
+	// "no such credential", which is the most confusing failure for a scoped key.
+	scopeExcluded := 0
+	// The remaining counters explain an empty candidate set instead of leaving the
+	// caller with a bare "no auth available": each one names a different reason and
+	// therefore a different fix.
+	disabledCount := 0
+	modelExcluded := 0
+	triedExcluded := 0
+	for _, candidate := range m.auths {
+		if candidate == nil || canonicalSchedulingProvider(executorKeyFromAuth(candidate)) != targetKey {
+			continue
+		}
+		if candidate.Disabled {
+			disabledCount++
 			continue
 		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
 			continue
 		}
-		if !eligibility.allows(candidate) {
-			continue
-		}
 		if _, used := tried[candidate.ID]; used {
+			triedExcluded++
 			continue
 		}
 		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
+			modelExcluded++
+			continue
+		}
+		if !eligibility.allows(candidate) {
+			if len(eligibility.allowedPools) > 0 && !eligibility.allowsCredential(candidate) {
+				scopeExcluded++
+			}
 			continue
 		}
 		candidates = append(candidates, candidate)
 	}
 	if len(candidates) == 0 {
 		m.mu.RUnlock()
-		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+		if scopeExcluded > 0 {
+			return nil, nil, &Error{
+				Code: "auth_not_found",
+				Message: fmt.Sprintf(
+					"no auth available in scope %s; %d credential(s) for this model are outside the key's scope",
+					strings.Join(eligibility.allowedPools, ","), scopeExcluded,
+				),
+			}
+		}
+		return nil, nil, &Error{
+			Code: "auth_not_found",
+			// scopeExcluded is handled by the branch above, so it is not repeated here.
+			Message: noCandidateAuthMessage([]string{provider}, model, authsPerProvider, candidateRejections{
+				disabled:      disabledCount,
+				modelExcluded: modelExcluded,
+				triedExcluded: triedExcluded,
+				pinnedAuthID:  pinnedAuthID,
+			}),
+		}
 	}
 	available, selectorAuths, errAvailable := m.availableAuthsForSelector(selector, candidates, provider, model, time.Now())
 	if errAvailable != nil {
@@ -2154,16 +2261,28 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		}
 	}
 	registryRef := registry.GetGlobalRegistry()
+	// authsPerProvider separates "this provider has no credential at all" from
+	// "its credentials cannot serve this request", because the two need different
+	// fixes. The rejection counters below name the second case.
+	authsPerProvider := make(map[string]int, len(providerSet))
 	for _, candidate := range m.auths {
-		if candidate == nil || candidate.Disabled {
+		if candidate == nil {
 			continue
 		}
-		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
+		providerKey := executorKeyFromAuth(candidate)
+		if _, ok := providerSet[providerKey]; ok {
+			authsPerProvider[providerKey]++
+		}
+	}
+	var rejected candidateRejections
+	rejected.pinnedAuthID = pinnedAuthID
+	for _, candidate := range m.auths {
+		if candidate == nil {
 			continue
 		}
-		if !eligibility.allows(candidate) {
-			continue
-		}
+		// Only credentials of the requested providers can explain this failure, so
+		// the provider filter comes first. Counting another provider's disabled or
+		// out-of-scope credential would report a reason the caller never asked about.
 		providerKey := executorKeyFromAuth(candidate)
 		if providerKey == "" {
 			continue
@@ -2171,20 +2290,39 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if _, ok := providerSet[providerKey]; !ok {
 			continue
 		}
+		if candidate.Disabled {
+			rejected.disabled++
+			continue
+		}
+		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
+			continue
+		}
+		if !eligibility.allows(candidate) {
+			if len(eligibility.allowedPools) > 0 && !eligibility.allowsCredential(candidate) {
+				rejected.scopeExcluded++
+			}
+			continue
+		}
 		if _, used := tried[candidate.ID]; used {
+			rejected.triedExcluded++
 			continue
 		}
 		if _, ok := m.executorLocked(providerKey); !ok {
+			rejected.executorMissing++
 			continue
 		}
 		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
+			rejected.modelExcluded++
 			continue
 		}
 		candidates = append(candidates, candidate)
 	}
 	if len(candidates) == 0 {
 		m.mu.RUnlock()
-		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
+		return nil, nil, "", &Error{
+			Code:    "auth_not_found",
+			Message: noCandidateAuthMessage(providers, model, authsPerProvider, rejected),
+		}
 	}
 	available, selectorAuths, errAvailable := m.availableAuthsForSelector(selector, candidates, "mixed", model, time.Now())
 	if errAvailable != nil {

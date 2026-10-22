@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"sort"
 	"strings"
@@ -414,18 +415,30 @@ func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, mo
 		strategy = s.strategy
 	}
 	providerState := s.providers[providerKey]
-	if providerState == nil {
-		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+	if providerState == nil || len(providerState.auths) == 0 {
+		return nil, &Error{
+			Code:    "auth_not_found",
+			Message: fmt.Sprintf("no credentials registered for provider %q (model %q)", providerKey, model),
+		}
 	}
 	shard := providerState.ensureModelLocked(modelKey, time.Now())
 	if shard == nil {
-		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+		return nil, &Error{
+			Code:    "auth_not_found",
+			Message: fmt.Sprintf("provider %q has no scheduler state for model %q", providerKey, model),
+		}
 	}
-	predicate := scheduledAuthPredicate(eligibility, tried, pinnedAuthID, strategy == schedulerStrategyWeightedRoundRobin)
+	filter := scheduledAuthFilter{
+		eligibility:           eligibility,
+		tried:                 tried,
+		pinnedAuthID:          pinnedAuthID,
+		requirePositiveWeight: strategy == schedulerStrategyWeightedRoundRobin,
+	}
+	predicate := filter.match
 	if picked := shard.pickReadyLocked(preferWebsocket, strategy, predicate); picked != nil {
 		return picked, nil
 	}
-	return nil, shard.unavailableErrorLocked(provider, model, predicate)
+	return nil, shard.unavailableErrorWithScopeLocked(provider, model, predicate, filter.eligibility)
 }
 
 func providerPrefersWebsocketTransport(providerKey string) bool {
@@ -486,7 +499,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		if picked := shard.pickReadyLocked(false, strategy, predicate); picked != nil {
 			return picked, providerKey, nil
 		}
-		return nil, "", shard.unavailableErrorLocked("mixed", model, predicate)
+		return nil, "", shard.unavailableErrorWithScopeLocked("mixed", model, predicate, eligibility)
 	}
 
 	predicate := scheduledAuthPredicate(eligibility, tried, "", strategy == schedulerStrategyWeightedRoundRobin)
@@ -514,7 +527,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		}
 	}
 	if !hasCandidate {
-		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, predicate)
+		return nil, "", s.mixedUnavailableErrorWithScopeLocked(normalized, model, predicate, eligibility)
 	}
 
 	if strategy == schedulerStrategyFillFirst {
@@ -528,7 +541,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 				return picked, providerKey, nil
 			}
 		}
-		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, predicate)
+		return nil, "", s.mixedUnavailableErrorWithScopeLocked(normalized, model, predicate, eligibility)
 	}
 
 	cursorKey := strings.Join(normalized, ",") + ":" + modelKey
@@ -596,7 +609,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		}
 	}
 	if startProviderIndex < 0 {
-		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, predicate)
+		return nil, "", s.mixedUnavailableErrorWithScopeLocked(normalized, model, predicate, eligibility)
 	}
 
 	slot := startSlot
@@ -620,15 +633,24 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		s.mixedCursors[cursorKey] = slot + 1
 		return picked, providerKey, nil
 	}
-	return nil, "", s.mixedUnavailableErrorLocked(normalized, model, predicate)
+	return nil, "", s.mixedUnavailableErrorWithScopeLocked(normalized, model, predicate, eligibility)
 }
 
 // mixedUnavailableErrorLocked synthesizes the mixed-provider cooldown or unavailable error.
 func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model string, predicate func(*scheduledAuth) bool) error {
+	return s.mixedUnavailableErrorWithScopeLocked(providers, model, predicate, authSelectionEligibility{})
+}
+
+// mixedUnavailableErrorWithScopeLocked is mixedUnavailableErrorLocked plus the
+// caller's pool scope. The scope is named only when it actually removed
+// candidates, so an unscoped or non-restrictive request keeps the exact message
+// the plain wrapper produces.
+func (s *authScheduler) mixedUnavailableErrorWithScopeLocked(providers []string, model string, predicate func(*scheduledAuth) bool, eligibility authSelectionEligibility) error {
 	now := time.Now()
 	total := 0
 	cooldownCount := 0
 	unauthorizedCount := 0
+	scopeExcluded := 0
 	earliest := time.Time{}
 
 	var latestModelTime time.Time
@@ -639,16 +661,26 @@ func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model st
 	var latestAuthID string
 	var latestAuthErr error
 
+	// reasons records, per provider, why it contributed no candidate. It is only
+	// reported when the request found no candidate in any provider.
+	var reasons []string
+
 	for _, providerKey := range providers {
 		providerState := s.providers[providerKey]
-		if providerState == nil {
+		if providerState == nil || len(providerState.auths) == 0 {
+			reasons = append(reasons, fmt.Sprintf("%s: no credentials registered", providerKey))
 			continue
 		}
 		shard := providerState.ensureModelLocked(canonicalModelKey(model), now)
 		if shard == nil {
+			reasons = append(reasons, fmt.Sprintf("%s: no scheduler state for this model", providerKey))
 			continue
 		}
-		localTotal, localCooldownCount, localUnauthorizedCount, localEarliest := shard.availabilitySummaryLocked(predicate)
+		localTotal, localCooldownCount, localUnauthorizedCount, localEarliest, localScopeExcluded := shard.availabilitySummaryWithScopeLocked(predicate, scopeRejectionPredicate(eligibility))
+		scopeExcluded += localScopeExcluded
+		if localTotal == 0 {
+			reasons = append(reasons, fmt.Sprintf("%s: %s", providerKey, shard.noCandidateReasonLocked(model)))
+		}
 		total += localTotal
 		cooldownCount += localCooldownCount
 		unauthorizedCount += localUnauthorizedCount
@@ -680,7 +712,14 @@ func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model st
 	}
 
 	if total == 0 {
-		return WithCause(&Error{Code: "auth_not_found", Message: "no auth available"}, lastCandidateErr)
+		message := "no auth available"
+		if note := scopeExclusionNote(eligibility, scopeExcluded); note != "" {
+			message += note
+		}
+		if len(reasons) > 0 {
+			message = fmt.Sprintf("%s (%s)", message, strings.Join(reasons, "; "))
+		}
+		return WithCause(&Error{Code: "auth_not_found", Message: message}, lastCandidateErr)
 	}
 	if cooldownCount == total && !earliest.IsZero() {
 		resetIn := earliest.Sub(now)
@@ -701,27 +740,136 @@ func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model st
 			HTTPStatus: http.StatusServiceUnavailable,
 		}, terminalCause)
 	}
-	return newAuthUnavailableErrorWithCause(earliest, now, lastCandidateErr)
+	return newAuthUnavailableErrorWithScopeCause(earliest, now, lastCandidateErr, eligibility, scopeExcluded)
 }
 
-// scheduledAuthPredicate filters request-ineligible auths before scheduler state advances.
+// scheduledAuthFilter is the request-level candidate filter. It drops
+// credentials the request may not use before any scheduler state advances.
+//
+// It is a value rather than a bare closure so the error path can ask the same
+// object which candidates the caller's pool scope removed. That keeps the scope
+// count inside the scan the error path already performs, instead of re-running
+// the filter over the shard just to explain the failure.
+type scheduledAuthFilter struct {
+	eligibility           authSelectionEligibility
+	tried                 map[string]struct{}
+	pinnedAuthID          string
+	requirePositiveWeight bool
+}
+
+// match reports whether entry may serve the request.
+func (f scheduledAuthFilter) match(entry *scheduledAuth) bool {
+	return f.passesNonScopeFilters(entry) && f.eligibility.allows(entry.auth)
+}
+
+// passesNonScopeFilters reports whether entry is rejected by none of the filters
+// other than the caller's pool scope.
+func (f scheduledAuthFilter) passesNonScopeFilters(entry *scheduledAuth) bool {
+	if entry == nil || entry.auth == nil {
+		return false
+	}
+	if f.requirePositiveWeight && (entry.meta == nil || entry.meta.weight <= 0) {
+		return false
+	}
+	if f.pinnedAuthID != "" && entry.auth.ID != f.pinnedAuthID {
+		return false
+	}
+	if len(f.tried) > 0 {
+		if _, ok := f.tried[entry.auth.ID]; ok {
+			return false
+		}
+	}
+	return true
+}
+
+// scopeExcluded reports whether entry passed every other filter and was dropped
+// only because the caller's pool scope does not contain it.
+func (f scheduledAuthFilter) scopeExcluded(entry *scheduledAuth) bool {
+	if len(f.eligibility.allowedPools) == 0 || !f.passesNonScopeFilters(entry) {
+		return false
+	}
+	return f.eligibility.scopeExcludes(entry.auth)
+}
+
+// scopeRejected returns the scope test to run alongside the candidate predicate,
+// or nil when the request is unscoped.
+func (f scheduledAuthFilter) scopeRejected() func(*scheduledAuth) bool {
+	if len(f.eligibility.allowedPools) == 0 {
+		return nil
+	}
+	return f.scopeExcluded
+}
+
+// scopeExcludes reports whether auth is dropped solely by the caller's pool
+// scope. Candidates that fail another eligibility filter are not counted, so the
+// reported number always means "this scope hid that many credentials".
+func (e authSelectionEligibility) scopeExcludes(auth *Auth) bool {
+	if len(e.allowedPools) == 0 || auth == nil {
+		return false
+	}
+	unscoped := e
+	unscoped.allowedPools = nil
+	return unscoped.allows(auth) && !e.allowsCredential(auth)
+}
+
+// scopeExclusionNote renders the scope clause for a "no auth available" message.
+// It is empty unless the request is scoped and the scope actually removed at
+// least one candidate, so unscoped and non-restrictive requests keep their exact
+// previous text. The wording matches the legacy selection path.
+func scopeExclusionNote(eligibility authSelectionEligibility, scopeExcluded int) string {
+	if scopeExcluded <= 0 || len(eligibility.allowedPools) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" in scope %s; %d credential(s) for this model are outside the key's scope", strings.Join(eligibility.allowedPools, ","), scopeExcluded)
+}
+
+// newAuthUnavailableErrorWithScopeCause is newAuthUnavailableErrorWithCause with
+// the caller's pool scope appended to the message when that scope hid
+// candidates. The message is rewritten on the freshly built error, so the
+// retry-after and cause behaviour of the original constructor is preserved.
+func newAuthUnavailableErrorWithScopeCause(next, now time.Time, cause error, eligibility authSelectionEligibility, scopeExcluded int) error {
+	err := newAuthUnavailableErrorWithCause(next, now, cause)
+	note := scopeExclusionNote(eligibility, scopeExcluded)
+	if note == "" {
+		return err
+	}
+	var base *Error
+	switch typed := err.(type) {
+	case *authUnavailableError:
+		base = typed.base
+	case *errorWithCause:
+		base = typed.base
+	case *Error:
+		base = typed
+	}
+	if base != nil {
+		base.Message += note
+	}
+	return err
+}
+
+// scheduledAuthPredicate builds the boolean candidate test for a request. It is
+// the closure form of scheduledAuthFilter, kept for callers that only need the
+// test itself.
 func scheduledAuthPredicate(eligibility authSelectionEligibility, tried map[string]struct{}, pinnedAuthID string, requirePositiveWeight bool) func(*scheduledAuth) bool {
+	return scheduledAuthFilter{
+		eligibility:           eligibility,
+		tried:                 tried,
+		pinnedAuthID:          pinnedAuthID,
+		requirePositiveWeight: requirePositiveWeight,
+	}.match
+}
+
+// scopeRejectionPredicate reports whether an entry would have served the request
+// but for the caller's pool scope. The error path runs it alongside the candidate
+// predicate so "the key cannot reach this credential" is distinguishable from
+// "the credential is cooling".
+func scopeRejectionPredicate(eligibility authSelectionEligibility) func(*scheduledAuth) bool {
 	return func(entry *scheduledAuth) bool {
-		if entry == nil || entry.auth == nil || !eligibility.allows(entry.auth) {
+		if entry == nil || entry.auth == nil {
 			return false
 		}
-		if requirePositiveWeight && (entry.meta == nil || entry.meta.weight <= 0) {
-			return false
-		}
-		if pinnedAuthID != "" && entry.auth.ID != pinnedAuthID {
-			return false
-		}
-		if len(tried) > 0 {
-			if _, ok := tried[entry.auth.ID]; ok {
-				return false
-			}
-		}
-		return true
+		return eligibility.scopeExcludes(entry.auth)
 	}
 }
 
@@ -1410,12 +1558,27 @@ func (m *modelScheduler) readyCountAtPriorityLocked(preferWebsocket bool, priori
 
 // unavailableErrorLocked returns the correct unavailable or cooldown error for the shard.
 func (m *modelScheduler) unavailableErrorLocked(provider, model string, predicate func(*scheduledAuth) bool) error {
+	return m.unavailableErrorWithScopeLocked(provider, model, predicate, authSelectionEligibility{})
+}
+
+// unavailableErrorWithScopeLocked is unavailableErrorLocked plus the caller's pool
+// scope. The scope is named only when it actually removed candidates, so an
+// unscoped or non-restrictive request keeps the exact message the plain wrapper
+// produces.
+func (m *modelScheduler) unavailableErrorWithScopeLocked(provider, model string, predicate func(*scheduledAuth) bool, eligibility authSelectionEligibility) error {
 	now := time.Now()
-	total, cooldownCount, unauthorizedCount, earliest := m.availabilitySummaryLocked(predicate)
+	total, cooldownCount, unauthorizedCount, earliest, scopeExcluded := m.availabilitySummaryWithScopeLocked(predicate, scopeRejectionPredicate(eligibility))
 	_, _, _, authErr, _, _ := m.candidateErrorsLocked(model, predicate)
 	lastCandidateErr, _, _ := m.latestCandidateErrorWithTimeLocked(model, predicate)
 	if total == 0 {
-		return WithCause(&Error{Code: "auth_not_found", Message: "no auth available"}, lastCandidateErr)
+		message := fmt.Sprintf("provider %q: %s", provider, m.noCandidateReasonLocked(model))
+		if note := scopeExclusionNote(eligibility, scopeExcluded); note != "" {
+			message = fmt.Sprintf("provider %q: no auth available%s", provider, note)
+		}
+		return WithCause(&Error{
+			Code:    "auth_not_found",
+			Message: message,
+		}, lastCandidateErr)
 	}
 	if cooldownCount == total && !earliest.IsZero() {
 		providerForError := provider
@@ -1440,7 +1603,26 @@ func (m *modelScheduler) unavailableErrorLocked(provider, model string, predicat
 			HTTPStatus: http.StatusServiceUnavailable,
 		}, terminalCause)
 	}
-	return newAuthUnavailableErrorWithCause(earliest, now, lastCandidateErr)
+	return newAuthUnavailableErrorWithScopeCause(earliest, now, lastCandidateErr, eligibility, scopeExcluded)
+}
+
+// noCandidateReasonLocked explains why this shard produced no candidate at all.
+//
+// The distinction is what makes the error actionable. "This provider has no
+// credential covering the model" needs a different model or a new login, while
+// "credentials cover the model but none may serve this request" needs a wait, a
+// wider key scope, or a different credential set. Both used to be reported as a
+// bare "no auth available", which the handler then surfaced as a generic server
+// error, leaving the operator with nothing to act on.
+func (m *modelScheduler) noCandidateReasonLocked(model string) string {
+	registered := 0
+	if m != nil {
+		registered = len(m.entries)
+	}
+	if registered == 0 {
+		return fmt.Sprintf("no credential covers model %q", model)
+	}
+	return fmt.Sprintf("%d credential(s) cover model %q but none can serve this request", registered, model)
 }
 
 func (m *modelScheduler) latestCandidateErrorWithTimeLocked(model string, predicate func(*scheduledAuth) bool) (error, time.Time, string) {
@@ -1523,14 +1705,26 @@ func (m *modelScheduler) candidateErrorsLocked(model string, predicate func(*sch
 
 // availabilitySummaryLocked summarizes total candidates, cooldown count, and earliest retry time.
 func (m *modelScheduler) availabilitySummaryLocked(predicate func(*scheduledAuth) bool) (int, int, int, time.Time) {
+	total, cooldownCount, unauthorizedCount, earliest, _ := m.availabilitySummaryWithScopeLocked(predicate, nil)
+	return total, cooldownCount, unauthorizedCount, earliest
+}
+
+// availabilitySummaryWithScopeLocked is availabilitySummaryLocked plus a count of
+// the entries the caller's pool scope removed. scopeRejected is nil for an
+// unscoped request, so the extra count stays zero and nothing else changes.
+func (m *modelScheduler) availabilitySummaryWithScopeLocked(predicate func(*scheduledAuth) bool, scopeRejected func(*scheduledAuth) bool) (int, int, int, time.Time, int) {
 	if m == nil {
-		return 0, 0, 0, time.Time{}
+		return 0, 0, 0, time.Time{}, 0
 	}
 	total := 0
 	cooldownCount := 0
 	unauthorizedCount := 0
+	scopeExcluded := 0
 	earliest := time.Time{}
 	for _, entry := range m.entries {
+		if scopeRejected != nil && scopeRejected(entry) {
+			scopeExcluded++
+		}
 		if predicate != nil && !predicate(entry) {
 			continue
 		}
@@ -1548,7 +1742,7 @@ func (m *modelScheduler) availabilitySummaryLocked(predicate func(*scheduledAuth
 			earliest = entry.nextRetryAt
 		}
 	}
-	return total, cooldownCount, unauthorizedCount, earliest
+	return total, cooldownCount, unauthorizedCount, earliest, scopeExcluded
 }
 
 // rebuildIndexesLocked reconstructs ready and blocked views from the current entry map.

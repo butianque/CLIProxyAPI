@@ -6,6 +6,7 @@ package handlers
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -66,6 +67,47 @@ const (
 // If errText is already valid JSON, it is returned as-is to preserve upstream error payloads.
 func BuildErrorResponseBody(status int, errText string) []byte {
 	return BuildErrorResponseBodyWithError(status, errText, nil)
+}
+
+// errorClassification is the client-facing classification an internal error may
+// carry. It is an interface because both CPA's own auth errors and the errors a
+// plugin returns over RPC implement it, and the HTTP layer must report the real
+// condition for either one without importing their packages.
+type errorClassification interface {
+	// ErrorCode is the machine-readable condition, for example "auth_not_found".
+	ErrorCode() string
+	// RetryableError reports whether a retry might fix the failure.
+	RetryableError() bool
+}
+
+// classifyError extracts the classification carried by err. It reports ok=false
+// when err carries no usable code, so callers keep their status-derived label.
+func classifyError(err error) (code string, retryable bool, ok bool) {
+	if err == nil {
+		return "", false, false
+	}
+	var classified errorClassification
+	if !errors.As(err, &classified) || classified == nil {
+		return "", false, false
+	}
+	code = strings.TrimSpace(classified.ErrorCode())
+	if code == "" {
+		return "", false, false
+	}
+	return code, classified.RetryableError(), true
+}
+
+// trimErrorCodePrefix drops a leading "<code>: " from text. The code now travels
+// in its own field, so repeating it inside the message only adds noise.
+func trimErrorCodePrefix(text, code string) string {
+	if code == "" {
+		return text
+	}
+	rest, ok := strings.CutPrefix(strings.TrimSpace(text), code+": ")
+	if !ok || strings.TrimSpace(rest) == "" {
+		return text
+	}
+	return rest
 }
 
 // BuildErrorResponseBodyWithError builds an OpenAI-compatible JSON error response body,
@@ -139,11 +181,33 @@ func BuildErrorResponseBodyWithError(status int, errText string, err error) []by
 		}
 	}
 
+	// A status-derived label is only a fallback. When the error carries its own
+	// code, report that code instead: every 5xx used to become
+	// internal_server_error, so "no credential can serve this model"
+	// (auth_not_found) reached clients as a CPA malfunction and a caller could not
+	// tell a capacity or configuration gap from a real defect. Only the generic
+	// labels are replaced, so the specific 4xx codes above keep their meaning.
+	//
+	// retryable is only emitted when it is true. The underlying field cannot
+	// distinguish "explicitly not retryable" from "not set", and reporting false
+	// for the latter would tell clients to give up where the code never said so.
+	var retryable *bool
+	if code == "" || code == "internal_server_error" {
+		if classifiedCode, classifiedRetryable, ok := classifyError(err); ok {
+			code = classifiedCode
+			errText = trimErrorCodePrefix(errText, classifiedCode)
+			if classifiedRetryable {
+				retryable = &classifiedRetryable
+			}
+		}
+	}
+
 	payload, errMarshal := json.Marshal(ErrorResponse{
 		Error: ErrorDetail{
-			Message: errText,
-			Type:    errType,
-			Code:    code,
+			Message:   errText,
+			Type:      errType,
+			Code:      code,
+			Retryable: retryable,
 		},
 	})
 	if errMarshal != nil {

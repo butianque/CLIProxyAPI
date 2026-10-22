@@ -979,7 +979,9 @@ func TestSessionAffinitySelector_ThinkingSuffixVariantsPreserveBindingAndRelease
 		t.Fatalf("third Pick() auth.ID = %q, want %q (thinking suffix variant should keep session stickiness)", third.ID, first.ID)
 	}
 
-	// Failure on a thinking-suffix variant (with explicit metadata) should properly release the session binding
+	// A transient failure on a thinking-suffix variant must keep the binding: the
+	// suffix resolves to the same cache key, and a failed attempt only changes
+	// availability, never the session's preference.
 	optsWithMetadata := cliproxyexecutor.Options{
 		OriginalRequest: payload,
 		Metadata: map[string]any{
@@ -996,13 +998,32 @@ func TestSessionAffinitySelector_ThinkingSuffixVariantsPreserveBindingAndRelease
 		Options:  optsWithMetadata,
 	})
 
+	kept, errKept := selector.Pick(context.Background(), "anthropic", "", opts, auths)
+	if errKept != nil {
+		t.Fatalf("Pick() after transient failure error = %v", errKept)
+	}
+	if kept.ID != first.ID {
+		t.Fatalf("Pick() after transient failure auth.ID = %q, want %q (a transient failure must not move the session)", kept.ID, first.ID)
+	}
+
+	// A structural model-not-found result resolves the same suffixed key and does
+	// release it, because that credential can never serve this model.
+	selector.OnResult(Result{
+		Provider: "anthropic",
+		Model:    "(high)",
+		AuthID:   first.ID,
+		Success:  false,
+		Error:    &Error{Code: "model_not_found", Message: "model not found"},
+		Options:  optsWithMetadata,
+	})
+
 	// After release, next pick should reselect using fallback selector
 	next, errNext := selector.Pick(context.Background(), "anthropic", "claude-sonnet-4-5", opts, auths)
 	if errNext != nil {
 		t.Fatalf("next Pick() error = %v", errNext)
 	}
 	if next.ID == first.ID {
-		t.Fatalf("next Pick() auth.ID = %q, should have reselected a different auth after failure release", next.ID)
+		t.Fatalf("next Pick() auth.ID = %q, should have reselected a different auth after model_not_found release", next.ID)
 	}
 }
 

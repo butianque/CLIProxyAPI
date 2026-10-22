@@ -50,6 +50,7 @@ type rpcError struct {
 	Code       string
 	message    string
 	statusCode int
+	retryable  bool
 }
 
 func (e rpcError) Error() string {
@@ -58,6 +59,17 @@ func (e rpcError) Error() string {
 
 func (e rpcError) StatusCode() int {
 	return e.statusCode
+}
+
+// ErrorCode reports the code the plugin declared. The HTTP layer prefers it over
+// the status-derived label so the plugin's own condition reaches the client.
+func (e rpcError) ErrorCode() string {
+	return strings.TrimSpace(e.Code)
+}
+
+// RetryableError reports whether the plugin declared the failure retryable.
+func (e rpcError) RetryableError() bool {
+	return e.retryable
 }
 
 type rpcResponseNormalizer struct {
@@ -381,6 +393,7 @@ func decodeEnvelopeResult[T any](envelope pluginabi.Envelope) (T, error) {
 				Code:       strings.TrimSpace(envelope.Error.Code),
 				message:    message,
 				statusCode: envelope.Error.HTTPStatus,
+				retryable:  envelope.Error.Retryable,
 			}
 		}
 		return zero, fmt.Errorf("plugin call failed")

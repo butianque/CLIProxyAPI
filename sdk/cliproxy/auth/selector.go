@@ -1064,7 +1064,9 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 				return auth, nil
 			}
 		}
-		// Cached auth not available, reselect via fallback selector for even distribution
+		// The bound credential cannot serve this request right now. Reselect via the
+		// fallback selector; OnResult keeps the binding across temporary failures, so
+		// the session only moves when the credential really stops being usable.
 		auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
 		if err != nil {
 			return nil, err
@@ -1545,9 +1547,19 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 		return
 	}
 
-	s.cache.CompareAndDelete(cacheKey, res.AuthID)
-	if fallbackKey != "" {
-		s.cache.CompareAndDelete(fallbackKey, res.AuthID)
+	// A failed attempt changes availability, not preference. The credential cools
+	// down and the next request borrows another one, but the session keeps its home
+	// so it can return once the credential recovers. Deleting the binding here is
+	// what used to migrate whole conversations, and their upstream prompt cache, on
+	// a single 5xx or 429.
+	//
+	// The exception is a credential that structurally cannot serve this model: the
+	// binding is keyed by model, so it would only ever produce a wasted borrow.
+	if res.Error != nil && res.Error.Code == "model_not_found" {
+		s.cache.CompareAndDelete(cacheKey, res.AuthID)
+		if fallbackKey != "" {
+			s.cache.CompareAndDelete(fallbackKey, res.AuthID)
+		}
 	}
 }
 

@@ -68,6 +68,12 @@ func enrichAuthSelectionError(err error, providers []string, model string) error
 	}
 
 	baseMessage := strings.TrimSpace(authErr.Message)
+	// The producers now explain themselves ("no credentials registered for
+	// provider X", "3 credential(s) cover model Y but none can serve this
+	// request"). Appending the provider list and model to such a message would
+	// state the same thing twice, so context is only added when the message is
+	// the bare fallback.
+	hasOwnDetail := baseMessage != "" && baseMessage != "no auth available"
 	if baseMessage == "" {
 		baseMessage = "no auth available"
 	}
@@ -78,7 +84,24 @@ func enrichAuthSelectionError(err error, providers []string, model string) error
 		upstreamSummary = coreauth.ExtractUpstreamErrorSummary(cause.Error())
 	}
 	var detail string
-	if upstreamSummary != "" && !strings.Contains(baseMessage, upstreamSummary) {
+	if hasOwnDetail {
+		// Append only the context the message does not already carry, so the
+		// caller keeps every useful fact without reading the same one twice.
+		detail = baseMessage
+		missing := make([]string, 0, 3)
+		if providerText != "unknown" && !strings.Contains(detail, providerText) {
+			missing = append(missing, "providers="+providerText)
+		}
+		if modelText != "unknown" && !strings.Contains(detail, modelText) {
+			missing = append(missing, "model="+modelText)
+		}
+		if upstreamSummary != "" && !strings.Contains(detail, upstreamSummary) {
+			missing = append(missing, "last upstream error: "+upstreamSummary)
+		}
+		if len(missing) > 0 {
+			detail += " (" + strings.Join(missing, "; ") + ")"
+		}
+	} else if upstreamSummary != "" && !strings.Contains(baseMessage, upstreamSummary) {
 		detail = fmt.Sprintf("%s (providers=%s, model=%s; last upstream error: %s)", baseMessage, providerText, modelText, upstreamSummary)
 	} else {
 		detail = fmt.Sprintf("%s (providers=%s, model=%s)", baseMessage, providerText, modelText)

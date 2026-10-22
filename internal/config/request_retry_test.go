@@ -1,6 +1,10 @@
 package config
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestParseConfigBytesRequestRetry(t *testing.T) {
 	cfg, errParse := ParseConfigBytes([]byte(`
@@ -70,4 +74,35 @@ func valueOrNil[T any](items []T) any {
 		return nil
 	}
 	return items[0]
+}
+
+func TestLoadConfigRetryDefaults(t *testing.T) {
+	cases := []struct {
+		name      string
+		yaml      string
+		wantRetry int
+		wantMax   int
+	}{
+		{name: "absent keys use defaults", yaml: "port: 8317\n", wantRetry: 3, wantMax: 30},
+		{name: "explicit zero is preserved", yaml: "port: 8317\nrequest-retry: 0\nmax-retry-interval: 0\n", wantRetry: 0, wantMax: 0},
+		{name: "explicit values are preserved", yaml: "port: 8317\nrequest-retry: 5\nmax-retry-interval: 12\n", wantRetry: 5, wantMax: 12},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if errWrite := os.WriteFile(path, []byte(tc.yaml), 0600); errWrite != nil {
+				t.Fatalf("write config: %v", errWrite)
+			}
+			cfg, errLoad := LoadConfig(path)
+			if errLoad != nil {
+				t.Fatalf("LoadConfig() error = %v", errLoad)
+			}
+			if cfg.RequestRetry != tc.wantRetry {
+				t.Fatalf("request-retry = %d, want %d", cfg.RequestRetry, tc.wantRetry)
+			}
+			if cfg.MaxRetryInterval != tc.wantMax {
+				t.Fatalf("max-retry-interval = %d, want %d", cfg.MaxRetryInterval, tc.wantMax)
+			}
+		})
+	}
 }

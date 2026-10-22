@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
@@ -10,8 +11,8 @@ import (
 )
 
 // poolAuth builds a credential addressed by its backing file name, which is how
-// credential-pools identifies membership. There is no attribute: pool membership
-// is declared in configuration, never inferred from a credential's provider.
+// the credential-pools table identifies membership. Its provider is the account
+// category a scope entry may also name.
 func poolAuth(fileName string) *Auth {
 	return &Auth{ID: fileName, FileName: fileName + ".json", Provider: "zcode"}
 }
@@ -56,7 +57,8 @@ func TestAllowsCredentialUsesExplicitPoolTable(t *testing.T) {
 		{"unlisted credential is rejected", poolAuth("loomy-16723433586"), []string{"loomy"}, false},
 		{"pool name is matched case-insensitively", poolAuth("zcode-paid-1"), []string{"zcode-paid!"}, true},
 		{"wrong pool is rejected", poolAuth("loomy-main"), []string{"zcode-free"}, false},
-		{"membership is not inferred from provider", poolAuth("loomy-unknown"), []string{"zcode"}, false},
+		{"scope names the credential's category", poolAuth("unlisted"), []string{"zcode"}, true},
+		{"another category is rejected", &Auth{ID: "l", FileName: "l.json", Provider: "loomy"}, []string{"zcode"}, false},
 		{"one of several scopes matches", poolAuth("zcode-free-1"), []string{"loomy", "zcode-free"}, true},
 		{"nil auth with restriction is rejected", nil, []string{"loomy"}, false},
 	}
@@ -70,14 +72,24 @@ func TestAllowsCredentialUsesExplicitPoolTable(t *testing.T) {
 	}
 }
 
-func TestAllowsCredentialRejectsEverythingWhenTableIsEmpty(t *testing.T) {
-	// A scoped caller cannot match anything when no pool membership is declared.
-	// This is the safety property: a restricted key must never silently fall back
-	// onto an unrelated credential.
+func TestAllowsCredentialScopesByCategoryWithoutPoolTable(t *testing.T) {
+	// A scope entry that names an account category needs no declared membership:
+	// the category is the credential's provider, so it follows the live credential
+	// set. This is what makes a scoped key track accounts being added or removed
+	// without a configuration write.
 	setCredentialPools(nil)
-	eligibility := authSelectionEligibility{allowedPools: []string{"loomy"}}
-	if eligibility.allows(poolAuth("loomy-main")) {
-		t.Fatal("a scoped caller was allowed through an empty credential-pools table")
+
+	if !(authSelectionEligibility{allowedPools: []string{"zcode"}}).allows(poolAuth("any-name")) {
+		t.Fatal("a key scoped to the credential's category must be allowed through an empty pool table")
+	}
+	if (authSelectionEligibility{allowedPools: []string{"loomy"}}).allows(poolAuth("any-name")) {
+		t.Fatal("a key scoped to another category must not reach a zcode credential")
+	}
+	// The safety property: a scope that matches neither a category nor a pool
+	// entry allows nothing, so a restricted key never silently falls back onto an
+	// unrelated credential.
+	if (authSelectionEligibility{allowedPools: []string{"no-such-category"}}).allows(poolAuth("any-name")) {
+		t.Fatal("an unmatched scope must reject every credential")
 	}
 }
 
@@ -188,8 +200,10 @@ func TestSelectAuthHonorsCredentialPoolScopeEndToEnd(t *testing.T) {
 		t.Fatalf("SelectAuth(loomy scope) selected %q, want pool-loomy", selected.ID)
 	}
 
-	// A zcode-bigmodel-scoped caller cannot reach the loomy credential: the pool
-	// table lists only pool-zcode, so there is nothing to select.
+	// A zcode-bigmodel-scoped caller cannot reach the loomy credential: neither the
+	// declared pool nor the category matches, so there is nothing to select. The
+	// error must name the scope, otherwise the caller cannot tell a misconfigured
+	// scope apart from a missing credential.
 	if _, errWrong := manager.SelectAuth(context.Background(), "loomy", model, cliproxyexecutor.Options{
 		Metadata: map[string]any{cliproxyexecutor.AllowedPoolsMetadataKey: "zcode-bigmodel"},
 	}); errWrong == nil {
@@ -198,6 +212,26 @@ func TestSelectAuthHonorsCredentialPoolScopeEndToEnd(t *testing.T) {
 		var authErr *Error
 		if !errors.As(errWrong, &authErr) || authErr.Code != "auth_not_found" {
 			t.Fatalf("SelectAuth(zcode scope on loomy provider) error = %v, want auth_not_found", errWrong)
+		}
+		if !strings.Contains(authErr.Message, "outside the key's scope") {
+			t.Fatalf("SelectAuth(zcode scope on loomy provider) message = %q, want it to name the scope", authErr.Message)
+		}
+		if !strings.Contains(authErr.Message, "zcode-bigmodel") {
+			t.Fatalf("SelectAuth(zcode scope on loomy provider) message = %q, want it to name the scoped entry", authErr.Message)
+		}
+	}
+
+	// Without a scope the same miss keeps the plain message: nothing was excluded
+	// by scoping, so naming the scope would be misleading.
+	if _, errPlain := manager.SelectAuth(context.Background(), "loomy", "no-such-model", cliproxyexecutor.Options{}); errPlain == nil {
+		t.Fatal("SelectAuth(unrestricted unknown model) error = nil, want auth_not_found")
+	} else {
+		var authErr *Error
+		if !errors.As(errPlain, &authErr) || authErr.Code != "auth_not_found" {
+			t.Fatalf("SelectAuth(unrestricted unknown model) error = %v, want auth_not_found", errPlain)
+		}
+		if strings.Contains(authErr.Message, "key's scope") {
+			t.Fatalf("SelectAuth(unrestricted unknown model) message = %q, want no scope wording", authErr.Message)
 		}
 	}
 
@@ -208,5 +242,55 @@ func TestSelectAuthHonorsCredentialPoolScopeEndToEnd(t *testing.T) {
 	}
 	if selectedZcode.ID != "pool-zcode" {
 		t.Fatalf("SelectAuth(unrestricted zcode) selected %q, want pool-zcode", selectedZcode.ID)
+	}
+}
+
+func TestSelectAuthScopesByAccountCategoryEndToEnd(t *testing.T) {
+	const model = "glm-5.3"
+	reg := registry.GetGlobalRegistry()
+
+	// No credential-pools table at all: the category alone has to decide.
+	setCredentialPools(nil)
+
+	loomyAuth := &Auth{ID: "cat-loomy", FileName: "cat-loomy.json", Provider: "loomy"}
+	workbuddyAuth := &Auth{ID: "cat-wb", FileName: "cat-wb.json", Provider: "workbuddy-global"}
+	for _, auth := range []*Auth{loomyAuth, workbuddyAuth} {
+		reg.RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+		authID := auth.ID
+		t.Cleanup(func() { reg.UnregisterClient(authID) })
+	}
+
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	manager.executors["loomy"] = schedulerTestExecutor{}
+	manager.executors["workbuddy-global"] = schedulerTestExecutor{}
+	for _, auth := range []*Auth{loomyAuth, workbuddyAuth} {
+		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
+		}
+	}
+
+	// Each category reaches exactly its own credential, even though both serve the
+	// same model through the same selector.
+	for _, tc := range []struct{ category, want string }{
+		{"loomy", "cat-loomy"},
+		{"workbuddy-global", "cat-wb"},
+	} {
+		selected, errSelect := manager.SelectAuth(context.Background(), tc.category, model, cliproxyexecutor.Options{
+			Metadata: map[string]any{cliproxyexecutor.AllowedPoolsMetadataKey: tc.category},
+		})
+		if errSelect != nil {
+			t.Fatalf("SelectAuth(%s scope) error = %v", tc.category, errSelect)
+		}
+		if selected.ID != tc.want {
+			t.Fatalf("SelectAuth(%s scope) selected %q, want %q", tc.category, selected.ID, tc.want)
+		}
+	}
+
+	// A scope naming a category that no credential belongs to must fail loudly
+	// rather than fall back onto the unrestricted set.
+	if _, errMiss := manager.SelectAuth(context.Background(), "loomy", model, cliproxyexecutor.Options{
+		Metadata: map[string]any{cliproxyexecutor.AllowedPoolsMetadataKey: "zcode-bigmodel"},
+	}); errMiss == nil {
+		t.Fatal("SelectAuth(unmatched category scope) error = nil, want auth_not_found")
 	}
 }

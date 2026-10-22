@@ -399,6 +399,109 @@ func TestBuildErrorResponseBodyWithError_TerminalAuthEnforcesContractOnJSONInput
 	}
 }
 
+// TestBuildErrorResponseBodyWithError_PrefersCarriedCodeOverStatusLabel pins the
+// fix for a mislabelled failure: every 5xx body used to be reported as
+// internal_server_error regardless of what actually happened, so "no credential
+// can serve this model" reached clients as a CPA malfunction.
+func TestBuildErrorResponseBodyWithError_PrefersCarriedCodeOverStatusLabel(t *testing.T) {
+	retryable := true
+	tests := []struct {
+		name          string
+		status        int
+		errText       string
+		err           error
+		wantCode      string
+		wantType      string
+		wantMessage   string
+		wantRetryable *bool
+	}{
+		{
+			name:        "auth_not_found keeps its own code",
+			status:      http.StatusServiceUnavailable,
+			errText:     "auth_not_found: no credential for provider \"zcode\" covers model \"glm-5.3\"",
+			err:         &coreauth.Error{Code: "auth_not_found", Message: "no credential for provider \"zcode\" covers model \"glm-5.3\""},
+			wantCode:    "auth_not_found",
+			wantType:    "server_error",
+			wantMessage: "no credential for provider \"zcode\" covers model \"glm-5.3\"",
+		},
+		{
+			name:          "retryable survives to the client",
+			status:        http.StatusServiceUnavailable,
+			errText:       "auth_unavailable: no auth available",
+			err:           &coreauth.Error{Code: "auth_unavailable", Message: "no auth available", Retryable: true, HTTPStatus: http.StatusServiceUnavailable},
+			wantCode:      "auth_unavailable",
+			wantType:      "server_error",
+			wantMessage:   "no auth available",
+			wantRetryable: &retryable,
+		},
+		{
+			// errorWithCause.As only matches *Error targets, so the code has to be
+			// reachable through the wrapper itself for the handler to find it.
+			name:        "code found through a cause wrapper",
+			status:      http.StatusInternalServerError,
+			errText:     "executor_not_found: executor not registered",
+			err:         coreauth.WithCause(&coreauth.Error{Code: "executor_not_found", Message: "executor not registered"}, errors.New("plugin load failed")),
+			wantCode:    "executor_not_found",
+			wantType:    "server_error",
+			wantMessage: "executor not registered",
+		},
+		{
+			name:        "no code falls back to the status label",
+			status:      http.StatusInternalServerError,
+			errText:     "boom",
+			err:         errors.New("boom"),
+			wantCode:    "internal_server_error",
+			wantType:    "server_error",
+			wantMessage: "boom",
+		},
+		{
+			// The specific 4xx labels are more precise than a generic internal
+			// code, so a carried code must not displace them.
+			name:        "specific 4xx label wins over a carried code",
+			status:      http.StatusTooManyRequests,
+			errText:     "rate limited",
+			err:         &coreauth.Error{Code: "auth_unavailable", Message: "rate limited", HTTPStatus: http.StatusTooManyRequests},
+			wantCode:    "rate_limit_exceeded",
+			wantType:    "rate_limit_error",
+			wantMessage: "rate limited",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			body := BuildErrorResponseBodyWithError(tc.status, tc.errText, tc.err)
+			var payload struct {
+				Error struct {
+					Type      string `json:"type"`
+					Code      string `json:"code"`
+					Message   string `json:"message"`
+					Retryable *bool  `json:"retryable"`
+				} `json:"error"`
+			}
+			if errUnmarshal := json.Unmarshal(body, &payload); errUnmarshal != nil {
+				t.Fatalf("unmarshal error body: %v", errUnmarshal)
+			}
+			if payload.Error.Code != tc.wantCode {
+				t.Fatalf("code = %q, want %q", payload.Error.Code, tc.wantCode)
+			}
+			if payload.Error.Type != tc.wantType {
+				t.Fatalf("type = %q, want %q", payload.Error.Type, tc.wantType)
+			}
+			if payload.Error.Message != tc.wantMessage {
+				t.Fatalf("message = %q, want %q", payload.Error.Message, tc.wantMessage)
+			}
+			switch {
+			case tc.wantRetryable == nil && payload.Error.Retryable != nil:
+				t.Fatalf("retryable = %v, want the field omitted", *payload.Error.Retryable)
+			case tc.wantRetryable != nil && payload.Error.Retryable == nil:
+				t.Fatalf("retryable missing, want %v", *tc.wantRetryable)
+			case tc.wantRetryable != nil && *payload.Error.Retryable != *tc.wantRetryable:
+				t.Fatalf("retryable = %v, want %v", *payload.Error.Retryable, *tc.wantRetryable)
+			}
+		})
+	}
+}
+
 func TestBuildErrorResponseBodyWithError_RequestTimeoutIsServerError(t *testing.T) {
 	body := BuildErrorResponseBodyWithError(http.StatusRequestTimeout, "upstream request timeout", nil)
 	var payload struct {
@@ -920,5 +1023,66 @@ func TestWriteErrorResponse_ContextCanceledUses499(t *testing.T) {
 
 	if recorder.Code != clienterror.StatusClientClosedRequest {
 		t.Fatalf("status = %d, want %d", recorder.Code, clienterror.StatusClientClosedRequest)
+	}
+}
+
+// TestEnrichAuthSelectionError_KeepsSelfExplanatoryMessage pins that the added
+// context does not repeat the message. Once the selection layer names what is
+// missing, appending the provider list and model again says the same thing twice
+// and buries the actionable part.
+func TestEnrichAuthSelectionError_KeepsSelfExplanatoryMessage(t *testing.T) {
+	in := &coreauth.Error{
+		Code:    "auth_not_found",
+		Message: `no credential can serve model "glm-5.3" (no credentials registered for zcode-bigmodel,zcode-zai)`,
+	}
+	out := enrichAuthSelectionError(in, []string{"zcode-bigmodel", "zcode-zai"}, "glm-5.3")
+
+	var got *coreauth.Error
+	if !errors.As(out, &got) || got == nil {
+		t.Fatalf("expected coreauth.Error, got %T", out)
+	}
+	if got.StatusCode() != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", got.StatusCode(), http.StatusServiceUnavailable)
+	}
+	if got.Code != "auth_not_found" {
+		t.Fatalf("code = %q, want auth_not_found", got.Code)
+	}
+	if strings.Contains(got.Message, "providers=") {
+		t.Fatalf("message = %q, want no repeated provider list", got.Message)
+	}
+	if strings.Count(got.Message, "glm-5.3") != 1 {
+		t.Fatalf("message = %q, want the model named once", got.Message)
+	}
+	if !strings.Contains(got.Message, "no credentials registered for zcode-bigmodel,zcode-zai") {
+		t.Fatalf("message = %q, want the original explanation preserved", got.Message)
+	}
+}
+
+// TestEnrichAuthSelectionError_AppendsOnlyMissingContext pins the other half of the
+// rule: when the message is its own explanation but leaves out the model, the
+// context is still added. Dropping it outright would trade a duplicated phrase for
+// a missing fact.
+func TestEnrichAuthSelectionError_AppendsOnlyMissingContext(t *testing.T) {
+	in := &coreauth.Error{
+		Code:    "auth_not_found",
+		Message: "no auth available in scope zcode-bigmodel; 2 credential(s) for this model are outside the key's scope",
+	}
+	out := enrichAuthSelectionError(in, []string{"loomy"}, "glm-5.3")
+
+	var got *coreauth.Error
+	if !errors.As(out, &got) || got == nil {
+		t.Fatalf("expected coreauth.Error, got %T", out)
+	}
+	if !strings.Contains(got.Message, "no auth available in scope zcode-bigmodel") {
+		t.Fatalf("message = %q, want the original explanation preserved", got.Message)
+	}
+	if !strings.Contains(got.Message, "model=glm-5.3") {
+		t.Fatalf("message = %q, want the missing model context appended", got.Message)
+	}
+	if !strings.Contains(got.Message, "providers=loomy") {
+		t.Fatalf("message = %q, want the missing provider context appended", got.Message)
+	}
+	if strings.Contains(got.Message, "providers=loomy, model=glm-5.3)") {
+		t.Fatalf("message = %q, want the appended context in the compact form", got.Message)
 	}
 }

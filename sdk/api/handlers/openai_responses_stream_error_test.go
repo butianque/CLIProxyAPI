@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 func TestBuildOpenAIResponsesStreamErrorChunk(t *testing.T) {
@@ -264,5 +266,50 @@ func TestBuildOpenAIResponsesStreamErrorChunkRequestTimeoutIsServerError(t *test
 	}
 	if got := failedPayload.Response.Error["type"]; got != "server_error" {
 		t.Fatalf("failed.response.error.type = %v, want %q", got, "server_error")
+	}
+}
+
+// TestBuildOpenAIResponsesStreamErrorChunkCarriesInternalCode pins that a streaming
+// error reports the real condition rather than a generic internal_server_error.
+// A stream client reads the code to decide whether replaying is worthwhile, so
+// labelling a credential gap as a CPA malfunction sends it down the wrong path.
+func TestBuildOpenAIResponsesStreamErrorChunkCarriesInternalCode(t *testing.T) {
+	chunk := BuildOpenAIResponsesStreamErrorChunk(
+		http.StatusServiceUnavailable,
+		`auth_not_found: no credential for provider "zcode" covers model "glm-5.3"`,
+		3,
+		&coreauth.Error{Code: "auth_not_found", Message: `no credential for provider "zcode" covers model "glm-5.3"`},
+	)
+	var payload map[string]any
+	if err := json.Unmarshal(chunk, &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	errorObj, ok := payload["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("error is not an object: %v", payload["error"])
+	}
+	if errorObj["code"] != "auth_not_found" {
+		t.Fatalf("code = %v, want %q", errorObj["code"], "auth_not_found")
+	}
+	wantMessage := `no credential for provider "zcode" covers model "glm-5.3"`
+	if errorObj["message"] != wantMessage {
+		t.Fatalf("message = %v, want %q", errorObj["message"], wantMessage)
+	}
+	if payload["sequence_number"] != float64(3) {
+		t.Fatalf("sequence_number = %v, want %v", payload["sequence_number"], 3)
+	}
+
+	// Without a classification the status label stays the fallback.
+	plainChunk := BuildOpenAIResponsesStreamErrorChunk(http.StatusInternalServerError, "unexpected EOF", 0)
+	var plain map[string]any
+	if err := json.Unmarshal(plainChunk, &plain); err != nil {
+		t.Fatalf("unmarshal plain: %v", err)
+	}
+	plainError, ok := plain["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("plain error is not an object: %v", plain["error"])
+	}
+	if plainError["code"] != "internal_server_error" {
+		t.Fatalf("plain code = %v, want %q", plainError["code"], "internal_server_error")
 	}
 }

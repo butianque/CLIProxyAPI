@@ -387,10 +387,10 @@ func TestConfigV8DeleteLastField(t *testing.T) {
 		path  string
 		check func(*config.Config) bool
 	}{
-		{"retry", "request-retry: 3\n", "routing/retry/request-retry", func(cfg *config.Config) bool { return cfg.RequestRetry == 0 }},
+		{"retry", "request-retry: 7\n", "routing/retry/request-retry", func(cfg *config.Config) bool { return cfg.RequestRetry == 3 }},
 		{"websocket", "ws-auth: false\n", "oauth/providers/aistudio/ws-auth", func(cfg *config.Config) bool { return cfg.WebsocketAuth }},
 		{"debug", "debug: true\n", "observability/logs/debug", func(cfg *config.Config) bool { return !cfg.Debug }},
-		{"sibling", "routing: {strategy: fill-first, retry: {request-retry: 3}}\n", "routing/retry/request-retry", func(cfg *config.Config) bool { return cfg.RequestRetry == 0 && cfg.Routing.Strategy == "fill-first" }},
+		{"sibling", "routing: {strategy: fill-first, retry: {request-retry: 7}}\n", "routing/retry/request-retry", func(cfg *config.Config) bool { return cfg.RequestRetry == 3 && cfg.Routing.Strategy == "fill-first" }},
 		{"provider", "oauth: {providers: {codex: {disable-codex-cloaking: true}}}\n", "upstream/codex/disable-codex-cloaking", func(cfg *config.Config) bool { return !cfg.Codex.DisableCodexCloaking }},
 		{"excluded models", "oauth: {excluded-models: {codex: [blocked-model]}}\n", "oauth/excluded-models", func(cfg *config.Config) bool { return len(cfg.OAuthExcludedModels) == 0 }},
 	} {
@@ -451,7 +451,7 @@ func TestConfigV8DeleteLastField(t *testing.T) {
 
 func TestConfigV8ReplaceEmptyGroup(t *testing.T) {
 	for _, tc := range []struct{ path, raw string }{
-		{"routing/retry", "routing: {retry: {request-retry: 3}}\n"},
+		{"routing/retry", "routing: {retry: {request-retry: 7}}\n"},
 		{"oauth/providers/aistudio", "oauth: {providers: {aistudio: {ws-auth: false}}}\n"},
 		{"observability/logs", "observability: {logs: {debug: true}}\n"},
 	} {
@@ -476,7 +476,9 @@ func TestConfigV8ReplaceEmptyGroup(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if loaded.RequestRetry != 0 || !loaded.WebsocketAuth || loaded.Debug {
+			// request-retry has a non-zero default (3), so an empty replacement must
+			// restore 3 rather than leave 7 behind or fall back to 0.
+			if loaded.RequestRetry != 3 || !loaded.WebsocketAuth || loaded.Debug {
 				t.Fatal("empty replacement did not restore defaults")
 			}
 		})

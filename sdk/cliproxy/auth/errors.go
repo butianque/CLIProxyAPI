@@ -96,6 +96,21 @@ func (e *Error) StatusCode() int {
 	return e.HTTPStatus
 }
 
+// ErrorCode reports the machine-readable code. The HTTP layer prefers it over the
+// status-derived label so a client sees the real condition (for example
+// "auth_not_found") instead of a generic "internal_server_error".
+func (e *Error) ErrorCode() string {
+	if e == nil {
+		return ""
+	}
+	return strings.TrimSpace(e.Code)
+}
+
+// RetryableError reports whether retrying might fix the failure.
+func (e *Error) RetryableError() bool {
+	return e != nil && e.Retryable
+}
+
 // IsRequestScoped reports whether the failure is tied to the current request
 // rather than the selected credential.
 func (e *Error) IsRequestScoped() bool {
@@ -179,6 +194,27 @@ func (e *errorWithCause) StatusCode() int {
 		return 0
 	}
 	return e.base.HTTPStatus
+}
+
+// ErrorCode reports the machine-readable code of the wrapped error.
+//
+// It delegates to base rather than relying on errors.As to reach it: this type's
+// As method only matches *Error targets, so an interface lookup would skip the
+// base error and report nothing. The HTTP layer asks for the code through an
+// interface, so the delegation has to happen here.
+func (e *errorWithCause) ErrorCode() string {
+	if e == nil {
+		return ""
+	}
+	return e.base.ErrorCode()
+}
+
+// RetryableError reports whether the wrapped error is retryable.
+func (e *errorWithCause) RetryableError() bool {
+	if e == nil {
+		return false
+	}
+	return e.base.RetryableError()
 }
 
 func (e *errorWithCause) IsRequestScoped() bool {
@@ -284,6 +320,27 @@ func (e *authUnavailableError) StatusCode() int {
 		return 0
 	}
 	return e.base.HTTPStatus
+}
+
+// ErrorCode reports the machine-readable code of the wrapped error.
+//
+// It delegates to base for the same reason errorWithCause does: this type's As
+// method only matches *Error targets, so an interface lookup would skip the base
+// error. A cooldown failure is precisely the case where the client needs the real
+// code and the retryable flag, so both are reported through the wrapper.
+func (e *authUnavailableError) ErrorCode() string {
+	if e == nil {
+		return ""
+	}
+	return e.base.ErrorCode()
+}
+
+// RetryableError reports whether the wrapped error is retryable.
+func (e *authUnavailableError) RetryableError() bool {
+	if e == nil {
+		return false
+	}
+	return e.base.RetryableError()
 }
 
 func (e *authUnavailableError) IsRequestScoped() bool {

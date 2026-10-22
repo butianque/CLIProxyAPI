@@ -62,11 +62,12 @@ type SDKConfig struct {
 	// APIKeys is a list of keys for authenticating clients to this proxy server.
 	APIKeys []string `yaml:"api-keys" json:"api-keys"`
 
-	// KeyPools optionally scopes a client API key to one or more credential pools.
-	// It maps a client API key to the pools it may route to; a key absent from this
-	// map is unrestricted. Which credentials belong to a pool is declared
-	// explicitly by CredentialPools — this map does not infer membership from a
-	// credential's provider.
+	// KeyPools optionally scopes a client API key to one or more scopes.
+	// It maps a client API key to the scopes it may route to; a key absent from this
+	// map is unrestricted. A scope entry matches either a pool declared in
+	// CredentialPools or a credential category (the credential file's type, such as
+	// "loomy" or "workbuddy-global"), and the two kinds are ORed: a credential in any
+	// matching scope is eligible.
 	KeyPools map[string][]string `yaml:"key-pools,omitempty" json:"key-pools,omitempty"`
 
 	// CredentialPools declares pool membership explicitly: a pool name maps to the
@@ -74,6 +75,8 @@ type SDKConfig struct {
 	// belong to it. Selection restricts a scoped key to the union of the
 	// credentials listed here, so "why did this key route here" is answerable from
 	// one table. A pool that names no credential contributes nothing.
+	// Hand-written configurations remain supported; the management panel no longer
+	// creates pools.
 	CredentialPools map[string][]string `yaml:"credential-pools,omitempty" json:"credential-pools,omitempty"`
 
 	// PassthroughHeaders controls whether upstream response headers are forwarded to downstream clients.

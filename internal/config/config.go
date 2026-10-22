@@ -92,6 +92,7 @@ type Config struct {
 
 	// RequestRetry defines the number of additional credential retry rounds after
 	// the first round has exhausted its eligible credentials.
+	// Default: 3. 0 disables the additional rounds.
 	RequestRetry int `yaml:"request-retry" json:"request-retry"`
 	// MaxRetryCredentials defines the maximum number of different credentials to
 	// try in each credential retry round.
@@ -101,6 +102,7 @@ type Config struct {
 	// allowed before starting another credential retry round. A non-positive value
 	// forbids positive cooldown waits; it does not disable same-round credential
 	// failover or immediate additional rounds allowed by RequestRetry.
+	// Default: 30.
 	MaxRetryInterval int `yaml:"max-retry-interval" json:"max-retry-interval"`
 
 	// QuotaExceeded defines the behavior when a quota is exceeded.

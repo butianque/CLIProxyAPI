@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -2452,5 +2453,170 @@ func TestManagerPluginSchedulerUnhandledWithRejectFlagFallsBack(t *testing.T) {
 	}
 	if got == nil || got.ID != "auth-a" {
 		t.Fatalf("SelectAuth() got = %v, want auth-a", got)
+	}
+}
+
+// TestUnavailableErrorsNameWhyNoCredentialCouldServe pins the diagnostic detail on
+// an auth_not_found failure. The bare "no auth available" message left the operator
+// unable to tell a missing credential from a credential that does not cover the
+// model, and the handler surfaced both as a generic server error.
+func TestUnavailableErrorsNameWhyNoCredentialCouldServe(t *testing.T) {
+	t.Parallel()
+
+	t.Run("no credential registered for the provider", func(t *testing.T) {
+		t.Parallel()
+		scheduler := newAuthScheduler(&RoundRobinSelector{})
+		_, errPick := scheduler.pickSingle(context.Background(), "zcode", "glm-5.3", cliproxyexecutor.Options{}, nil)
+		var authErr *Error
+		if !errors.As(errPick, &authErr) || authErr == nil {
+			t.Fatalf("pickSingle() error = %v, want *Error", errPick)
+		}
+		if authErr.Code != "auth_not_found" {
+			t.Fatalf("code = %q, want auth_not_found", authErr.Code)
+		}
+		if !strings.Contains(authErr.Message, "no credentials registered") {
+			t.Fatalf("message = %q, want it to name the missing credentials", authErr.Message)
+		}
+		if !strings.Contains(authErr.Message, "zcode") {
+			t.Fatalf("message = %q, want it to name the provider", authErr.Message)
+		}
+	})
+
+	t.Run("credentials exist but none cover the model", func(t *testing.T) {
+		t.Parallel()
+		scheduler := newSchedulerForTest(
+			&RoundRobinSelector{},
+			&Auth{ID: "zcode-auth", Provider: "zcode"},
+		)
+		_, errPick := scheduler.pickSingle(context.Background(), "zcode", "glm-5.3", cliproxyexecutor.Options{}, nil)
+		var authErr *Error
+		if !errors.As(errPick, &authErr) || authErr == nil {
+			t.Fatalf("pickSingle() error = %v, want *Error", errPick)
+		}
+		if authErr.Code != "auth_not_found" {
+			t.Fatalf("code = %q, want auth_not_found", authErr.Code)
+		}
+		if !strings.Contains(authErr.Message, `no credential covers model "glm-5.3"`) {
+			t.Fatalf("message = %q, want it to name the uncovered model", authErr.Message)
+		}
+	})
+}
+
+// TestMixedUnavailableErrorReportsPerProviderReason pins that a multi-provider
+// request explains each provider separately instead of collapsing into one
+// unhelpful sentence.
+func TestMixedUnavailableErrorReportsPerProviderReason(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newAuthScheduler(&RoundRobinSelector{})
+	scheduler.mu.Lock()
+	errMixed := scheduler.mixedUnavailableErrorLocked([]string{"zcode", "loomy"}, "glm-5.3", nil)
+	scheduler.mu.Unlock()
+
+	var authErr *Error
+	if !errors.As(errMixed, &authErr) || authErr == nil {
+		t.Fatalf("mixedUnavailableErrorLocked() error = %v, want *Error", errMixed)
+	}
+	if authErr.Code != "auth_not_found" {
+		t.Fatalf("code = %q, want auth_not_found", authErr.Code)
+	}
+	for _, provider := range []string{"zcode", "loomy"} {
+		if !strings.Contains(authErr.Message, provider+": no credentials registered") {
+			t.Fatalf("message = %q, want a per-provider reason for %q", authErr.Message, provider)
+		}
+	}
+}
+
+// TestMixedSelectionExplainsMissingCredentials pins the message the live proxy
+// actually returns. A multi-provider request for a model whose providers hold no
+// credential used to answer "no auth available (providers=..., model=...)",
+// which reads like a CPA bug; naming the providers that have nothing configured
+// is what tells the operator where to add a credential.
+func TestMixedSelectionExplainsMissingCredentials(t *testing.T) {
+	t.Parallel()
+
+	t.Run("no credential registered for any provider", func(t *testing.T) {
+		t.Parallel()
+		// A non-builtin selector keeps the legacy selection path, which is the path
+		// the plugin-driven deployment uses.
+		manager := NewManager(nil, &trackingSelector{}, nil)
+		_, _, _, errPick := manager.pickNextMixed(
+			context.Background(),
+			[]string{"zcode-bigmodel", "zcode-zai"},
+			"glm-5.3",
+			cliproxyexecutor.Options{},
+			nil,
+		)
+		var authErr *Error
+		if !errors.As(errPick, &authErr) || authErr == nil {
+			t.Fatalf("pickNextMixed() error = %v, want *Error", errPick)
+		}
+		if authErr.Code != "auth_not_found" {
+			t.Fatalf("code = %q, want auth_not_found", authErr.Code)
+		}
+		if !strings.Contains(authErr.Message, "no credentials registered for zcode-bigmodel,zcode-zai") {
+			t.Fatalf("message = %q, want it to name the providers without credentials", authErr.Message)
+		}
+	})
+
+	t.Run("credential exists but is disabled", func(t *testing.T) {
+		t.Parallel()
+		manager := NewManager(nil, &trackingSelector{}, nil)
+		if _, errRegister := manager.Register(context.Background(), &Auth{
+			ID:       "zcode-disabled",
+			Provider: "zcode-bigmodel",
+			Disabled: true,
+		}); errRegister != nil {
+			t.Fatalf("Register() error = %v", errRegister)
+		}
+		_, _, _, errPick := manager.pickNextMixed(
+			context.Background(),
+			[]string{"zcode-bigmodel"},
+			"glm-5.3",
+			cliproxyexecutor.Options{},
+			nil,
+		)
+		var authErr *Error
+		if !errors.As(errPick, &authErr) || authErr == nil {
+			t.Fatalf("pickNextMixed() error = %v, want *Error", errPick)
+		}
+		if strings.Contains(authErr.Message, "no credentials registered") {
+			t.Fatalf("message = %q, want the disabled reason instead of a missing-credential reason", authErr.Message)
+		}
+		if !strings.Contains(authErr.Message, "1 disabled") {
+			t.Fatalf("message = %q, want it to name the disabled credential", authErr.Message)
+		}
+	})
+}
+
+// TestAuthUnavailableErrorReportsCodeAndRetryable pins the contract the HTTP layer
+// reads. The wrapper's As method only matches *Error targets, so an interface
+// lookup skips the wrapped error unless the wrapper delegates: without that, a
+// cooldown was reported as internal_server_error and lost its retryable flag --
+// the one case where telling the client to retry matters most.
+func TestAuthUnavailableErrorReportsCodeAndRetryable(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	errUnavailable := newAuthUnavailableErrorWithCause(now.Add(time.Minute), now, nil)
+
+	var authErr *Error
+	if !errors.As(errUnavailable, &authErr) || authErr == nil {
+		t.Fatalf("newAuthUnavailableErrorWithCause() = %v, want it to expose *Error", errUnavailable)
+	}
+
+	type classification interface {
+		ErrorCode() string
+		RetryableError() bool
+	}
+	var classified classification
+	if !errors.As(errUnavailable, &classified) || classified == nil {
+		t.Fatalf("newAuthUnavailableErrorWithCause() = %T, want it to expose the classification interface", errUnavailable)
+	}
+	if got := classified.ErrorCode(); got != "auth_unavailable" {
+		t.Fatalf("ErrorCode() = %q, want auth_unavailable", got)
+	}
+	if !classified.RetryableError() {
+		t.Fatal("RetryableError() = false, want true for a cooldown that ends")
 	}
 }

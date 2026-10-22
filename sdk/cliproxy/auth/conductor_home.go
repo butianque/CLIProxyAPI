@@ -926,13 +926,22 @@ func (m *Manager) homeRuntimeAuthByID(sessionID string, authID string) (*Auth, P
 }
 
 func (m *Manager) pickNextViaHome(ctx context.Context, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
+	return m.pickNextViaHomeWithEligibility(ctx, model, opts, tried, authSelectionEligibilityForRequest(ctx, opts))
+}
+
+// pickNextViaHomeWithEligibility is pickNextViaHome with the caller's auth
+// selection eligibility already resolved. Home decides the credential, so the
+// scope has to be enforced on what Home returns; passing the eligibility in
+// keeps that check identical to the local selectors instead of letting Home
+// bypass the caller's scope.
+func (m *Manager) pickNextViaHomeWithEligibility(ctx context.Context, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, eligibility authSelectionEligibility) (*Auth, ProviderExecutor, string, error) {
 	if m == nil {
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	selection, errSelection := m.pickHomeDispatchSelection(ctx, model, withHomeExcludedAuthIDs(opts, tried))
+	selection, errSelection := m.pickHomeDispatchSelectionWithEligibility(ctx, model, withHomeExcludedAuthIDs(opts, tried), eligibility)
 	if errSelection != nil {
 		return nil, nil, "", errSelection
 	}
@@ -949,6 +958,15 @@ func (m *Manager) pickNextViaHome(ctx context.Context, model string, opts clipro
 }
 
 func (m *Manager) pickHomeDispatchSelection(ctx context.Context, model string, opts cliproxyexecutor.Options) (*HomeDispatchSelection, error) {
+	return m.pickHomeDispatchSelectionWithEligibility(ctx, model, opts, authSelectionEligibilityForRequest(ctx, opts))
+}
+
+// pickHomeDispatchSelectionWithEligibility dispatches through Home and rejects a
+// dispatched credential the caller's eligibility does not allow. Home owns the
+// candidate set, so this is the only place where a scope can be enforced on a
+// Home pick: a restricted key must fail closed instead of executing on an
+// account outside its scope.
+func (m *Manager) pickHomeDispatchSelectionWithEligibility(ctx context.Context, model string, opts cliproxyexecutor.Options, eligibility authSelectionEligibility) (*HomeDispatchSelection, error) {
 	if m == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
@@ -972,7 +990,17 @@ func (m *Manager) pickHomeDispatchSelection(ctx context.Context, model string, o
 		return nil, errRetained
 	}
 	if retainedOK {
-		return retained, nil
+		// A retained session selection was made under the same key, but the key's
+		// scope can change between requests, so re-check it before reuse. Only the
+		// pool scope is re-checked: kind and credential-policy constraints belong to
+		// the caller's own re-dispatch loops, and rejecting them here would turn a
+		// normal retry into a hard failure.
+		if retainedAuth := retained.CloneAuth(); retainedAuth != nil && eligibility.allowsCredential(retainedAuth) {
+			return retained, nil
+		}
+		if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, retained, "scope_mismatch"); errEnd != nil {
+			return nil, errEnd
+		}
 	}
 	if sessionID := homeExecutionSessionIDFromMetadata(opts.Metadata); sessionID != "" {
 		if pinnedAuthID != "" {
@@ -1167,6 +1195,17 @@ func (m *Manager) pickHomeDispatchSelection(ctx context.Context, model string, o
 		endScope()
 		return nil, errIdentity
 	}
+	// Home owns the candidate set, so the caller's scope can only be enforced on
+	// the dispatched credential. Failing closed here is what keeps a restricted key
+	// from executing on an account outside its scope. Only the pool scope is
+	// enforced: kind and credential-policy mismatches are expected re-dispatch
+	// signals for the callers that own those loops (SelectHomeAuthByKind,
+	// SelectHomeAuthWithCredentialPolicy), so rejecting them here would turn a
+	// normal retry into a hard failure.
+	if !eligibility.allowsCredential(&auth) {
+		endScope()
+		return nil, homeScopeRejectionError(eligibility, &auth)
+	}
 	logicalProvider := strings.ToLower(strings.TrimSpace(auth.Provider))
 	executorKey := executorKeyFromAuth(&auth)
 	if logicalProvider == "" || executorKey == "" {
@@ -1231,6 +1270,29 @@ func (m *Manager) pickHomeDispatchSelection(ctx context.Context, model string, o
 	selection.CanonicalSessionID = sessionID
 	selection.ParentSessionID = parentSessionID
 	return selection, nil
+}
+
+// homeScopeRejectionError reports a Home dispatch the caller's eligibility does
+// not allow. Home owns its own candidate set, so the caller's pool scope can only
+// be enforced on the credential Home hands back; this error is what turns that
+// late check into an actionable message instead of a bare failure.
+func homeScopeRejectionError(eligibility authSelectionEligibility, auth *Auth) *Error {
+	credentialID := ""
+	if auth != nil {
+		credentialID = strings.TrimSpace(auth.ID)
+	}
+	if len(eligibility.allowedPools) > 0 && !eligibility.allowsCredential(auth) {
+		return &Error{
+			Code:       "auth_unavailable",
+			Message:    "home dispatched credential " + credentialID + " outside the key's scope " + strings.Join(eligibility.allowedPools, ","),
+			HTTPStatus: http.StatusServiceUnavailable,
+		}
+	}
+	return &Error{
+		Code:       "auth_unavailable",
+		Message:    "home dispatched credential " + credentialID + " that the caller's auth selection constraints do not allow",
+		HTTPStatus: http.StatusServiceUnavailable,
+	}
 }
 
 func homeRetryRoundFromMetadata(metadata map[string]any) int {

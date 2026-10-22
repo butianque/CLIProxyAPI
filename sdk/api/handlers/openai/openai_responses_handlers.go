@@ -259,10 +259,10 @@ func (f *responsesSSEFramer) repairErrorPayload(payload []byte) []byte {
 		seq = f.dataFrames - 1
 	}
 	if failureEvent == "response.failed" {
-		chunk := handlers.BuildOpenAIResponsesStreamFailedChunk(status, errText, seq)
+		chunk := handlers.BuildOpenAIResponsesStreamFailedChunk(status, errText, seq, errMsg.Error)
 		return []byte(fmt.Sprintf("event: response.failed\ndata: %s\n\n", chunk))
 	}
-	chunk := handlers.BuildOpenAIResponsesStreamErrorChunk(status, errText, seq)
+	chunk := handlers.BuildOpenAIResponsesStreamErrorChunk(status, errText, seq, errMsg.Error)
 	return []byte(fmt.Sprintf("event: error\ndata: %s\n\n", chunk))
 }
 
@@ -1091,11 +1091,11 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flush
 			seq = int(origSeq.Int())
 		}
 		if isCodexResponsesClientRequest(c) {
-			chunk := handlers.BuildOpenAIResponsesStreamFailedChunk(status, errText, seq)
+			chunk := handlers.BuildOpenAIResponsesStreamFailedChunk(status, errText, seq, errMsg.Error)
 			_, _ = fmt.Fprintf(c.Writer, "\nevent: response.failed\ndata: %s\n\n", string(chunk))
 			return
 		}
-		chunk := handlers.BuildOpenAIResponsesStreamErrorChunk(status, errText, seq)
+		chunk := handlers.BuildOpenAIResponsesStreamErrorChunk(status, errText, seq, errMsg.Error)
 		_, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", string(chunk))
 	}
 
