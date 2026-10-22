@@ -758,3 +758,91 @@ plugins:
 		request(http.MethodDelete, path, http.StatusNotFound, "")
 	}
 }
+
+// putConfigYAML saves a whole document the way the panel does.
+func putConfigYAML(router *gin.Engine, token, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPut, "/v8/management/config.yaml", strings.NewReader(body))
+	if token != "" {
+		req.Header.Set(sessionHeaderName, token)
+	}
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+	return recorder
+}
+
+// TestRotatingTheManagementKeyEvictsOtherSessions covers the promise the panel
+// makes next to the field: other signed-in browsers need the new key, this one
+// stays signed in. Sessions are independent of the key by design, so nothing else
+// would end them — a leaked key would keep working through every open browser.
+func TestRotatingTheManagementKeyEvictsOtherSessions(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("remote-management: {secret-key: old-key}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, errLoad := config.LoadConfig(path)
+	if errLoad != nil {
+		t.Fatal(errLoad)
+	}
+	h := &Handler{cfg: cfg, configFilePath: path}
+	router := gin.New()
+	router.PUT("/v8/management/config.yaml", h.PutConfigYAML)
+
+	_, operatorToken, errOperator := h.ensureSessions().create("10.0.0.1", false)
+	if errOperator != nil {
+		t.Fatal(errOperator)
+	}
+	_, otherToken, errOther := h.ensureSessions().create("10.0.0.2", false)
+	if errOther != nil {
+		t.Fatal(errOther)
+	}
+
+	recorder := putConfigYAML(router, operatorToken, "remote-management: {secret-key: new-key}\n")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("rotate the key: %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	if _, errLookup := h.ensureSessions().lookup(otherToken, "10.0.0.2"); errLookup == nil {
+		t.Fatal("a session opened with the old key must not survive the rotation")
+	}
+	if _, errLookup := h.ensureSessions().lookup(operatorToken, "10.0.0.1"); errLookup != nil {
+		t.Fatalf("the session that rotated the key must stay signed in: %v", errLookup)
+	}
+}
+
+// TestUnrelatedConfigSaveKeepsOtherSessions is the other half: an ordinary save
+// carries the stored bcrypt hash back through the parser unchanged, so it must not
+// be mistaken for a rotation and sign everyone out.
+func TestUnrelatedConfigSaveKeepsOtherSessions(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("remote-management: {secret-key: old-key}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, errLoad := config.LoadConfig(path)
+	if errLoad != nil {
+		t.Fatal(errLoad)
+	}
+	h := &Handler{cfg: cfg, configFilePath: path}
+	router := gin.New()
+	router.PUT("/v8/management/config.yaml", h.PutConfigYAML)
+
+	_, otherToken, errOther := h.ensureSessions().create("10.0.0.2", false)
+	if errOther != nil {
+		t.Fatal(errOther)
+	}
+
+	// The panel saves the document it read, with an unrelated field changed.
+	stored, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatal(errRead)
+	}
+	recorder := putConfigYAML(router, "", string(stored)+"port: 8317\n")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("save config: %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	if _, errLookup := h.ensureSessions().lookup(otherToken, "10.0.0.2"); errLookup != nil {
+		t.Fatalf("an unrelated save must not sign anyone out: %v", errLookup)
+	}
+}

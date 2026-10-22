@@ -244,9 +244,12 @@ func TestExpiredSessionIsRejected(t *testing.T) {
 	}
 }
 
-// TestQuietSessionStaysSignedIn is the separation the panel needs: a browser that
-// went quiet keeps its sign-in, while the credential grant it held does not.
+// TestQuietSessionStaysSignedIn covers the two clocks staying independent: they
+// are configured apart, and when the unlock window is the shorter one the grant
+// expires while the browser is still recognised.
 func TestQuietSessionStaysSignedIn(t *testing.T) {
+	t.Setenv("CPA_SESSION_IDLE_MINUTES", "10")
+	t.Setenv("CPA_PANEL_IDLE_MINUTES", "60")
 	passphraseStoreLocked(t)
 	h, r := sessionRouter(t)
 
@@ -262,6 +265,59 @@ func TestQuietSessionStaysSignedIn(t *testing.T) {
 	}
 	if status := secretStatusOf(t, r, token); status.Unlocked {
 		t.Fatal("a quiet session must not still hold an unlocked credential store")
+	}
+}
+
+// TestPanelIdleSignsTheBrowserOut pins the window that ends a session. It is what
+// still holds when no page is running: a closed tab cannot run the panel's own
+// idle guard, so the server has to be the one that forgets the browser.
+func TestPanelIdleSignsTheBrowserOut(t *testing.T) {
+	t.Setenv("CPA_PANEL_IDLE_MINUTES", "10")
+	for _, tc := range []struct {
+		name string
+		idle time.Duration
+		want int
+	}{
+		{"just inside the window", 9 * time.Minute, http.StatusOK},
+		{"past the window", 11 * time.Minute, http.StatusUnauthorized},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			passphraseStoreLocked(t)
+			h, r := sessionRouter(t)
+			token := startSession(t, r)
+
+			registry := h.ensureSessions()
+			registry.mu.Lock()
+			session := registry.sessions[token]
+			registry.mu.Unlock()
+			session.lastAuth = time.Now().Add(-tc.idle)
+
+			recorder := call(t, r, http.MethodGet, "/session", token, nil)
+			if recorder.Code != tc.want {
+				t.Fatalf("idle %v: %d, want %d: %s", tc.idle, recorder.Code, tc.want, recorder.Body.String())
+			}
+		})
+	}
+}
+
+// TestRevokeOthersKeepsTheCallingSession is the contract behind "changing the
+// management key signs other browsers out, this one stays".
+func TestRevokeOthersKeepsTheCallingSession(t *testing.T) {
+	passphraseStoreLocked(t)
+	h, r := sessionRouter(t)
+
+	keep := startSession(t, r)
+	other := startSession(t, r)
+
+	dropped := h.ensureSessions().revokeOthers(keep)
+	if len(dropped) != 1 {
+		t.Fatalf("revoked %d sessions, want 1", len(dropped))
+	}
+	if recorder := call(t, r, http.MethodGet, "/session", other, nil); recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("the revoked session: %d, want 401", recorder.Code)
+	}
+	if recorder := call(t, r, http.MethodGet, "/session", keep, nil); recorder.Code != http.StatusOK {
+		t.Fatalf("the calling session: %d, want 200: %s", recorder.Code, recorder.Body.String())
 	}
 }
 

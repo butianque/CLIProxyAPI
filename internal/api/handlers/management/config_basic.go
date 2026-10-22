@@ -171,12 +171,22 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 		return
 	}
 	// Reload into handler to keep memory in sync
+	previousCfg := h.cfg
 	newCfg, err := config.LoadConfig(h.configFilePath)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "reload_failed", "message": err.Error()})
 		return
 	}
 	h.cfg = newCfg
+	// Rotating the management key has to evict the sessions opened with the old
+	// one. Sessions live in memory and are deliberately independent of the key, so
+	// without this a leaked key would keep working through every browser that was
+	// already signed in — the panel's copy promises the opposite.
+	if secretKeyChanged(previousCfg, newCfg) {
+		for _, ended := range h.ensureSessions().revokeOthers(sessionToken(c)) {
+			revokeSessionGrant(ended.id)
+		}
+	}
 	c.JSON(http.StatusOK, gin.H{"ok": true, "changed": []string{"config"}})
 }
 

@@ -185,11 +185,35 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 		return
 	}
 	// Runtime-only ownership state is never sourced from an uploaded YAML document.
-	next.Home = h.cfg.Home
+	previousCfg := h.cfg
+	next.Home = previousCfg.Home
 	h.cfg = next
+	// Rotating the management key has to evict the sessions opened with the old
+	// one. Sessions live in memory and are deliberately independent of the key, so
+	// without this a leaked key would keep working through every browser that was
+	// already signed in — the panel's copy promises the opposite.
+	if secretKeyChanged(previousCfg, next) {
+		for _, ended := range h.ensureSessions().revokeOthers(sessionToken(c)) {
+			revokeSessionGrant(ended.id)
+		}
+	}
 	snapshot := h.reloadSnapshotConfigLocked()
 	h.reloadConfigAfterManagementSaveAsync(c.Request.Context(), snapshot)
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "config-version": 8})
+}
+
+// secretKeyChanged reports whether a saved document replaced the management key.
+//
+// Both sides are parsed configurations, and parsing normalises the value the same
+// way every time: a plaintext key is hashed once and an existing bcrypt hash is
+// kept verbatim. An unrelated save therefore compares equal, while any write that
+// carries a new key compares different — including re-entering the same key, which
+// is the operator asking for a fresh credential either way.
+func secretKeyChanged(previous, next *config.Config) bool {
+	if previous == nil || next == nil {
+		return false
+	}
+	return previous.RemoteManagement.SecretKey != next.RemoteManagement.SecretKey
 }
 
 var v8ICEServersPath = []string{"oauth", "providers", "codex", "live-media-relay", "ice-servers"}

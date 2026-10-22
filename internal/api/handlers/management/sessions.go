@@ -65,11 +65,15 @@ const (
 	defaultSessionIdleTTL     = 10 * time.Minute
 	defaultSessionAbsoluteTTL = 12 * time.Hour
 	// defaultPanelIdleTTL is the browser-session window: how long a signed-in
-	// browser may go without a request and still be recognised. It is deliberately
-	// much longer than the unlock window — being signed in to the panel and having
-	// the credential store open are different privileges, and conflating them is
-	// what made a page reload look like a fresh login.
-	defaultPanelIdleTTL = 12 * time.Hour
+	// browser may go without a real user action and still be recognised.
+	//
+	// It matches the unlock window on purpose. A signed-in browser holds a cookie
+	// that outlives the page, so "signed in" is itself standing access to the
+	// panel: leaving it alive for twelve hours would mean an abandoned tab keeps
+	// working long after the operator walked away. The panel's own idle guard
+	// signs out at the same mark; this clock is what still holds when no page is
+	// running to enforce it.
+	defaultPanelIdleTTL = 10 * time.Minute
 	// sessionSweepInterval bounds how late an expired session is noticed. Liveness
 	// is enforced on every request anyway; the sweeper exists so an abandoned
 	// session's grant (and, on a passphrase store, the storage key) is dropped
@@ -129,7 +133,7 @@ func sessionIdleTTL() time.Duration {
 }
 
 // panelIdleTTL resolves the browser-session window. CPA_PANEL_IDLE_MINUTES
-// overrides it; zero or a negative value falls back to the default.
+// overrides it; zero or a negative value disables the idle clock.
 func panelIdleTTL() time.Duration {
 	if raw := strings.TrimSpace(os.Getenv("CPA_PANEL_IDLE_MINUTES")); raw != "" {
 		if minutes, errAtoi := strconv.Atoi(raw); errAtoi == nil {
@@ -362,11 +366,33 @@ func (r *sessionRegistry) revoke(token string) *managementSession {
 	return session
 }
 
+// revokeOthers drops every session except keep and returns them so their grants
+// can be revoked too.
+//
+// keep may be empty, which means the caller proved the management key without
+// holding a session (a curl or a script). Nothing is then spared: whoever just
+// rotated the key is exactly the person who should not have to wonder whether an
+// old browser still holds a way in.
+func (r *sessionRegistry) revokeOthers(keep string) []*managementSession {
+	keep = strings.TrimSpace(keep)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var dropped []*managementSession
+	for token, session := range r.sessions {
+		if token == keep {
+			continue
+		}
+		delete(r.sessions, token)
+		dropped = append(dropped, session)
+	}
+	return dropped
+}
+
 // sweep drops expired sessions and returns them so their grants can be revoked.
 //
-// It uses the browser-session clock, not the unlock clock: a session that merely
-// went quiet keeps the browser signed in, while the credential grant it holds
-// expires on its own (see dropStaleGrants).
+// It uses the browser-session clock, not the unlock clock: the two are configured
+// separately, and the unlock clock can be shorter, in which case the grant dies
+// on its own while the browser is still recognised (see dropStaleGrants).
 func (r *sessionRegistry) sweep(now time.Time) []*managementSession {
 	idle, absolute := panelIdleTTL(), sessionAbsoluteTTL()
 	r.mu.Lock()
@@ -538,27 +564,33 @@ func requireSession(c *gin.Context) (*managementSession, bool) {
 
 // sessionPayload is the session description the panel reads.
 type sessionPayload struct {
-	ID              string `json:"id"`
-	Token           string `json:"token,omitempty"`
-	ClientIP        string `json:"client_ip,omitempty"`
-	IdleSeconds     int    `json:"idle_seconds"`
-	AbsoluteSeconds int    `json:"absolute_seconds"`
-	ExpiresAt       string `json:"expires_at"`
-	Unlocked        bool   `json:"unlocked"`
-	SystemAccess    string `json:"system_access"`
+	ID       string `json:"id"`
+	Token    string `json:"token,omitempty"`
+	ClientIP string `json:"client_ip,omitempty"`
+	// IdleSeconds is the credential-unlock window; PanelIdleSeconds is the
+	// browser-session window. The panel signs out on the second one, so it must
+	// not have to infer it from the first when the two are configured apart.
+	IdleSeconds      int    `json:"idle_seconds"`
+	PanelIdleSeconds int    `json:"panel_idle_seconds"`
+	AbsoluteSeconds  int    `json:"absolute_seconds"`
+	ExpiresAt        string `json:"expires_at"`
+	Unlocked         bool   `json:"unlocked"`
+	SystemAccess     string `json:"system_access"`
 }
 
 func buildSessionPayload(session *managementSession, token string) sessionPayload {
 	payload := sessionPayload{
-		ID:              session.id,
-		Token:           token,
-		ClientIP:        session.clientIP,
-		IdleSeconds:     int(sessionIdleTTL() / time.Second),
-		AbsoluteSeconds: int(sessionAbsoluteTTL() / time.Second),
-		SystemAccess:    "none",
+		ID:               session.id,
+		Token:            token,
+		ClientIP:         session.clientIP,
+		IdleSeconds:      int(sessionIdleTTL() / time.Second),
+		PanelIdleSeconds: int(panelIdleTTL() / time.Second),
+		AbsoluteSeconds:  int(sessionAbsoluteTTL() / time.Second),
+		SystemAccess:     "none",
 	}
-	if idle := sessionIdleTTL(); idle > 0 {
-		payload.ExpiresAt = session.lastSeen.Add(idle).UTC().Format(time.RFC3339)
+	// The session dies on the browser clock, so that is the deadline to report.
+	if idle := panelIdleTTL(); idle > 0 {
+		payload.ExpiresAt = session.lastAuth.Add(idle).UTC().Format(time.RFC3339)
 	}
 	if store := secretstore.Default(); store != nil {
 		payload.Unlocked = store.SessionUnlocked(session.id)
