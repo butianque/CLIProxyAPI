@@ -21,6 +21,15 @@ logs
 conv
 config.yaml
 
+# Local build artifacts. A stray 90 MB .exe left in the tree would otherwise be
+# copied into the build context on every image build, which dominates the build
+# time on a slow bind mount.
+*.exe
+*.dll
+*.so
+*.test
+dist
+
 # Development/editor
 bin
 .vscode
