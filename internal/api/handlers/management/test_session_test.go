@@ -15,7 +15,7 @@ import (
 // behaviour it names.
 func newTestSession(t *testing.T, h *Handler) *managementSession {
 	t.Helper()
-	session, _, errCreate := h.ensureSessions().create("127.0.0.1")
+	session, _, errCreate := h.ensureSessions().create("127.0.0.1", false)
 	if errCreate != nil {
 		t.Fatalf("create test session: %v", errCreate)
 	}

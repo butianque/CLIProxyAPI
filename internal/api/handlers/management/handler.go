@@ -263,8 +263,10 @@ func (h *Handler) SetPostAuthPersistHook(hook coreauth.PostAuthHook) {
 }
 
 // Middleware enforces access control for management endpoints.
-// All requests (local and remote) require a valid management key.
-// Additionally, remote access requires allow-remote-management=true.
+//
+// A request authenticates either with the management key (Authorization: Bearer
+// or X-Management-Key) or with the session cookie the key issued earlier. Remote
+// access requires allow-remote-management=true on both paths.
 func (h *Handler) Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Header("X-CPA-VERSION", buildinfo.Version)
@@ -289,6 +291,39 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 			provided = c.GetHeader("X-Management-Key")
 		}
 
+		// A browser does not have to present the key on every request: after the
+		// first sign-in it holds a session cookie instead. The cookie is only ever
+		// issued by a key-authenticated request, it is HttpOnly, SameSite=Strict,
+		// scoped to the management API, and bound to the address that created it.
+		//
+		// This is checked before the key path so that a browser which simply has no
+		// key (every reload) is not counted as a failed attempt: absence of a
+		// credential is not a guess, and counting it would let any unauthenticated
+		// visitor lock the operator's IP out of the panel.
+		if provided == "" {
+			if token := sessionCookieToken(c); token != "" {
+				if !cookieRequestAllowed(c) {
+					c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "missing " + sessionCSRFHeader + " header"})
+					return
+				}
+				if !localClient && !h.remoteManagementAllowed() {
+					c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "remote management disabled"})
+					return
+				}
+				session, errLookup := h.ensureSessions().lookup(token, clientIP)
+				if errLookup != nil {
+					clearSessionCookie(c)
+					c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "management session expired"})
+					return
+				}
+				c.Set(sessionContextKey, session)
+				c.Next()
+				return
+			}
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing management key"})
+			return
+		}
+
 		allowed, statusCode, errMsg := h.AuthenticateManagementKey(clientIP, localClient, provided)
 		if !allowed {
 			c.AbortWithStatusJSON(statusCode, gin.H{"error": errMsg})
@@ -296,6 +331,19 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 		}
 		c.Next()
 	}
+}
+
+// remoteManagementAllowed reports whether clients outside the loopback interface
+// may use the management API at all. The session cookie path has to ask this
+// separately: a cookie outlives the config change that turned remote access off.
+func (h *Handler) remoteManagementAllowed() bool {
+	if h == nil {
+		return false
+	}
+	if h.allowRemoteOverride {
+		return true
+	}
+	return h.cfg != nil && h.cfg.RemoteManagement.AllowRemote
 }
 
 // AuthenticateManagementKey verifies the provided management key for the given client.

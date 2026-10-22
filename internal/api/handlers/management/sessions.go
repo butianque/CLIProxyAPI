@@ -40,8 +40,36 @@ const (
 	// sessionContextKey is where the resolved session is stored on the gin context.
 	sessionContextKey = "cpa.management.session"
 
+	// sessionCookieName is the browser's credential. It is HttpOnly and scoped to
+	// the management API, so a page reload, a second tab, or a reopened window
+	// reaches the same session without asking for the management key again — which
+	// is what a browser is supposed to do, and what the key alone could never do
+	// (the key is not persisted by default, and storing it in JavaScript-reachable
+	// storage is worse than an HttpOnly cookie).
+	sessionCookieName = "cpa_management_session"
+	// sessionCookiePath is the only path prefix that ever sees this cookie. Every
+	// management route lives under it.
+	sessionCookiePath = "/v8/management"
+
+	// sessionCSRFHeader must accompany a request that authenticates with the
+	// cookie. SameSite=Strict already stops cross-site requests from carrying the
+	// cookie, but "site" is the registrable domain: a sibling host such as
+	// api.example.com could still post to cpa.example.com. A plain HTML form
+	// cannot set a custom header, so requiring one closes that gap.
+	sessionCSRFHeader      = "X-CPA-Panel"
+	sessionCSRFHeaderValue = "1"
+
+	// defaultSessionIdleTTL is the credential-unlock window: how long an unlocked
+	// secret store stays unlocked without a real user action. It is short because it
+	// bounds standing access to upstream credentials.
 	defaultSessionIdleTTL     = 10 * time.Minute
 	defaultSessionAbsoluteTTL = 12 * time.Hour
+	// defaultPanelIdleTTL is the browser-session window: how long a signed-in
+	// browser may go without a request and still be recognised. It is deliberately
+	// much longer than the unlock window — being signed in to the panel and having
+	// the credential store open are different privileges, and conflating them is
+	// what made a page reload look like a fresh login.
+	defaultPanelIdleTTL = 12 * time.Hour
 	// sessionSweepInterval bounds how late an expired session is noticed. Liveness
 	// is enforced on every request anyway; the sweeper exists so an abandoned
 	// session's grant (and, on a passphrase store, the storage key) is dropped
@@ -60,10 +88,20 @@ type managementSession struct {
 	clientIP string
 	created  time.Time
 	lastSeen time.Time
+	// lastAuth is the last request that authenticated with this session, which is
+	// what keeps the browser signed in. lastSeen is the last real user action,
+	// which is what keeps the credential store unlocked.
+	lastAuth time.Time
+	// persistent mirrors the cookie the browser asked for, so a re-issue does not
+	// turn "remember this device" into "until the browser closes".
+	persistent bool
 }
 
-func (s *managementSession) expired(now time.Time, idle, absolute time.Duration) bool {
-	if idle > 0 && now.Sub(s.lastSeen) > idle {
+// expiredForPanel reports whether the browser is no longer recognised. Only the
+// panel clock and the absolute cap apply: polling must not extend a session, but
+// neither should a quiet afternoon end it.
+func (s *managementSession) expiredForPanel(now time.Time, idle, absolute time.Duration) bool {
+	if idle > 0 && now.Sub(s.lastAuth) > idle {
 		return true
 	}
 	return absolute > 0 && now.Sub(s.created) > absolute
@@ -88,6 +126,20 @@ func sessionIdleTTL() time.Duration {
 		}
 	}
 	return defaultSessionIdleTTL
+}
+
+// panelIdleTTL resolves the browser-session window. CPA_PANEL_IDLE_MINUTES
+// overrides it; zero or a negative value falls back to the default.
+func panelIdleTTL() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv("CPA_PANEL_IDLE_MINUTES")); raw != "" {
+		if minutes, errAtoi := strconv.Atoi(raw); errAtoi == nil {
+			if minutes <= 0 {
+				return 0
+			}
+			return time.Duration(minutes) * time.Minute
+		}
+	}
+	return defaultPanelIdleTTL
 }
 
 // sessionAbsoluteTTL resolves the absolute limit. CPA_SESSION_ABSOLUTE_HOURS
@@ -117,6 +169,109 @@ func sessionBindsIP() bool {
 	}
 }
 
+// sessionToken returns the caller's session token. The header wins: it is what
+// non-browser clients and older panels send. The cookie is what a browser sends
+// on its own after the first sign-in.
+func sessionToken(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	if token := strings.TrimSpace(c.GetHeader(sessionHeaderName)); token != "" {
+		return token
+	}
+	return sessionCookieToken(c)
+}
+
+// sessionCookieToken returns only the cookie's token.
+//
+// Management authentication uses this and not sessionToken: the cookie is
+// HttpOnly, so a script running in the panel's own origin cannot read it and
+// replay it elsewhere. The header token stays available for session resolution
+// (secret operations), where it is already the panel's own credential.
+func sessionCookieToken(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	cookie, errCookie := c.Cookie(sessionCookieName)
+	if errCookie != nil {
+		return ""
+	}
+	return strings.TrimSpace(cookie)
+}
+
+// sessionCookieSecure reports whether the cookie must carry the Secure flag. The
+// panel is reached over TLS at the edge, so behind the proxy the scheme arrives in
+// X-Forwarded-Proto rather than on the request itself.
+func sessionCookieSecure(c *gin.Context) bool {
+	if c == nil {
+		return true
+	}
+	if c.Request != nil && c.Request.TLS != nil {
+		// A non-nil TLS state does not mean TLS. net/http fills Request.TLS from
+		// any connection that reports a ConnectionState, and this server's
+		// buffered connection wrapper reports a zero one for plain TCP. Only a
+		// completed handshake counts, otherwise every plain-HTTP deployment would
+		// get a Secure cookie the browser then drops.
+		if state := c.Request.TLS; state.HandshakeComplete || state.Version != 0 {
+			return true
+		}
+	}
+	return strings.EqualFold(strings.TrimSpace(c.GetHeader("X-Forwarded-Proto")), "https")
+}
+
+// writeSessionCookie hands the browser its session token.
+//
+// persistent decides whether the cookie outlives the browser process. The default
+// is a session cookie: the panel keeps working across reloads, tabs and windows,
+// and a fresh browser start signs in again.
+func writeSessionCookie(c *gin.Context, token string, persistent bool) {
+	if c == nil || token == "" || c.Writer == nil {
+		return
+	}
+	cookie := &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    token,
+		Path:     sessionCookiePath,
+		HttpOnly: true,
+		Secure:   sessionCookieSecure(c),
+		SameSite: http.SameSiteStrictMode,
+	}
+	if persistent {
+		if lifetime := sessionAbsoluteTTL(); lifetime > 0 {
+			cookie.MaxAge = int(lifetime / time.Second)
+			cookie.Expires = time.Now().Add(lifetime)
+		}
+	}
+	http.SetCookie(c.Writer, cookie)
+}
+
+// clearSessionCookie drops the browser's session token.
+func clearSessionCookie(c *gin.Context) {
+	if c == nil || c.Writer == nil {
+		return
+	}
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    "",
+		Path:     sessionCookiePath,
+		HttpOnly: true,
+		Secure:   sessionCookieSecure(c),
+		SameSite: http.SameSiteStrictMode,
+		MaxAge:   -1,
+		Expires:  time.Unix(1, 0),
+	})
+}
+
+// cookieRequestAllowed reports whether a request that authenticates with the
+// session cookie carries the CSRF header. A token sent in the session header is
+// already immune to form-based cross-site requests, so it does not need this.
+func cookieRequestAllowed(c *gin.Context) bool {
+	if c == nil {
+		return false
+	}
+	return strings.TrimSpace(c.GetHeader(sessionCSRFHeader)) == sessionCSRFHeaderValue
+}
+
 // newSessionToken returns a 32-byte URL-safe token.
 func newSessionToken() (string, error) {
 	buf := make([]byte, 32)
@@ -127,17 +282,23 @@ func newSessionToken() (string, error) {
 }
 
 // create registers a new session and returns it with its token.
-func (r *sessionRegistry) create(clientIP string) (*managementSession, string, error) {
+//
+// persistent only records how the browser should keep the cookie, so a later
+// re-issue (the browser lost it, the panel came back with just its token) does not
+// silently downgrade a "remember this device" session to a browser-lifetime one.
+func (r *sessionRegistry) create(clientIP string, persistent bool) (*managementSession, string, error) {
 	token, errToken := newSessionToken()
 	if errToken != nil {
 		return nil, "", errToken
 	}
 	now := time.Now()
 	session := &managementSession{
-		id:       token[:16],
-		clientIP: clientIP,
-		created:  now,
-		lastSeen: now,
+		id:         token[:16],
+		clientIP:   clientIP,
+		created:    now,
+		lastSeen:   now,
+		lastAuth:   now,
+		persistent: persistent,
 	}
 	r.mu.Lock()
 	r.sessions[token] = session
@@ -145,8 +306,8 @@ func (r *sessionRegistry) create(clientIP string) (*managementSession, string, e
 	return session, token, nil
 }
 
-// lookup resolves a token without touching its idle clock. A request that merely
-// polls must not extend the session.
+// lookup resolves a token without touching its clocks. A request that merely polls
+// must not extend the session.
 func (r *sessionRegistry) lookup(token, clientIP string) (*managementSession, error) {
 	token = strings.TrimSpace(token)
 	if token == "" {
@@ -159,7 +320,7 @@ func (r *sessionRegistry) lookup(token, clientIP string) (*managementSession, er
 		return nil, errSessionExpired
 	}
 	now := time.Now()
-	if session.expired(now, sessionIdleTTL(), sessionAbsoluteTTL()) {
+	if session.expiredForPanel(now, panelIdleTTL(), sessionAbsoluteTTL()) {
 		delete(r.sessions, token)
 		return nil, errSessionExpired
 	}
@@ -169,8 +330,9 @@ func (r *sessionRegistry) lookup(token, clientIP string) (*managementSession, er
 	return session, nil
 }
 
-// touch resolves a token and slides its idle clock. It is the only path that
-// does, and only real user activity is allowed to reach it.
+// touch resolves a token and slides both clocks. It is the only path that does,
+// and only real user activity is allowed to reach it: a real action is both
+// "the browser is still here" and "the operator is still working".
 func (r *sessionRegistry) touch(token, clientIP string) (*managementSession, error) {
 	session, errLookup := r.lookup(token, clientIP)
 	if errLookup != nil {
@@ -178,7 +340,9 @@ func (r *sessionRegistry) touch(token, clientIP string) (*managementSession, err
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	session.lastSeen = time.Now()
+	now := time.Now()
+	session.lastSeen = now
+	session.lastAuth = now
 	return session, nil
 }
 
@@ -199,13 +363,17 @@ func (r *sessionRegistry) revoke(token string) *managementSession {
 }
 
 // sweep drops expired sessions and returns them so their grants can be revoked.
+//
+// It uses the browser-session clock, not the unlock clock: a session that merely
+// went quiet keeps the browser signed in, while the credential grant it holds
+// expires on its own (see dropStaleGrants).
 func (r *sessionRegistry) sweep(now time.Time) []*managementSession {
-	idle, absolute := sessionIdleTTL(), sessionAbsoluteTTL()
+	idle, absolute := panelIdleTTL(), sessionAbsoluteTTL()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	var dropped []*managementSession
 	for token, session := range r.sessions {
-		if session.expired(now, idle, absolute) {
+		if session.expiredForPanel(now, idle, absolute) {
 			delete(r.sessions, token)
 			dropped = append(dropped, session)
 		}
@@ -275,22 +443,50 @@ func dropStaleGrants(now time.Time) {
 
 // SessionMiddleware resolves the session token for management routes.
 //
-// A request without the header is allowed through: the management key alone still
+// A request without any token is allowed through: the management key alone still
 // works for everything that is not a secret operation, so existing scripts and
-// tooling keep functioning. A request that does present a header must present a
+// tooling keep functioning. A request that does present a token must present a
 // live one — a stale token is an expired session, and answering 401 is what sends
 // the panel back to the login page instead of letting it show stale data.
+//
+// The cookie is the browser's own credential and the header is what a script
+// sends, so they are tried in that order of authority: if the header names a
+// session that is gone but the cookie still resolves, the cookie wins. And a live
+// session always ends up with a cookie — otherwise a browser that signed in with
+// the key once could lose "this browser is signed in" without noticing.
 func (h *Handler) SessionMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		token := strings.TrimSpace(c.GetHeader(sessionHeaderName))
+		headerToken := strings.TrimSpace(c.GetHeader(sessionHeaderName))
+		cookieToken := sessionCookieToken(c)
+		token := headerToken
+		if token == "" {
+			token = cookieToken
+		}
 		if token == "" {
 			c.Next()
 			return
 		}
 		session, errLookup := h.ensureSessions().lookup(token, c.ClientIP())
+		if errLookup != nil && cookieToken != "" && cookieToken != headerToken {
+			// The header may be a leftover from another session or another tab.
+			// The cookie is what this browser actually holds.
+			if viaCookie, errCookie := h.ensureSessions().lookup(cookieToken, c.ClientIP()); errCookie == nil {
+				session, errLookup, headerToken, token = viaCookie, nil, "", cookieToken
+			}
+		}
 		if errLookup != nil {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": errLookup.Error()})
+			if headerToken != "" {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": errLookup.Error()})
+				return
+			}
+			// A stale cookie must not block a request that still carries a valid
+			// management key: drop it and let the key path decide.
+			clearSessionCookie(c)
+			c.Next()
 			return
+		}
+		if cookieToken == "" {
+			writeSessionCookie(c, token, session.persistent)
 		}
 		c.Set(sessionContextKey, session)
 		c.Next()
@@ -373,12 +569,25 @@ func buildSessionPayload(session *managementSession, token string) sessionPayloa
 
 // PostSession starts a management session. The management key is the only
 // credential it accepts; the reply carries the token the panel stores.
+//
+// The same token is also written to an HttpOnly cookie, which is what lets a
+// reload or a new tab stay signed in without the panel holding the key. The
+// optional `persistent` flag asks for a cookie that outlives the browser process.
 func (h *Handler) PostSession(c *gin.Context) {
-	session, token, errCreate := h.ensureSessions().create(c.ClientIP())
+	var request struct {
+		Persistent bool `json:"persistent"`
+	}
+	if c.Request != nil && c.Request.Body != nil {
+		// A missing or malformed body is not an error: the default is a session
+		// cookie, which is what a browser should get unless it asked otherwise.
+		_ = c.ShouldBindJSON(&request)
+	}
+	session, token, errCreate := h.ensureSessions().create(c.ClientIP(), request.Persistent)
 	if errCreate != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "cannot create a session"})
 		return
 	}
+	writeSessionCookie(c, token, request.Persistent)
 	c.JSON(http.StatusOK, buildSessionPayload(session, token))
 }
 
@@ -394,7 +603,7 @@ func (h *Handler) GetSession(c *gin.Context) {
 // PostSessionTouch slides the idle clock. The panel calls it on real user
 // activity only, so background polling never keeps a session alive.
 func (h *Handler) PostSessionTouch(c *gin.Context) {
-	session, errTouch := h.ensureSessions().touch(c.GetHeader(sessionHeaderName), c.ClientIP())
+	session, errTouch := h.ensureSessions().touch(sessionToken(c), c.ClientIP())
 	if errTouch != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": errTouch.Error()})
 		return
@@ -409,7 +618,10 @@ func (h *Handler) PostSessionTouch(c *gin.Context) {
 // DeleteSession ends the calling session and drops its secret-store grant. Other
 // sessions are untouched.
 func (h *Handler) DeleteSession(c *gin.Context) {
-	session := h.ensureSessions().revoke(c.GetHeader(sessionHeaderName))
+	session := h.ensureSessions().revoke(sessionToken(c))
+	// The cookie goes away whether or not the token still resolved: a browser that
+	// pressed "sign out" must not keep a credential it can no longer use.
+	clearSessionCookie(c)
 	if session == nil {
 		c.JSON(http.StatusOK, gin.H{"status": "ended"})
 		return
