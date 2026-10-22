@@ -137,9 +137,16 @@ func (h *Handler) bindAccountEgress(c *gin.Context, id int, rawName string) (str
 		}
 	} else {
 		delete(target.Metadata, "egress_id")
-		// Clear the cached address as well: see PostEgressPoolUnbind.
-		delete(target.Metadata, "proxy_url")
 		target.ProxyURL = ""
+	}
+	// The id is what every load resolves; the address beside it is what a
+	// plugin executor dials, because it builds its own transports and can only
+	// learn the exit from metadata. Keep the pair in step, so a credential is
+	// never bound on paper while its traffic falls back to the host's address.
+	if target.ProxyURL != "" {
+		target.Metadata["proxy_url"] = target.ProxyURL
+	} else {
+		delete(target.Metadata, "proxy_url")
 	}
 	target.UpdatedAt = time.Now()
 	updated, errUpdate := h.authManager.Update(c.Request.Context(), target)

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	sdkauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
@@ -1104,6 +1105,76 @@ func TestSynthesizeAuthFile_CodexPlanType(t *testing.T) {
 			}
 			if got := auths[0].Attributes["plan_type"]; got != tt.wantPlan {
 				t.Fatalf("plan_type attribute = %q, want %q", got, tt.wantPlan)
+			}
+		})
+	}
+}
+
+type singleAuthParserFunc func(context.Context, pluginapi.AuthParseRequest) (*coreauth.Auth, bool, error)
+
+func (f singleAuthParserFunc) ParseAuth(ctx context.Context, req pluginapi.AuthParseRequest) (*coreauth.Auth, bool, error) {
+	return f(ctx, req)
+}
+
+// TestSynthesizeAuthFileResolvesEgressID pins the reload half of the exit
+// invariant: a file that names its exit by id comes back bound, on both the
+// plugin-owned and the built-in path.
+//
+// The watcher rebuilds the runtime credential from the file on every change,
+// including the change a bind itself writes. A synthesizer that skipped the
+// reference would therefore unbind the credential seconds after it was bound,
+// and send its traffic from the host's own address while the panel still
+// reported the exit as set.
+func TestSynthesizeAuthFileResolvesEgressID(t *testing.T) {
+	const wantProxy = "socks5://user:pass@10.0.0.2:1080"
+	sdkauth.SetEgressResolver(func(id int) (string, error) {
+		if id != 2 {
+			t.Fatalf("resolver asked for #%d, want #2", id)
+		}
+		return wantProxy, nil
+	})
+	t.Cleanup(func() { sdkauth.SetEgressResolver(nil) })
+
+	pluginParser := singleAuthParserFunc(func(_ context.Context, req pluginapi.AuthParseRequest) (*coreauth.Auth, bool, error) {
+		// A plugin republishes only the fields it models.
+		return &coreauth.Auth{
+			ID:       req.FileName,
+			Provider: "loomy",
+			Metadata: map[string]any{"type": "loomy"},
+		}, true, nil
+	})
+
+	for _, testCase := range []struct {
+		name   string
+		raw    string
+		parser PluginAuthParser
+	}{
+		{name: "built-in", raw: `{"type":"zcode","session":"token","egress_id":2}`},
+		{name: "plugin", raw: `{"type":"loomy","session":"token","egress_id":2}`, parser: pluginParser},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			dir := t.TempDir()
+			fullPath := filepath.Join(dir, "account.json")
+			ctx := &SynthesisContext{
+				Config:           &config.Config{},
+				AuthDir:          dir,
+				Now:              time.Date(2026, 6, 21, 0, 0, 0, 0, time.UTC),
+				IDGenerator:      NewStableIDGenerator(),
+				PluginAuthParser: testCase.parser,
+			}
+
+			auths, errSynthesize := SynthesizeAuthFile(ctx, fullPath, []byte(testCase.raw))
+			if errSynthesize != nil {
+				t.Fatalf("SynthesizeAuthFile error: %v", errSynthesize)
+			}
+			if len(auths) != 1 {
+				t.Fatalf("auths = %d, want 1", len(auths))
+			}
+			if got := auths[0].ProxyURL; got != wantProxy {
+				t.Fatalf("ProxyURL = %q, want %q", got, wantProxy)
+			}
+			if id, ok := sdkauth.EgressIDFromMetadata(auths[0].Metadata); !ok || id != 2 {
+				t.Fatalf("egress id = %d/%t, want 2/true", id, ok)
 			}
 		})
 	}

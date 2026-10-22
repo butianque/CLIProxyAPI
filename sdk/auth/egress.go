@@ -5,6 +5,8 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 // This file lets a credential name its exit by pool id instead of by address.
@@ -63,6 +65,34 @@ func ResolveEgressID(id int) string {
 		return UnresolvedEgress
 	}
 	return url
+}
+
+// ApplyEgressID resolves the exit a credential names onto the record built from
+// its file.
+//
+// Two loaders build an Auth from the same file — the cold-start file store and
+// the watcher's synthesizer — and the reference lives only in that file, so both
+// have to apply it here. A loader that skips this leaves the credential on
+// whatever address the file happens to carry, which for a credential that names
+// its exit by id is no address at all: traffic then leaves from the host's own
+// address, the one outcome this design must never produce.
+//
+// The address is published beside the id, not instead of it. The id stays
+// authoritative at every load, and the copy is what a plugin executor dials: a
+// plugin builds its own transports and can only learn the exit from metadata.
+func ApplyEgressID(auth *cliproxyauth.Auth, metadata map[string]any) {
+	if auth == nil {
+		return
+	}
+	id, ok := EgressIDFromMetadata(metadata)
+	if !ok {
+		return
+	}
+	auth.ProxyURL = ResolveEgressID(id)
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata["proxy_url"] = auth.ProxyURL
 }
 
 // EgressIDFromMetadata reads the pool id an auth document carries.

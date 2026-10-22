@@ -710,3 +710,58 @@ func TestRefreshAuth_MergesAttributesAndPreservesPath_Issue6119(t *testing.T) {
 		})
 	}
 }
+
+// TestRefreshAuthKeepsHostManagedMetadata pins that a refresh cannot unbind a
+// credential.
+//
+// A plugin republishes only the fields it models, so the exit reference is
+// absent from what it returns. Reading that absence as a deletion removes the
+// reference from the record, and the save that follows a refresh writes the
+// record back over the auth file — which is how a bound account ends up on the
+// host's own address after a restart.
+func TestRefreshAuthKeepsHostManagedMetadata(t *testing.T) {
+	host := newHostWithRecords(capabilityRecord{
+		id: "auth-plugin",
+		plugin: pluginapi.Plugin{
+			Capabilities: pluginapi.Capabilities{
+				AuthProvider: fakeAuthProvider{
+					identifier: "plugin-provider",
+					refreshAuth: func(context.Context, pluginapi.AuthRefreshRequest) (pluginapi.AuthRefreshResponse, error) {
+						return pluginapi.AuthRefreshResponse{
+							Auth: pluginapi.AuthData{
+								Metadata: map[string]any{"access_token": "new-token"},
+							},
+						}, nil
+					},
+				},
+			},
+		},
+	})
+
+	auth := host.AuthDataToCoreAuth(pluginapi.AuthData{
+		Provider: "plugin-provider",
+		ID:       "auth-1",
+		Metadata: map[string]any{
+			"access_token": "old-token",
+			"egress_id":    2,
+			"proxy_url":    "socks5://user:pass@10.0.0.2:1080",
+		},
+	}, "", "")
+	if auth == nil {
+		t.Fatal("AuthDataToCoreAuth() = nil, want auth")
+	}
+
+	refreshed, handled, errRefresh := host.RefreshAuth(context.Background(), auth)
+	if errRefresh != nil {
+		t.Fatalf("RefreshAuth() error = %v", errRefresh)
+	}
+	if !handled || refreshed == nil {
+		t.Fatalf("RefreshAuth() handled=%t auth=%#v, want refreshed auth", handled, refreshed)
+	}
+	if got, ok := refreshed.Metadata["egress_id"]; !ok || got != 2 {
+		t.Fatalf("refreshed egress_id = %v/%t, want 2/true", got, ok)
+	}
+	if got := refreshed.Metadata["access_token"]; got != "new-token" {
+		t.Fatalf("refreshed access_token = %v, want the plugin's new token", got)
+	}
+}

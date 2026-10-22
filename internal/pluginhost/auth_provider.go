@@ -440,8 +440,20 @@ func (h *Host) RefreshAuth(ctx context.Context, auth *coreauth.Auth) (refreshed 
 	if strings.TrimSpace(data.ProxyURL) == "" {
 		data.ProxyURL = auth.ProxyURL
 	}
-	if len(data.Metadata) == 0 {
-		data.Metadata = cloneAnyMap(auth.Metadata)
+	// A plugin republishes only the fields it models, so every host-managed
+	// field has to be carried over here. Reading its absence as a deletion
+	// would unbind the credential: the exit reference lives in this map, and
+	// the next save writes the map back over the auth file.
+	if data.Metadata == nil {
+		data.Metadata = make(map[string]any)
+	}
+	for key, value := range authMetadata(auth) {
+		if coreauth.IsAuthTokenPayloadKey(key) {
+			continue
+		}
+		if _, exists := data.Metadata[key]; !exists {
+			data.Metadata[key] = value
+		}
 	}
 	if len(data.Attributes) == 0 {
 		if auth != nil {

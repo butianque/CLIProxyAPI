@@ -12,6 +12,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
 	kimiauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/kimi"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	sdkauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	log "github.com/sirupsen/logrus"
@@ -132,6 +133,14 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 				if p, ok := metadata["proxy_url"].(string); ok && auth.ProxyURL == "" {
 					auth.ProxyURL = strings.TrimSpace(p)
 				}
+				// A plugin republishes only the fields it models, so the file's
+				// own host-managed metadata is carried over here: an exit named
+				// by id must not disappear from the record just because the
+				// plugin never mentioned it.
+				coreauth.MergeExistingAuthMetadata(auth, metadata)
+				// A pool id wins over the address beside it; see
+				// sdk/auth/filestore.go, which loads the same file at startup.
+				sdkauth.ApplyEgressID(auth, metadata)
 				if pref, ok := metadata["prefix"].(string); ok && auth.Prefix == "" {
 					auth.Prefix = strings.Trim(strings.TrimSpace(pref), "/")
 				}
@@ -212,6 +221,9 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
+	// A pool id wins over the address beside it; see sdk/auth/filestore.go,
+	// which loads the same file at startup.
+	sdkauth.ApplyEgressID(a, metadata)
 	// Read priority from auth file.
 	coreauth.ApplyAuthPriorityMetadata(a, metadata)
 	if errWeight := coreauth.ApplyAuthWeightMetadata(a, metadata); errWeight != nil {
