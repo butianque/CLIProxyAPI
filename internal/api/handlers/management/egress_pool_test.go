@@ -516,6 +516,43 @@ func TestEgressPoolBindRejectsAnUnknownTarget(t *testing.T) {
 	}
 }
 
+// TestEgressIDValueReadsEveryShapeTheTwoReadersProduce pins that the id is
+// understood as the type each reader actually holds.
+//
+// A binding is written once and read back through two different paths: the pool
+// scan decodes the auth file, so encoding/json hands it a float64, while the
+// account view reads the live credential's metadata, where the bind handler left
+// the Go int it was given. A reader that understood only the JSON shapes made a
+// freshly bound credential report no exit at all until the watcher reloaded it.
+func TestEgressIDValueReadsEveryShapeTheTwoReadersProduce(t *testing.T) {
+	cases := []struct {
+		name  string
+		value any
+	}{
+		{"in-memory int, as the bind handler writes it", 2},
+		{"in-memory int64, as a merged metadata map can hold it", int64(2)},
+		{"decoded JSON number, as the pool scan reads it", float64(2)},
+		{"decoded JSON number kept exact", json.Number("2")},
+		{"string, as a hand-written file can hold it", "2"},
+		{"string with padding", " 2 "},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			id, ok := egressIDValue(tc.value)
+			if !ok || id != 2 {
+				t.Fatalf("egressIDValue(%#v) = (%d, %v), want (2, true)", tc.value, id, ok)
+			}
+		})
+	}
+
+	// A non-positive id is not a reference, whatever shape it arrives in.
+	for _, value := range []any{0, int64(0), float64(0), json.Number("0"), "0", -1, ""} {
+		if id, ok := egressIDValue(value); ok {
+			t.Fatalf("egressIDValue(%#v) = (%d, true), want it reported as absent", value, id)
+		}
+	}
+}
+
 // itoa avoids pulling strconv into every call site in this file.
 func itoa(value int) string {
 	return strconv.Itoa(value)

@@ -189,6 +189,70 @@ func TestListAccountsReportsTheAccountOpenedAt(t *testing.T) {
 	}
 }
 
+// TestListAccountsReportsTheExitABindingJustWrote pins the account view's half
+// of the binding contract: the id the bind handler leaves in the live metadata
+// has to come back out of /accounts immediately, not only once the watcher has
+// reloaded the file from disk.
+//
+// The panel decides what the exit row says from this field alone. When it was
+// missing, a bound credential rendered its resolved address under the "no exit"
+// option: the row read as unbound, and the entry it actually pointed at was
+// buried below it.
+func TestListAccountsReportsTheExitABindingJustWrote(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	// One credential per shape the id can be held in: the Go int that
+	// bindAccountEgress writes into live metadata, and the float64 that
+	// encoding/json produces when the same file is read back off disk. Both
+	// describe the same binding and must read the same way.
+	for _, record := range []*coreauth.Auth{
+		{
+			ID:       "loomy-int",
+			FileName: "loomy-int.json",
+			Provider: "loomy",
+			Status:   coreauth.StatusActive,
+			Metadata: map[string]any{"egress_id": 2},
+			ProxyURL: "socks5://user:pass@10.0.0.2:1080",
+		},
+		{
+			ID:       "loomy-float",
+			FileName: "loomy-float.json",
+			Provider: "loomy",
+			Status:   coreauth.StatusActive,
+			Metadata: map[string]any{"egress_id": float64(2)},
+		},
+		{
+			ID:       "loomy-none",
+			FileName: "loomy-none.json",
+			Provider: "loomy",
+			Status:   coreauth.StatusActive,
+		},
+	} {
+		if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+			t.Fatalf("failed to register %s: %v", record.ID, errRegister)
+		}
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	h.tokenStore = &memoryAuthStore{}
+
+	accounts := accountList(t, listAccounts(t, h, "/v8/management/accounts"))
+	exits := map[string]any{}
+	for _, account := range accounts {
+		exits[account["auth_id"].(string)] = account["egress_id"]
+	}
+	for _, id := range []string{"loomy-int", "loomy-float"} {
+		if got := exits[id]; got != float64(2) {
+			t.Fatalf("%s egress_id = %#v, want 2", id, got)
+		}
+	}
+	// An unbound credential reports nothing rather than a zero id.
+	if got := exits["loomy-none"]; got != nil {
+		t.Fatalf("loomy-none egress_id = %#v, want it absent", got)
+	}
+}
+
 func TestListAccountsFiltersAndCounts(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 

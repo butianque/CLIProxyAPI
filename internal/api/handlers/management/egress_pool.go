@@ -169,12 +169,24 @@ func egressRefFromPayload(payload map[string]any) string {
 	return ""
 }
 
-// egressIDValue reads an id that may arrive as a number or as a string.
+// egressIDValue reads an id in every shape the two readers can hand it.
+//
+// The same field arrives as two different Go types depending on the path: the
+// pool scan reads it back off an auth file, where encoding/json produced a
+// float64, while the account view reads the live credential's metadata, where
+// bindAccountEgress stored the Go int it was given. Understanding only the JSON
+// shapes made a credential that had just been bound report "no exit" until the
+// file watcher reloaded it from disk, so the panel showed the resolved address
+// as a hand-written one instead of the entry it pointed at.
 func egressIDValue(value any) (int, bool) {
 	switch typed := value.(type) {
 	case float64:
 		id := int(typed)
 		return id, id > 0
+	case int:
+		return typed, typed > 0
+	case int64:
+		return int(typed), typed > 0
 	case json.Number:
 		id, errParse := typed.Int64()
 		return int(id), errParse == nil && id > 0
