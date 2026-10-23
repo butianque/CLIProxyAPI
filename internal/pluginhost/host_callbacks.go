@@ -27,6 +27,7 @@ type rpcHostHTTPRequest struct {
 	Headers        httpHeader                 `json:"headers,omitempty"`
 	Body           []byte                     `json:"body,omitempty"`
 	WireProfile    *pluginapi.HTTPWireProfile `json:"wire_profile,omitempty"`
+	ProxyURL       string                     `json:"proxy_url,omitempty"`
 	Request        *httpRequest               `json:"request,omitempty"`
 }
 
@@ -38,6 +39,7 @@ type httpRequest struct {
 	Headers     httpHeader                 `json:"headers,omitempty"`
 	Body        []byte                     `json:"body,omitempty"`
 	WireProfile *pluginapi.HTTPWireProfile `json:"wire_profile,omitempty"`
+	ProxyURL    string                     `json:"proxy_url,omitempty"`
 }
 
 type rpcHostHTTPStreamResponse struct {
@@ -231,7 +233,7 @@ func (h *Host) callHostHTTPDo(ctx context.Context, request []byte) ([]byte, erro
 		return nil, errAcquire
 	}
 	defer operation.finish()
-	resp, errDo := h.newHTTPClient(nil).Do(operation.ctx, httpReq)
+	resp, errDo := h.newHTTPClientWithProxy(nil, httpReq.ProxyURL).Do(operation.ctx, httpReq)
 	if errDo != nil {
 		return nil, errDo
 	}
@@ -264,7 +266,7 @@ func (h *Host) callHostHTTPDoStream(ctx context.Context, request []byte) ([]byte
 		operation.finish()
 	}()
 
-	resp, errDo := h.newHTTPClient(nil).DoStream(streamCtx, httpReq)
+	resp, errDo := h.newHTTPClientWithProxy(nil, httpReq.ProxyURL).DoStream(streamCtx, httpReq)
 	if errDo != nil {
 		return nil, errDo
 	}
@@ -386,6 +388,7 @@ func decodeHostHTTPRequestWithOperationID(raw []byte) (pluginapi.HTTPRequest, st
 			Headers:     map[string][]string(req.Request.Headers),
 			Body:        append([]byte(nil), req.Request.Body...),
 			WireProfile: cloneWireProfile(wireProfile),
+			ProxyURL:    firstNonEmpty(req.Request.ProxyURL, req.ProxyURL),
 		}, req.HostCallbackID, strings.TrimSpace(req.OperationID), nil
 	}
 	return pluginapi.HTTPRequest{
@@ -394,6 +397,7 @@ func decodeHostHTTPRequestWithOperationID(raw []byte) (pluginapi.HTTPRequest, st
 		Headers:     map[string][]string(req.Headers),
 		Body:        append([]byte(nil), req.Body...),
 		WireProfile: cloneWireProfile(req.WireProfile),
+		ProxyURL:    strings.TrimSpace(req.ProxyURL),
 	}, req.HostCallbackID, strings.TrimSpace(req.OperationID), nil
 }
 

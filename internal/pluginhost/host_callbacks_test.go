@@ -1542,6 +1542,78 @@ func TestDecodeHostHTTPRequestWithWireProfile(t *testing.T) {
 	}
 }
 
+// TestDecodeHostHTTPRequestWithProxyURL pins the per-request exit plumbing: a
+// plugin may name the credential's own egress on the request, in the flat
+// envelope, the nested request object, or a plain pluginapi.HTTPRequest, and an
+// address the transport cannot use must be rejected rather than dialed direct.
+func TestDecodeHostHTTPRequestWithProxyURL(t *testing.T) {
+	t.Parallel()
+
+	const exitURL = "socks5://user:secret@127.0.0.1:1080"
+
+	cases := []struct {
+		name    string
+		payload func() []byte
+		want    string
+	}{
+		{
+			name: "flat",
+			payload: func() []byte {
+				raw, _ := json.Marshal(rpcHostHTTPRequest{Method: http.MethodGet, URL: "https://example.com", ProxyURL: exitURL})
+				return raw
+			},
+			want: exitURL,
+		},
+		{
+			name: "nested",
+			payload: func() []byte {
+				raw, _ := json.Marshal(rpcHostHTTPRequest{Request: &httpRequest{Method: http.MethodGet, URL: "https://example.com", ProxyURL: exitURL}})
+				return raw
+			},
+			want: exitURL,
+		},
+		{
+			name: "sdk",
+			payload: func() []byte {
+				raw, _ := json.Marshal(pluginapi.HTTPRequest{Method: http.MethodGet, URL: "https://example.com", ProxyURL: exitURL})
+				return raw
+			},
+			want: exitURL,
+		},
+		{
+			name: "absent",
+			payload: func() []byte {
+				raw, _ := json.Marshal(rpcHostHTTPRequest{Method: http.MethodGet, URL: "https://example.com"})
+				return raw
+			},
+			want: "",
+		},
+	}
+
+	for _, tc := range cases {
+		decoded, _, errDecode := decodeHostHTTPRequestWithCallbackID(tc.payload())
+		if errDecode != nil {
+			t.Fatalf("%s: decode error = %v", tc.name, errDecode)
+		}
+		if decoded.ProxyURL != tc.want {
+			t.Fatalf("%s: ProxyURL = %q, want %q", tc.name, decoded.ProxyURL, tc.want)
+		}
+	}
+
+	if errValid := validateRequestProxyURL(exitURL); errValid != nil {
+		t.Fatalf("valid exit rejected: %v", errValid)
+	}
+	if errValid := validateRequestProxyURL("  "); errValid != nil {
+		t.Fatalf("empty exit rejected: %v", errValid)
+	}
+	if errValid := validateRequestProxyURL("direct"); errValid != nil {
+		t.Fatalf("explicit direct rejected: %v", errValid)
+	}
+	if errInvalid := validateRequestProxyURL("not a url"); errInvalid == nil {
+		t.Fatal("malformed exit accepted, want a fail-closed error")
+	}
+}
+
 func TestHostModelExecutePropagatesForcedProviderAndAuthID(t *testing.T) {
 	host := New()
 	var got handlers.ModelExecutionRequest

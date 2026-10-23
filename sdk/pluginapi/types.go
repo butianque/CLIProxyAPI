@@ -1174,6 +1174,11 @@ type HTTPRequest struct {
 	Body []byte
 	// WireProfile specifies optional outbound HTTP wire profile settings.
 	WireProfile *HTTPWireProfile `json:"wire_profile,omitempty"`
+	// ProxyURL overrides the outbound exit for this request, normally with the
+	// credential's bound egress address. It outranks the auth and global proxy
+	// settings; empty leaves the host policy in charge. An address the host
+	// cannot use fails the request instead of falling back to a direct dial.
+	ProxyURL string `json:"proxy_url,omitempty"`
 }
 
 // HTTPResponse describes a non-streaming host HTTP response.

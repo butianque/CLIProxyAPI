@@ -58,6 +58,19 @@ func (c *hostHTTPClient) proxyContext(ctx context.Context) context.Context {
 	return cliproxyexecutor.WithRequestProxyURL(ctx, c.requestProxyURL)
 }
 
+// validateRequestProxyURL rejects a per-request exit the transport cannot use.
+// Empty (no override) and the explicit direct markers parse fine.
+func validateRequestProxyURL(raw string) error {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil
+	}
+	if _, errParse := proxyutil.Parse(trimmed); errParse != nil {
+		return fmt.Errorf("pluginhost: parse request proxy %s: %w", proxyutil.Redact(trimmed), errParse)
+	}
+	return nil
+}
+
 func (c *hostHTTPClient) Do(ctx context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -149,6 +162,12 @@ func (c *hostHTTPClient) doHTTP(ctx context.Context, req pluginapi.HTTPRequest) 
 		ctx = context.Background()
 	}
 	cfg := c.host.currentRuntimeConfig()
+	// An explicitly supplied exit must either work or fail the request: falling
+	// back to a direct dial would silently change the egress IP the credential
+	// is bound to.
+	if errProxy := validateRequestProxyURL(c.requestProxyURL); errProxy != nil {
+		return nil, cfg, nil, errProxy
+	}
 	method := req.Method
 	if method == "" {
 		method = http.MethodGet
