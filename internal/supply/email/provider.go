@@ -1034,6 +1034,13 @@ func ProbeGraph(ctx context.Context, account, clientID, refreshToken, egress str
 // It is read-only: nothing is sent anywhere, so it needs no passphrase — and it
 // never repeats the credential in a detail or an error.
 func probeMailbox(ctx context.Context, target Target) (string, error) {
+	return probeMailboxWith(ctx, target, dialSession)
+}
+
+// probeMailboxWith is probeMailbox over a caller-supplied dial, so the probe can
+// run through the provider's own dial (and therefore through its test seam)
+// instead of always opening a real session.
+func probeMailboxWith(ctx context.Context, target Target, dial func(ctx context.Context, target Target) (Session, error)) (string, error) {
 	if target.Auth != AuthGraph && strings.TrimSpace(target.Host) == "" {
 		return "", fmt.Errorf("%w: no mailbox host", ErrProbeUnready)
 	}
@@ -1043,10 +1050,13 @@ func probeMailbox(ctx context.Context, target Target) (string, error) {
 	if strings.TrimSpace(target.Password) == "" {
 		return "", fmt.Errorf("%w: no mailbox credential", ErrProbeUnready)
 	}
-	session, errDial := dialSession(ctx, target)
+	session, errDial := dial(ctx, target)
 	if errDial != nil {
 		if errors.Is(errDial, ErrLoginRejected) {
-			return "", fmt.Errorf("%w: %v", ErrProbeUnready, errDial)
+			// Both kinds are kept in the chain: the credential exists but the
+			// server refused it, which a caller may report differently from a
+			// credential that could not even be read.
+			return "", fmt.Errorf("%w: %w", ErrProbeUnready, errDial)
 		}
 		return "", errDial
 	}
@@ -1056,6 +1066,46 @@ func probeMailbox(ctx context.Context, target Target) (string, error) {
 		return "", errFolders
 	}
 	return fmt.Sprintf("connected, %d mailboxes", len(folders)), nil
+}
+
+// ProbeAddress opens the mailbox that receives address and closes it again.
+//
+// It answers the panel's "can this identity be reached right now" question for
+// an address that carries its own credential: such an address has no channel to
+// probe, so the only honest answer comes from dialling the mailbox that covers
+// it. The credential is read the way a real read reads it, so a mailbox whose
+// credential is missing or unreadable reports that instead of a connection
+// failure.
+//
+// Nothing is read from the mailbox: no message is listed, no code is extracted.
+func (p *ProviderImpl) ProbeAddress(ctx context.Context, address string) (string, error) {
+	address = strings.TrimSpace(address)
+	if address == "" {
+		return "", fmt.Errorf("%w: no address", supply.ErrUnknownIdentity)
+	}
+	targets, errTargets := p.targets()
+	if errTargets != nil {
+		return "", errTargets
+	}
+	chosen, ok := targetFor(targets, address)
+	if !ok {
+		// No mailbox receives this address, which is a different defect from a
+		// mailbox that refuses a login: the caller can neither retry nor wait.
+		return "", fmt.Errorf("%w: no mailbox receives %s", supply.ErrUnknownIdentity, address)
+	}
+	resolved, errCredential := p.withCredential(chosen)
+	if errCredential != nil {
+		return "", errCredential
+	}
+	// The probe opens a session, so it queues behind the same bound a real read
+	// does: a page that probes every identity must not look like a burst of
+	// logins to the provider.
+	release, errGate := p.gate.acquire(ctx, gateKey(resolved))
+	if errGate != nil {
+		return "", errGate
+	}
+	defer release()
+	return probeMailboxWith(ctx, resolved, p.dial)
 }
 
 var _ supply.Provider = (*ProviderImpl)(nil)

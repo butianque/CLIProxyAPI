@@ -151,6 +151,9 @@ func (s *Server) registerManagementV8Routes() {
 	v8.POST("/supply/email/grab", s.mgmt.PostSupplyEmailGrab)
 	v8.GET("/supply/email/code", s.mgmt.GetSupplyEmailCode)
 	v8.POST("/supply/email/credential", s.mgmt.PostSupplyEmailCredential)
+	// "Can the mailbox that receives this address be opened right now" — the
+	// answer an identity with its own credential cannot get from a channel.
+	v8.POST("/supply/email/probe", s.mgmt.PostSupplyEmailProbe)
 	// A batch of mailboxes from a seller's paste: one call parses every line,
 	// stores the refresh tokens, and creates one channel per mailbox.
 	v8.POST("/supply/email/import", s.mgmt.PostSupplyEmailImport)

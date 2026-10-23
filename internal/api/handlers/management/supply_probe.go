@@ -15,9 +15,13 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/supply/phone"
 )
 
-// This file is the channel probe surface: the panel's "is this channel actually
-// reachable" question, answered with one cheap authenticated call per declared
-// nature.
+// This file is the probe surface: the panel's "is this actually reachable"
+// question, answered with one cheap authenticated call per thing asked about.
+//
+// Two things get probed. A channel declares natures, and each declared nature is
+// dialled once. An identity in the pool that carries its own credential has no
+// channel to ask — the mailbox that receives it is the only thing that can
+// answer — so it is probed by address instead.
 //
 // A probe is read-only: it needs no master passphrase, writes nothing, and
 // never returns a credential value. What it reports is a state plus, when there
@@ -185,4 +189,111 @@ func probeCredential(vault secretstore.Vault, name string) (string, string) {
 		return "", "the named credential cannot be read"
 	}
 	return value, ""
+}
+
+// emailProbeLimit caps how many addresses one request may probe. Each address
+// costs one mailbox session, so the cap is what keeps a page-wide probe from
+// turning into an unbounded burst of logins.
+const emailProbeLimit = 40
+
+// emailProbeTimeout bounds one address's probe, waiting for a free session
+// included. A probe that hangs therefore holds its worker, not the request.
+const emailProbeTimeout = 15 * time.Second
+
+// PostSupplyEmailProbe answers "can the mailbox that receives this address be
+// opened right now", for one address or a batch.
+//
+// It exists because an identity that carries its own credential has no channel
+// to probe: asking a channel about it would answer about a different mailbox.
+// The answer is per address rather than per mailbox, because the caller asked
+// about addresses — a catch-all domain has many of them behind one mailbox.
+func (h *Handler) PostSupplyEmailProbe(c *gin.Context) {
+	var body struct {
+		Addresses []string `json:"addresses"`
+	}
+	// The body is required: with no address there is nothing to probe, and
+	// answering "everything is fine" would be a lie about an empty question.
+	_ = c.ShouldBindJSON(&body)
+
+	provider, errProvider := emailProvider()
+	if errProvider != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"status": "error",
+			"error":  "no email mailbox is configured",
+			"code":   "email_unavailable",
+		})
+		return
+	}
+	addresses := make([]string, 0, len(body.Addresses))
+	seen := make(map[string]bool, len(body.Addresses))
+	for _, raw := range body.Addresses {
+		address := strings.TrimSpace(raw)
+		if address == "" {
+			continue
+		}
+		key := strings.ToLower(address)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		addresses = append(addresses, address)
+		if len(addresses) == emailProbeLimit {
+			break
+		}
+	}
+	if len(addresses) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"status": "error",
+			"error":  "no address to probe",
+			"code":   "address_required",
+		})
+		return
+	}
+
+	ctx := c.Request.Context()
+	probes := make([]gin.H, len(addresses))
+	var wg sync.WaitGroup
+	for i, address := range addresses {
+		wg.Go(func() {
+			ctxProbe, cancel := context.WithTimeout(ctx, emailProbeTimeout)
+			defer cancel()
+			detail, errProbe := provider.ProbeAddress(ctxProbe, address)
+			probes[i] = addressProbeView(address, detail, errProbe)
+		})
+	}
+	wg.Wait()
+
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "probes": probes})
+}
+
+// addressProbeView turns one address's outcome into the panel's vocabulary.
+func addressProbeView(address, detail string, errProbe error) gin.H {
+	view := gin.H{"address": address}
+	switch {
+	case errProbe == nil:
+		view["state"] = probeOnline
+		if detail != "" {
+			view["detail"] = detail
+		}
+	case errors.Is(errProbe, email.ErrLoginRejected):
+		// The credential was read and the mailbox refused it: this address
+		// cannot receive mail until the credential is replaced.
+		view["state"] = probeOffline
+		view["detail"] = errProbe.Error()
+	case errors.Is(errProbe, email.ErrProbeUnready), errors.Is(errProbe, email.ErrCredential):
+		// Nothing was attempted, so nothing can be concluded about reachability.
+		// Reporting this as offline would send the operator looking for a network
+		// fault that does not exist.
+		view["state"] = probeUnready
+		view["detail"] = errProbe.Error()
+	case errors.Is(errProbe, supply.ErrUnknownIdentity):
+		// No mailbox receives this address, so it can never be used: that is a
+		// real failure, not an untried one.
+		view["state"] = probeOffline
+		view["detail"] = "no configured mailbox receives this address"
+	default:
+		view["state"] = probeOffline
+		view["detail"] = errProbe.Error()
+	}
+	return view
 }

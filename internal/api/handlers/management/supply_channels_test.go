@@ -2,7 +2,9 @@ package management
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,12 +12,14 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/secretstore"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/supply"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/supply/email"
 )
 
 func setupChannelTest(t *testing.T) (*Handler, *gin.Engine) {
@@ -731,5 +735,147 @@ func TestSupplyChannelRejectsUnusableMailbox(t *testing.T) {
 				t.Fatalf("%s: %d %s, want 400", name, rr.Code, rr.Body.String())
 			}
 		})
+	}
+}
+
+// An address that carries its own credential is probed by dialling the mailbox
+// that receives it. The three outcomes are kept apart on purpose: a mailbox that
+// refused the login cannot receive mail, a credential that could not be read was
+// never tried, and an address no mailbox receives can never be used at all.
+func TestAddressProbeViewSeparatesUntriedFromUnreachable(t *testing.T) {
+	online := addressProbeView("a@outlook.com", "connected, 3 mailboxes", nil)
+	if online["state"] != probeOnline || online["detail"] != "connected, 3 mailboxes" {
+		t.Fatalf("online = %v", online)
+	}
+
+	// The mailbox answered and refused the credential: offline, with the reason.
+	refused := addressProbeView("a@outlook.com", "", fmt.Errorf("%w: AUTHENTICATE failed", email.ErrLoginRejected))
+	if refused["state"] != probeOffline {
+		t.Fatalf("refused = %v, want offline", refused)
+	}
+
+	// A credential that could not be read was never sent anywhere, so the state
+	// is unready — the panel must not turn that into "unreachable".
+	unready := addressProbeView("a@outlook.com", "", fmt.Errorf("%w: the store is locked", email.ErrCredential))
+	if unready["state"] != probeUnready {
+		t.Fatalf("unready = %v, want unready", unready)
+	}
+
+	// No mailbox covers the address: it can never receive mail, which is a real
+	// failure rather than an untried one.
+	unknown := addressProbeView("x@elsewhere.com", "", fmt.Errorf("%w: none", supply.ErrUnknownIdentity))
+	if unknown["state"] != probeOffline {
+		t.Fatalf("unknown identity = %v, want offline", unknown)
+	}
+	if detail, _ := unknown["detail"].(string); !strings.Contains(detail, "no configured mailbox") {
+		t.Fatalf("detail = %q, want the address's own reason", detail)
+	}
+}
+
+// probeSession stands in for a live mailbox so the address probe can be
+// exercised through the route without a server.
+type probeSession struct{}
+
+func (probeSession) Mailboxes(context.Context) ([]string, error) {
+	return []string{"INBOX", "Junk"}, nil
+}
+
+func (probeSession) Recent(context.Context, string, time.Time, email.FolderPosition, int) ([]email.Mail, uint32, error) {
+	return nil, 0, nil
+}
+
+func (probeSession) Close() error { return nil }
+
+// The address probe route answers per address: one connection per mailbox, and
+// the address no mailbox receives is reported as unusable rather than untried.
+func TestSupplyEmailProbeAnswersPerAddress(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := filepath.Join(dir, "supply")
+	cfgPath := filepath.Join(dir, "config.yaml")
+	if errWrite := os.WriteFile(cfgPath, []byte("supply:\n  storage-dir: "+stateDir+"\n"), 0o600); errWrite != nil {
+		t.Fatalf("write config: %v", errWrite)
+	}
+	if errMkdir := os.MkdirAll(stateDir, 0o755); errMkdir != nil {
+		t.Fatalf("create supply dir: %v", errMkdir)
+	}
+	channels := supply.ChannelDocument{Version: 1, Channels: []supply.Channel{{
+		ID:       "ormnes",
+		Label:    "Ormnes",
+		Category: "self-built",
+		Email: &supply.KindConfig{
+			Enabled: true,
+			Natures: []supply.Nature{supply.NatureIMAP},
+			Connections: map[supply.Nature]supply.Connection{
+				supply.NatureIMAP: {Endpoint: "imap.example.com:993", Account: "box@example.com", Domain: "ormnes.com"},
+			},
+		},
+	}}}
+	raw, errMarshal := json.Marshal(channels)
+	if errMarshal != nil {
+		t.Fatalf("marshal channels: %v", errMarshal)
+	}
+	if errWrite := os.WriteFile(supply.ChannelPath(stateDir), raw, 0o600); errWrite != nil {
+		t.Fatalf("write channels: %v", errWrite)
+	}
+
+	provider, errNew := email.New(email.Config{
+		ChannelsPath: supply.ChannelPath(stateDir),
+		Credential:   func(name string) (string, error) { return "auth-code-for-" + name, nil },
+		Dial: func(context.Context, email.Target) (email.Session, error) {
+			return probeSession{}, nil
+		},
+	})
+	if errNew != nil {
+		t.Fatalf("email.New: %v", errNew)
+	}
+	previous := supply.Default()
+	t.Cleanup(func() { supply.SetDefault(previous) })
+	registry := supply.NewRegistry()
+	if errRegister := registry.Register(provider); errRegister != nil {
+		t.Fatalf("register provider: %v", errRegister)
+	}
+	supply.SetDefault(registry)
+
+	h := &Handler{configFilePath: cfgPath}
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.POST("/supply/email/probe", h.PostSupplyEmailProbe)
+
+	req := httptest.NewRequest(http.MethodPost, "/supply/email/probe", bytes.NewBufferString(`{"addresses":["abc@ormnes.com","ABC@ormnes.com","x@elsewhere.com"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("probe: %d %s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Probes []map[string]any `json:"probes"`
+	}
+	if errDecode := json.Unmarshal(rr.Body.Bytes(), &resp); errDecode != nil {
+		t.Fatalf("decode: %v", errDecode)
+	}
+	// The duplicate is collapsed: one address is one connection.
+	if len(resp.Probes) != 2 {
+		t.Fatalf("probes = %v, want the two distinct addresses", resp.Probes)
+	}
+	byAddress := map[string]map[string]any{}
+	for _, probe := range resp.Probes {
+		address, _ := probe["address"].(string)
+		byAddress[address] = probe
+	}
+	if state, _ := byAddress["abc@ormnes.com"]["state"].(string); state != probeOnline {
+		t.Fatalf("covered address = %v, want online", byAddress["abc@ormnes.com"])
+	}
+	if state, _ := byAddress["x@elsewhere.com"]["state"].(string); state != probeOffline {
+		t.Fatalf("uncovered address = %v, want offline", byAddress["x@elsewhere.com"])
+	}
+
+	// No address at all is a refused request, not a cheerful "all fine".
+	empty := httptest.NewRequest(http.MethodPost, "/supply/email/probe", bytes.NewBufferString(`{"addresses":[]}`))
+	empty.Header.Set("Content-Type", "application/json")
+	emptyRecorder := httptest.NewRecorder()
+	r.ServeHTTP(emptyRecorder, empty)
+	if emptyRecorder.Code != http.StatusBadRequest {
+		t.Fatalf("empty request: %d, want 400", emptyRecorder.Code)
 	}
 }

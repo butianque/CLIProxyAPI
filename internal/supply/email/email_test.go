@@ -948,3 +948,54 @@ func TestProviderInboxReadsChannelMailboxesOnly(t *testing.T) {
 		t.Fatalf("err = %v, want ErrUnknownIdentity", errUnknown)
 	}
 }
+
+// An address that carries its own credential is probed through the mailbox that
+// receives it: that mailbox is the only thing that can say whether the address
+// can be used right now.
+func TestProviderProbeAddressOpensCoveringMailbox(t *testing.T) {
+	session := &fakeSession{folders: []string{"INBOX", "Junk"}}
+	provider := newProvider(t, session, imapChannel("qq", "box@qq.com", "ormnes.com", true))
+
+	detail, errProbe := provider.ProbeAddress(context.Background(), "abc@ormnes.com")
+	if errProbe != nil {
+		t.Fatalf("ProbeAddress: %v", errProbe)
+	}
+	if detail != "connected, 2 mailboxes" {
+		t.Fatalf("detail = %q, want the folder count", detail)
+	}
+	// The credential was read from the store rather than assumed, and the
+	// session was closed again: a probe that left a mailbox open would leak a
+	// connection per page load.
+	if strings.TrimSpace(session.dialled) == "" {
+		t.Fatal("the probe dialled without a credential")
+	}
+	if !session.closed {
+		t.Fatal("the probe left the mailbox open")
+	}
+
+	// An address no mailbox receives cannot be reached, and the answer says so
+	// instead of reporting a connection that was never attempted.
+	if _, errUnknown := provider.ProbeAddress(context.Background(), "x@elsewhere.com"); !errors.Is(errUnknown, supply.ErrUnknownIdentity) {
+		t.Fatalf("err = %v, want ErrUnknownIdentity", errUnknown)
+	}
+}
+
+// A credential that cannot be read is not an unreachable mailbox: the probe
+// reports it as unready so the panel does not send the operator looking for a
+// network fault.
+func TestProviderProbeAddressReportsUnreadableCredential(t *testing.T) {
+	provider, errNew := New(Config{
+		ChannelsPath: writeChannels(t, imapChannel("qq", "box@qq.com", "ormnes.com", true)),
+		Credential:   func(string) (string, error) { return "", errors.New("the secret store is locked") },
+		Dial: func(context.Context, Target) (Session, error) {
+			t.Fatal("a probe with no readable credential must not dial")
+			return nil, nil
+		},
+	})
+	if errNew != nil {
+		t.Fatalf("New: %v", errNew)
+	}
+	if _, errProbe := provider.ProbeAddress(context.Background(), "abc@ormnes.com"); !errors.Is(errProbe, ErrCredential) {
+		t.Fatalf("err = %v, want ErrCredential", errProbe)
+	}
+}
