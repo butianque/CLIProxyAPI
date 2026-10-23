@@ -145,6 +145,11 @@ func (s *Server) registerManagementV8Routes() {
 	// arrived in them, and where a mailbox authorization code is stored.
 	v8.GET("/supply/email/status", s.mgmt.GetSupplyEmailStatus)
 	v8.GET("/supply/email/inbox", s.mgmt.GetSupplyEmailInbox)
+	// The machine surface: hand out one address, then ask what arrived for it
+	// after the position the caller holds. A script uses these two and nothing
+	// else; the panel uses the two above.
+	v8.POST("/supply/email/grab", s.mgmt.PostSupplyEmailGrab)
+	v8.GET("/supply/email/code", s.mgmt.GetSupplyEmailCode)
 	v8.POST("/supply/email/credential", s.mgmt.PostSupplyEmailCredential)
 	// A batch of mailboxes from a seller's paste: one call parses every line,
 	// stores the refresh tokens, and creates one channel per mailbox.

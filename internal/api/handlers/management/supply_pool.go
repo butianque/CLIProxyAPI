@@ -102,6 +102,15 @@ func poolRecordView(record supply.Record, index map[string]string, secrets secre
 		"first_seen": record.FirstSeen,
 		"last_used":  record.LastUsed,
 	}
+	// A mail address is one address that forwards somewhere; the domain is where
+	// it receives, and the part before it is the identity. Reporting the domain
+	// for every email record is what lets a reader group a bought mailbox and a
+	// catch-all alias by the same fact instead of by how they were obtained.
+	if record.Kind == supply.KindEmail {
+		if domain := supply.AddressDomain(record.Address); domain != "" {
+			view["domain"] = domain
+		}
+	}
 	if record.ChannelID != "" {
 		view["channel_id"] = record.ChannelID
 	}

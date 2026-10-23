@@ -62,6 +62,14 @@ type Config struct {
 	// would drift from the others. Nil means no pool is available, in which case
 	// an id cannot be honoured and the connection fails closed.
 	ResolveEgress func(id int) (string, error)
+
+	// MaxOpen bounds how many mailboxes are open at once across the process.
+	// Zero uses DefaultMaxOpen; a negative value means no bound.
+	MaxOpen int
+
+	// MaxPerHost bounds how many mailboxes are open at once against one server.
+	// Zero uses DefaultMaxPerHost; a negative value means no bound.
+	MaxPerHost int
 }
 
 // ProviderImpl is the email supply provider.
@@ -69,6 +77,7 @@ type ProviderImpl struct {
 	cfg        Config
 	dial       func(ctx context.Context, target Target) (Session, error)
 	credential func(name string) (string, error)
+	gate       *dialGate
 }
 
 // New builds the email provider.
@@ -82,7 +91,18 @@ func New(cfg Config) (*ProviderImpl, error) {
 	if cfg.MaxMessages <= 0 {
 		cfg.MaxMessages = DefaultMaxMessages
 	}
-	provider := &ProviderImpl{cfg: cfg, dial: cfg.Dial, credential: cfg.Credential}
+	if cfg.MaxOpen == 0 {
+		cfg.MaxOpen = DefaultMaxOpen
+	}
+	if cfg.MaxPerHost == 0 {
+		cfg.MaxPerHost = DefaultMaxPerHost
+	}
+	provider := &ProviderImpl{
+		cfg:        cfg,
+		dial:       cfg.Dial,
+		credential: cfg.Credential,
+		gate:       newDialGate(cfg.MaxOpen, cfg.MaxPerHost),
+	}
 	if provider.dial == nil {
 		provider.dial = dialSession
 	}
@@ -143,6 +163,21 @@ func (p *ProviderImpl) Grab(ctx context.Context, opts supply.GrabOptions) (suppl
 		// An address no configured mailbox receives is not one this service
 		// handed out, and the caller's right answer is a manual path.
 		return supply.Identity{}, supply.ErrUnknownIdentity
+	}
+	// A caller may ask for one kind of source: a bought mailbox that exists on
+	// its own, or an alias of a domain this service operates. Narrowing here
+	// rather than at each caller keeps the choice out of the wire contract.
+	if usage := strings.TrimSpace(opts.Usage); usage != "" {
+		narrowed := make([]Target, 0, len(targets))
+		for _, target := range targets {
+			if strings.EqualFold(strings.TrimSpace(target.Usage), usage) {
+				narrowed = append(narrowed, target)
+			}
+		}
+		if len(narrowed) == 0 {
+			return supply.Identity{}, supply.ErrUnavailable
+		}
+		targets = narrowed
 	}
 	target, ok := pickTarget(targets, strings.TrimSpace(opts.UID))
 	if !ok {
@@ -215,10 +250,23 @@ func (p *ProviderImpl) Read(ctx context.Context, purpose, address string) (suppl
 	if len(targets) == 0 {
 		return supply.Message{}, supply.ErrUnavailable
 	}
+	// Only a mailbox that can receive the address can hold its mail, so the
+	// others are not opened: walking every configured mailbox would make one
+	// read cost as many connections as the service has mailboxes.
+	covering := make([]Target, 0, 1)
+	for _, target := range orderTargets(targets, wanted) {
+		if target.Covers(wanted) {
+			covering = append(covering, target)
+		}
+	}
+	if len(covering) == 0 {
+		return supply.Message{}, supply.ErrUnknownIdentity
+	}
+	targets = covering
 	var firstErr error
 	scanned := false
-	for _, target := range orderTargets(targets, wanted) {
-		mails, errScan := p.scan(ctx, target, wanted, 1)
+	for _, target := range targets {
+		mails, _, errScan := p.scan(ctx, target, wanted, Cursor{}, 1)
 		if errScan != nil {
 			if firstErr == nil {
 				firstErr = errScan
@@ -242,6 +290,135 @@ func (p *ProviderImpl) Read(ctx context.Context, purpose, address string) (suppl
 		return supply.Message{}, firstErr
 	}
 	return supply.Message{Ready: false}, nil
+}
+
+// ReadResult is one answer to "what arrived for this address after the position
+// I hold".
+//
+// It carries the messages, not only a code, because a verification mail is not
+// the only thing that arrives: a welcome mail with no code can sit on top of it,
+// and an answer that reported only the newest message would say "no code" while
+// the code was one message down.
+type ReadResult struct {
+	// Mails are the new messages, newest first, at most readAfterLimit.
+	Mails []Mail
+	// Code is the newest code among them, or "" when none states one.
+	Code string
+	// Cursor is where the next read continues. It advances past everything this
+	// answer returned.
+	Cursor string
+	// Reset reports that the mailbox's generation changed, so the position the
+	// caller held no longer named the same messages and the window was read
+	// again. A caller may see a message twice when this is true.
+	Reset bool
+	// Mailbox names the mailbox that answered, so a caller can tell which
+	// address's connection produced the mail.
+	Mailbox string
+}
+
+const (
+	// readAfterLimit is how many new messages one read reports. A verification
+	// flow needs the newest one; the rest are there so a caller can recognise
+	// which mail it is looking at.
+	readAfterLimit = 5
+	// pollInterval is how often a waiting read looks again on the same session.
+	// Opening a new session per look would cost a TLS handshake and a login every
+	// two seconds of waiting, which is what a provider throttles.
+	pollInterval = 2 * time.Second
+)
+
+// ReadAfter reads the mail that arrived for one address after a position.
+//
+// It opens exactly one mailbox: the one that can receive the address. That is
+// the difference from Read, which walks every configured mailbox until one
+// answers — affordable for a single catch-all domain, not for a thousand bought
+// addresses.
+//
+// wait keeps the session open and looks again on it until something arrives or
+// the wait expires, so a caller asks once instead of polling in a loop.
+func (p *ProviderImpl) ReadAfter(ctx context.Context, address, cursor string, wait time.Duration) (ReadResult, error) {
+	wanted := strings.ToLower(strings.TrimSpace(address))
+	if wanted == "" {
+		return ReadResult{}, errors.New("email: a read needs an address to look for")
+	}
+	after, errCursor := DecodeCursor(cursor)
+	if errCursor != nil {
+		return ReadResult{}, errCursor
+	}
+	targets, errTargets := p.targets()
+	if errTargets != nil {
+		return ReadResult{}, errTargets
+	}
+	chosen, ok := targetFor(targets, wanted)
+	if !ok {
+		// No configured mailbox receives this address, so this service never
+		// handed it out. The caller's answer is a manual path, not a retry.
+		return ReadResult{}, supply.ErrUnknownIdentity
+	}
+	deadline := time.Now().Add(wait)
+	for {
+		mails, positions, errScan := p.scan(ctx, chosen, wanted, after, readAfterLimit)
+		if errScan != nil {
+			return ReadResult{}, errScan
+		}
+		next := Cursor{Nature: cursorNature(chosen.Auth), Folders: positions}
+		if len(mails) > 0 {
+			return ReadResult{
+				Mails:   mails,
+				Code:    firstCode(mails),
+				Cursor:  EncodeCursor(next),
+				Reset:   positionReset(after, positions),
+				Mailbox: chosen.Account,
+			}, nil
+		}
+		if wait <= 0 || !time.Now().Before(deadline) {
+			// Nothing new. The position is handed back with the folder
+			// generations refreshed, so a caller that polls again continues from
+			// the same place.
+			return ReadResult{Cursor: EncodeCursor(next), Mailbox: chosen.Account, Reset: positionReset(after, positions)}, nil
+		}
+		select {
+		case <-ctx.Done():
+			return ReadResult{}, ctx.Err()
+		case <-time.After(pollInterval):
+		}
+	}
+}
+
+// positionReset reports whether a folder the caller held a position in now has a
+// different generation, which invalidates every stored UID in it.
+func positionReset(before Cursor, after []FolderPosition) bool {
+	for _, position := range after {
+		previous := before.For(position.Folder)
+		if previous.UIDValidity == 0 || position.UIDValidity == 0 {
+			continue
+		}
+		if previous.UIDValidity != position.UIDValidity {
+			return true
+		}
+	}
+	return false
+}
+
+// targetFor picks the one mailbox that can receive address.
+func targetFor(targets []Target, address string) (Target, bool) {
+	for _, target := range orderTargets(targets, address) {
+		if target.Covers(address) {
+			return target, true
+		}
+	}
+	return Target{}, false
+}
+
+// firstCode returns the newest message's code, or the next one down when the
+// newest states none.
+func firstCode(mails []Mail) string {
+	for _, mail := range mails {
+		if code := strings.TrimSpace(mail.Code); code != "" {
+			return code
+		}
+	}
+	return ""
 }
 
 // Link records which account an address registered, so the ledger can answer
@@ -298,7 +475,12 @@ type InboxMailbox struct {
 //
 // This is the management surface's read: the operator wants to see what
 // actually arrived, including mail that states no code. An empty address means
-// "everything", which is what an inbox view shows before a search.
+// "everything the channels hold", which is what a channel row reports.
+//
+// It deliberately does not walk the bought mailboxes: one address, one mailbox,
+// is what ReadAfter is for. Opening a thousand bought mailboxes to fill one
+// panel would cost a thousand connections per view, and a channel row has
+// nothing to say about a mailbox that no channel issued.
 func (p *ProviderImpl) Inbox(ctx context.Context, address string, limit int) (InboxReading, error) {
 	wanted := strings.ToLower(strings.TrimSpace(address))
 	if limit <= 0 {
@@ -308,6 +490,30 @@ func (p *ProviderImpl) Inbox(ctx context.Context, address string, limit int) (In
 	if errTargets != nil {
 		return InboxReading{}, errTargets
 	}
+	if len(targets) == 0 {
+		return InboxReading{}, supply.ErrUnavailable
+	}
+	// A mailbox that cannot receive the address cannot hold its mail, so reading
+	// it would only cost a connection. An empty address asks for the channels'
+	// own mailboxes, which are the ones a row speaks for.
+	narrowed := make([]Target, 0, len(targets))
+	for _, target := range orderTargets(targets, wanted) {
+		if wanted == "" {
+			if strings.TrimSpace(target.ChannelID) != "" {
+				narrowed = append(narrowed, target)
+			}
+			continue
+		}
+		if target.Covers(wanted) {
+			narrowed = append(narrowed, target)
+		}
+	}
+	if wanted != "" && len(narrowed) == 0 {
+		// Nothing here receives this address, so this service never handed it
+		// out. Saying "no mail" would hide that behind a convincing answer.
+		return InboxReading{}, supply.ErrUnknownIdentity
+	}
+	targets = narrowed
 	if len(targets) == 0 {
 		return InboxReading{}, supply.ErrUnavailable
 	}
@@ -325,7 +531,7 @@ func (p *ProviderImpl) Inbox(ctx context.Context, address string, limit int) (In
 			Account:   target.Account,
 			Domain:    target.Domain,
 		}
-		mails, errScan := p.scan(ctx, target, wanted, limit)
+		mails, _, errScan := p.scan(ctx, target, wanted, Cursor{}, limit)
 		if errScan != nil {
 			// One mailbox failing is not the whole read failing: another may
 			// answer. But the failure is reported per mailbox, because a channel
@@ -410,15 +616,24 @@ func transportName(auth AuthMode) string {
 }
 
 // scan reads one mailbox and returns the messages that were addressed to
-// address (or all of them when address is empty).
-func (p *ProviderImpl) scan(ctx context.Context, target Target, address string, limit int) ([]Mail, error) {
+// address (or all of them when address is empty), plus the position each folder
+// was read up to.
+func (p *ProviderImpl) scan(ctx context.Context, target Target, address string, after Cursor, limit int) ([]Mail, []FolderPosition, error) {
 	resolved, errCredential := p.withCredential(target)
 	if errCredential != nil {
-		return nil, errCredential
+		return nil, nil, errCredential
 	}
+	// One mailbox is one connection. The gate is taken before dialling, so a
+	// burst of readers queues instead of opening a session per caller against a
+	// provider that will start refusing them.
+	release, errGate := p.gate.acquire(ctx, gateKey(resolved))
+	if errGate != nil {
+		return nil, nil, errGate
+	}
+	defer release()
 	session, errDial := p.dial(ctx, resolved)
 	if errDial != nil {
-		return nil, errDial
+		return nil, nil, errDial
 	}
 	defer func() { _ = session.Close() }()
 
@@ -430,10 +645,11 @@ func (p *ProviderImpl) scan(ctx context.Context, target Target, address string, 
 	}
 	since := time.Now().Add(-p.cfg.PollWindow)
 	collected := make([]Mail, 0, limit)
+	positions := make([]FolderPosition, 0, len(folders))
 	scanned := false
 	var firstErr error
 	for _, mailbox := range junkMailboxes(folders) {
-		mails, errRecent := session.Recent(ctx, mailbox, since, p.cfg.MaxMessages)
+		mails, validity, errRecent := session.Recent(ctx, mailbox, since, after.For(mailbox), p.cfg.MaxMessages)
 		if errRecent != nil {
 			// One unreadable folder is not fatal while another still answers, but
 			// a mailbox where every folder failed is not an empty inbox: saying
@@ -444,6 +660,18 @@ func (p *ProviderImpl) scan(ctx context.Context, target Target, address string, 
 			continue
 		}
 		scanned = true
+		if len(mails) > 0 {
+			// The position moves past the newest message this folder returned,
+			// so the next read does not report the same mail again.
+			positions = append(positions, positionFor(mailbox, validity, mails[len(mails)-1]))
+		} else {
+			// Nothing new, but the folder's generation is still worth carrying:
+			// a reset is what tells a caller its position no longer holds.
+			previous := after.For(mailbox)
+			previous.Folder = mailbox
+			previous.UIDValidity = validity
+			positions = append(positions, previous)
+		}
 		for _, mail := range mails {
 			if !mail.Mentions(address) {
 				continue
@@ -453,7 +681,7 @@ func (p *ProviderImpl) scan(ctx context.Context, target Target, address string, 
 		}
 	}
 	if !scanned && firstErr != nil {
-		return nil, firstErr
+		return nil, nil, firstErr
 	}
 	// Newest first, then trim: the caller asked for the newest match, and a
 	// folder returns its messages in arrival order, not by date.
@@ -461,7 +689,17 @@ func (p *ProviderImpl) scan(ctx context.Context, target Target, address string, 
 	if len(collected) > limit {
 		collected = collected[:limit]
 	}
-	return collected, nil
+	return collected, positions, nil
+}
+
+// positionFor is the position that continues after newest in one folder.
+func positionFor(folder string, validity uint32, newest Mail) FolderPosition {
+	return FolderPosition{
+		Folder:      folder,
+		UIDValidity: validity,
+		UID:         newest.UID,
+		Received:    newest.Date.UTC().Format(time.RFC3339Nano),
+	}
 }
 
 // withCredential fills in the mailbox password from the secret store.

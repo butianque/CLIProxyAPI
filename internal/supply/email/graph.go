@@ -122,14 +122,23 @@ func (s *graphSession) Mailboxes(ctx context.Context) ([]string, error) {
 	return names, nil
 }
 
-// Recent reads the newest messages of one folder since a point in time.
-func (s *graphSession) Recent(ctx context.Context, mailbox string, since time.Time, limit int) ([]Mail, error) {
+// Recent reads the messages of one folder that arrived after a point.
+//
+// Graph has no UID, so a position here is an arrival time: "strictly later than
+// the one already handed out". Strictness is what keeps a poll from returning
+// the same message twice. The validity is always zero, because Graph has no
+// folder generation to invalidate a position.
+func (s *graphSession) Recent(ctx context.Context, mailbox string, since time.Time, after FolderPosition, limit int) ([]Mail, uint32, error) {
 	target, errTarget := s.folderTarget(ctx, mailbox)
 	if errTarget != nil {
-		return nil, errTarget
+		return nil, 0, errTarget
 	}
 	query := url.Values{}
-	query.Set("$filter", "receivedDateTime ge "+since.UTC().Format(time.RFC3339))
+	if strings.TrimSpace(after.Received) != "" {
+		query.Set("$filter", "receivedDateTime gt "+strings.TrimSpace(after.Received))
+	} else {
+		query.Set("$filter", "receivedDateTime ge "+since.UTC().Format(time.RFC3339))
+	}
 	query.Set("$select", graphMessageSelect)
 	query.Set("$orderby", "receivedDateTime desc")
 	if limit > 0 {
@@ -141,13 +150,13 @@ func (s *graphSession) Recent(ctx context.Context, mailbox string, since time.Ti
 		Value []graphMessage `json:"value"`
 	}
 	if errGet := s.get(ctx, address, &payload); errGet != nil {
-		return nil, errGet
+		return nil, 0, errGet
 	}
 	mails := make([]Mail, 0, len(payload.Value))
 	for _, message := range payload.Value {
 		mails = append(mails, message.toMail(mailbox))
 	}
-	return mails, nil
+	return mails, 0, nil
 }
 
 // Close ends the session. Graph holds no connection of its own, so there is

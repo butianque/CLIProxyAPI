@@ -128,6 +128,9 @@ type fakeSession struct {
 	// recentErr makes every folder read fail, which is how a server that rejects
 	// the search looks to the provider.
 	recentErr error
+	// validity is the folder generation the fake reports, so a test can prove a
+	// position is carried in a cursor and dropped when the folder is reset.
+	validity uint32
 	// dialled records the password the provider resolved, so a test can prove
 	// the credential was read instead of assumed.
 	dialled string
@@ -136,15 +139,25 @@ type fakeSession struct {
 
 func (f *fakeSession) Mailboxes(ctx context.Context) ([]string, error) { return f.folders, nil }
 
-func (f *fakeSession) Recent(ctx context.Context, mailbox string, since time.Time, limit int) ([]Mail, error) {
+func (f *fakeSession) Recent(ctx context.Context, mailbox string, since time.Time, after FolderPosition, limit int) ([]Mail, uint32, error) {
 	if f.recentErr != nil {
-		return nil, f.recentErr
+		return nil, 0, f.recentErr
 	}
 	mails := f.mails[mailbox]
+	// Honour the position the way a real folder does: only messages past it.
+	if after.UID > 0 {
+		newer := make([]Mail, 0, len(mails))
+		for _, mail := range mails {
+			if mail.UID > after.UID {
+				newer = append(newer, mail)
+			}
+		}
+		mails = newer
+	}
 	if limit > 0 && len(mails) > limit {
 		mails = mails[len(mails)-limit:]
 	}
-	return mails, nil
+	return mails, f.validity, nil
 }
 
 func (f *fakeSession) Close() error {
@@ -651,5 +664,287 @@ func TestProviderTargetsOAuth2Mailbox(t *testing.T) {
 	}
 	if want := "auth-code-for-" + targets[0].SecretName; session.dialled != want {
 		t.Fatalf("credential read = %q, want %q", session.dialled, want)
+	}
+}
+
+// A cursor round-trips and refuses anything this build did not write, so a
+// caller cannot poll with a position that nothing can honour.
+func TestCursorRoundTrip(t *testing.T) {
+	if got := EncodeCursor(Cursor{}); got != "" {
+		t.Fatalf("zero cursor encoded to %q, want the empty string", got)
+	}
+	decoded, errEmpty := DecodeCursor("")
+	if errEmpty != nil || !decoded.IsZero() {
+		t.Fatalf("empty cursor = %+v, err = %v; want the zero cursor", decoded, errEmpty)
+	}
+
+	original := Cursor{
+		Nature:  cursorNatureIMAP,
+		Folders: []FolderPosition{{Folder: "INBOX", UIDValidity: 42, UID: 900}},
+	}
+	decoded, errDecode := DecodeCursor(EncodeCursor(original))
+	if errDecode != nil {
+		t.Fatalf("DecodeCursor: %v", errDecode)
+	}
+	if decoded.Nature != original.Nature {
+		t.Fatalf("nature = %q, want %q", decoded.Nature, original.Nature)
+	}
+	if len(decoded.Folders) != 1 || decoded.Folders[0] != original.Folders[0] {
+		t.Fatalf("positions = %+v, want %+v", decoded.Folders, original.Folders)
+	}
+
+	for _, bad := range []string{"900", "v1.!!!", "v1.eyJuIjoicG9wMyJ9"} {
+		if _, errBad := DecodeCursor(bad); !errors.Is(errBad, ErrCursor) {
+			t.Fatalf("DecodeCursor(%q) err = %v, want ErrCursor", bad, errBad)
+		}
+	}
+}
+
+// A second read continues from the position the first one handed back: the
+// message already reported is not reported again, and only the new one is.
+func TestProviderReadAfterContinuesFromCursor(t *testing.T) {
+	base := time.Date(2026, 10, 14, 10, 0, 0, 0, time.UTC)
+	first := mailTo("abc@ormnes.com", "111111", base)
+	first.UID = 900
+	second := mailTo("abc@ormnes.com", "222222", base.Add(time.Minute))
+	second.UID = 901
+	session := &fakeSession{
+		folders:  []string{"INBOX"},
+		mails:    map[string][]Mail{"INBOX": {first}},
+		validity: 42,
+	}
+	provider := newProvider(t, session, imapChannel("qq", "box@qq.com", "ormnes.com", true))
+
+	answer, errRead := provider.ReadAfter(context.Background(), "abc@ormnes.com", "", 0)
+	if errRead != nil {
+		t.Fatalf("ReadAfter: %v", errRead)
+	}
+	if answer.Code != "111111" {
+		t.Fatalf("code = %q, want 111111", answer.Code)
+	}
+	if answer.Cursor == "" {
+		t.Fatal("no cursor was handed back, so the next read cannot continue")
+	}
+
+	// Nothing new: the position comes back unchanged and no code is invented.
+	same, errSame := provider.ReadAfter(context.Background(), "abc@ormnes.com", answer.Cursor, 0)
+	if errSame != nil {
+		t.Fatalf("ReadAfter again: %v", errSame)
+	}
+	if same.Code != "" || len(same.Mails) != 0 {
+		t.Fatalf("re-read reported %+v, want nothing new", same)
+	}
+	if same.Cursor != answer.Cursor {
+		t.Fatalf("cursor moved without new mail: %q -> %q", answer.Cursor, same.Cursor)
+	}
+
+	// A new message arrives; only it is reported.
+	session.mails["INBOX"] = []Mail{first, second}
+	next, errNext := provider.ReadAfter(context.Background(), "abc@ormnes.com", answer.Cursor, 0)
+	if errNext != nil {
+		t.Fatalf("ReadAfter after arrival: %v", errNext)
+	}
+	if next.Code != "222222" {
+		t.Fatalf("code = %q, want the new 222222", next.Code)
+	}
+	if len(next.Mails) != 1 || next.Mails[0].UID != 901 {
+		t.Fatalf("mails = %+v, want only UID 901", next.Mails)
+	}
+	if next.Reset {
+		t.Fatal("Reset = true while the folder validity did not change")
+	}
+}
+
+// A folder whose generation changed invalidates every stored UID, so the read
+// starts over from the window and says so instead of silently skipping mail.
+func TestProviderReadAfterReportsFolderReset(t *testing.T) {
+	base := time.Date(2026, 10, 14, 10, 0, 0, 0, time.UTC)
+	mail := mailTo("abc@ormnes.com", "333333", base)
+	mail.UID = 5
+	session := &fakeSession{
+		folders:  []string{"INBOX"},
+		mails:    map[string][]Mail{"INBOX": {mail}},
+		validity: 42,
+	}
+	provider := newProvider(t, session, imapChannel("qq", "box@qq.com", "ormnes.com", true))
+
+	stale := EncodeCursor(Cursor{
+		Nature:  cursorNatureIMAP,
+		Folders: []FolderPosition{{Folder: "INBOX", UIDValidity: 7, UID: 4}},
+	})
+	answer, errRead := provider.ReadAfter(context.Background(), "abc@ormnes.com", stale, 0)
+	if errRead != nil {
+		t.Fatalf("ReadAfter: %v", errRead)
+	}
+	if !answer.Reset {
+		t.Fatal("Reset = false, want true when the folder generation changed")
+	}
+	if answer.Code != "333333" {
+		t.Fatalf("code = %q, want the message read from the window", answer.Code)
+	}
+}
+
+// A read that names an address no configured mailbox receives is not a retry: it
+// is an identity this service never handed out.
+func TestProviderReadAfterUnknownAddress(t *testing.T) {
+	session := &fakeSession{folders: []string{"INBOX"}, mails: map[string][]Mail{}}
+	provider := newProvider(t, session, imapChannel("qq", "box@qq.com", "ormnes.com", true))
+
+	_, errRead := provider.ReadAfter(context.Background(), "x@elsewhere.com", "", 0)
+	if !errors.Is(errRead, supply.ErrUnknownIdentity) {
+		t.Fatalf("err = %v, want ErrUnknownIdentity", errRead)
+	}
+}
+
+// A handout narrowed to one kind of source must not fall back to the other: a
+// caller that asked for a bought mailbox did not ask for an alias.
+func TestProviderGrabNarrowsByUsage(t *testing.T) {
+	session := &fakeSession{folders: []string{"INBOX"}, mails: map[string][]Mail{}}
+	catchAll := imapChannel("qq", "box@qq.com", "ormnes.com", true)
+	personal := imapChannel("personal", "me@qq.com", "", true)
+	personal.Category = "third-party"
+	personal.Email.Connections[supply.NatureIMAP] = supply.Connection{
+		Endpoint: "imap.qq.com:993",
+		Account:  "me@qq.com",
+		Secret:   "mail-personal",
+	}
+	provider := newProvider(t, session, catchAll, personal)
+
+	identity, errPersonal := provider.Grab(context.Background(), supply.GrabOptions{Usage: "personal"})
+	if errPersonal != nil {
+		t.Fatalf("Grab personal: %v", errPersonal)
+	}
+	if identity.Address != "me@qq.com" {
+		t.Fatalf("address = %q, want the bought mailbox", identity.Address)
+	}
+
+	identity, errAlias := provider.Grab(context.Background(), supply.GrabOptions{Usage: "self-domain"})
+	if errAlias != nil {
+		t.Fatalf("Grab self-domain: %v", errAlias)
+	}
+	if !strings.HasSuffix(identity.Address, "@ormnes.com") {
+		t.Fatalf("address = %q, want an alias on the catch-all domain", identity.Address)
+	}
+
+	if _, errNone := provider.Grab(context.Background(), supply.GrabOptions{Usage: "reserved"}); !errors.Is(errNone, supply.ErrUnavailable) {
+		t.Fatalf("err = %v, want ErrUnavailable for a kind of source nothing serves", errNone)
+	}
+}
+
+// The gate bounds how many mailboxes are open at once, and a release gives the
+// slot back exactly once: a caller that defers a release and also calls it on an
+// error path must not free a slot someone else is holding.
+func TestDialGateBoundsTotal(t *testing.T) {
+	gate := newDialGate(1, 1)
+	ctx := context.Background()
+
+	release, errAcquire := gate.acquire(ctx, "imap.example.com")
+	if errAcquire != nil {
+		t.Fatalf("acquire: %v", errAcquire)
+	}
+	// A second mailbox cannot be opened while the only slot is held. The bound
+	// is a bound: the wait ends when the caller's context does.
+	short, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	if _, errSecond := gate.acquire(short, "imap.example.com"); errSecond == nil {
+		t.Fatal("a second mailbox was opened while the bound was one")
+	}
+
+	release()
+	// Releasing twice is not a second release.
+	release()
+
+	again, errAgain := gate.acquire(ctx, "imap.example.com")
+	if errAgain != nil {
+		t.Fatalf("acquire after release: %v", errAgain)
+	}
+	again()
+}
+
+// The per-host bound is per host: one busy server does not consume the slots a
+// different server's mailbox needs.
+func TestDialGateSeparatesHosts(t *testing.T) {
+	gate := newDialGate(2, 1)
+	ctx := context.Background()
+
+	first, errFirst := gate.acquire(ctx, "imap.a.example")
+	if errFirst != nil {
+		t.Fatalf("acquire a: %v", errFirst)
+	}
+	defer first()
+
+	short, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	second, errSecond := gate.acquire(short, "imap.b.example")
+	if errSecond != nil {
+		t.Fatalf("a different host was refused while another held its slot: %v", errSecond)
+	}
+	second()
+}
+
+// An unconfigured bound means no bound, which is what an operator setting zero
+// asked for: the gate must never turn a missing setting into a refusal.
+func TestDialGateWithoutLimitsAlwaysAdmits(t *testing.T) {
+	gate := newDialGate(0, 0)
+	releases := make([]func(), 0, 32)
+	for range 32 {
+		release, errAcquire := gate.acquire(context.Background(), "imap.example.com")
+		if errAcquire != nil {
+			t.Fatalf("acquire: %v", errAcquire)
+		}
+		releases = append(releases, release)
+	}
+	for _, release := range releases {
+		release()
+	}
+}
+
+// The panel's inbox read is a channel view, not a sweep of every address the
+// service holds. Opening a thousand bought mailboxes to fill one view would cost
+// a thousand connections and say nothing a channel row could show.
+func TestProviderInboxReadsChannelMailboxesOnly(t *testing.T) {
+	base := time.Date(2026, 10, 14, 10, 0, 0, 0, time.UTC)
+	session := &fakeSession{
+		folders: []string{"INBOX"},
+		mails:   map[string][]Mail{"INBOX": {mailTo("box@qq.com", "111111", base)}},
+	}
+	pool := supply.NewPool()
+	pool.AttachMailbox(supply.KindEmail, "bought@outlook.com", supply.Mailbox{
+		Nature:   supply.NatureGraph,
+		Endpoint: "graph.microsoft.com",
+		ClientID: "app-1",
+	}, base.Unix())
+
+	provider, errNew := New(Config{
+		ChannelsPath: writeChannels(t, imapChannel("qq", "box@qq.com", "ormnes.com", true)),
+		Credential:   func(name string) (string, error) { return "secret-for-" + name, nil },
+		Dial: func(ctx context.Context, target Target) (Session, error) {
+			session.dialled = target.Account
+			return session, nil
+		},
+		Pool: pool,
+	})
+	if errNew != nil {
+		t.Fatalf("New: %v", errNew)
+	}
+
+	reading, errInbox := provider.Inbox(context.Background(), "", 5)
+	if errInbox != nil {
+		t.Fatalf("Inbox: %v", errInbox)
+	}
+	if len(reading.Mailboxes) != 1 {
+		t.Fatalf("read %d mailboxes, want only the channel's one", len(reading.Mailboxes))
+	}
+	if reading.Mailboxes[0].Account != "box@qq.com" {
+		t.Fatalf("mailbox = %q, want the channel's", reading.Mailboxes[0].Account)
+	}
+	if session.dialled != "box@qq.com" {
+		t.Fatalf("opened %q, want the channel's mailbox only", session.dialled)
+	}
+
+	// An address no mailbox receives is not "no mail": nothing was read, and
+	// saying otherwise would hide the address behind a convincing empty answer.
+	if _, errUnknown := provider.Inbox(context.Background(), "x@elsewhere.com", 5); !errors.Is(errUnknown, supply.ErrUnknownIdentity) {
+		t.Fatalf("err = %v, want ErrUnknownIdentity", errUnknown)
 	}
 }

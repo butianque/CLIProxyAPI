@@ -14,6 +14,7 @@ package supply
 import (
 	"context"
 	"errors"
+	"strings"
 )
 
 // ErrUnknownIdentity reports that a caller asked to re-occupy an exact identity
@@ -97,6 +98,28 @@ type GrabOptions struct {
 	// Address re-occupies one exact identity, which is how a later
 	// re-authentication gets back onto a registered number or address.
 	Address string `json:"address,omitempty"`
+	// Usage narrows the handout to one kind of source: "personal" for an
+	// address that exists on its own (a bought mailbox), "self-domain" for an
+	// alias of a domain the service operates (a catch-all). Empty accepts both,
+	// which is what a caller that only needs "an address" wants.
+	Usage string `json:"usage,omitempty"`
+}
+
+// AddressDomain returns the domain part of a mail address, lowercased, or "" when
+// the value carries none.
+//
+// It is the namespace an address receives in, and it is the one grouping that
+// holds for every email identity: a bought mailbox (name@outlook.com) and a
+// catch-all alias (name@example.com) are the same shape — one address that
+// forwards somewhere — so the domain is what tells a reader where it receives.
+// The part before it is the identity; the domain is never an identity of its own.
+func AddressDomain(address string) string {
+	trimmed := strings.TrimSpace(address)
+	at := strings.LastIndex(trimmed, "@")
+	if at < 0 || at == len(trimmed)-1 {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(trimmed[at+1:]))
 }
 
 // Supply is the host's account-supply service. One instance serves every

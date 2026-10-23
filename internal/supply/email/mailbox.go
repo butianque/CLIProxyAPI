@@ -164,8 +164,10 @@ func (t Target) Covers(address string) bool {
 type Session interface {
 	// Mailboxes lists the folders the account holds.
 	Mailboxes(ctx context.Context) ([]string, error)
-	// Recent reads the newest messages of one folder since a point in time.
-	Recent(ctx context.Context, mailbox string, since time.Time, limit int) ([]Mail, error)
+	// Recent reads the messages of one folder that arrived after a point, and
+	// reports the folder's validity so the caller can tell a position that still
+	// holds from one that a mailbox reset invalidated.
+	Recent(ctx context.Context, mailbox string, since time.Time, after FolderPosition, limit int) ([]Mail, uint32, error)
 	// Close ends the session.
 	Close() error
 }
@@ -268,33 +270,49 @@ func (s *imapSession) Mailboxes(ctx context.Context) ([]string, error) {
 	return names, nil
 }
 
-// Recent reads the newest messages of one folder since a point in time.
+// Recent reads the messages of one folder that arrived after a point.
 //
 // The whole message is fetched in one round trip per folder rather than
 // fetching headers and then bodies: a verification mail is small, and two round
 // trips per candidate would make a poll slow enough to miss short-lived codes.
-func (s *imapSession) Recent(ctx context.Context, mailbox string, since time.Time, limit int) ([]Mail, error) {
+//
+// When the caller hands back a position in this same folder, the search becomes
+// "newer than that UID" instead of "since that date", so a poll costs one SEARCH
+// and one FETCH of what actually arrived rather than re-reading the window. A
+// changed UIDVALIDITY invalidates every stored UID, so the position is dropped
+// and the window is searched again; the validity is returned either way, which
+// is how the caller learns that it happened.
+func (s *imapSession) Recent(ctx context.Context, mailbox string, since time.Time, after FolderPosition, limit int) ([]Mail, uint32, error) {
 	if errCtx := ctx.Err(); errCtx != nil {
-		return nil, errCtx
+		return nil, 0, errCtx
 	}
 	selected, errSelect := s.client.Select(mailbox, &imap.SelectOptions{ReadOnly: true}).Wait()
 	if errSelect != nil {
-		return nil, errSelect
+		return nil, 0, errSelect
 	}
+	validity := selected.UIDValidity
 	if selected.NumMessages == 0 {
-		return nil, nil
+		return nil, validity, nil
+	}
+	criteria := &imap.SearchCriteria{Since: since}
+	if after.UID > 0 && after.UIDValidity == validity {
+		var newer imap.UIDSet
+		// A zero stop is "*", so this is "the UID after the one already read,
+		// through the newest message".
+		newer.AddRange(imap.UID(after.UID+1), 0)
+		criteria.UID = []imap.UIDSet{newer}
 	}
 	// A plain SEARCH is deliberate. Asking for RETURN (ALL) would require
 	// ESEARCH, which many providers (QQ among them) do not advertise, and a
 	// rejected SEARCH reads as "no mail" instead of as a failure. The classic
 	// "* SEARCH" reply carries every matching UID anyway.
-	found, errSearch := s.client.Search(&imap.SearchCriteria{Since: since}, nil).Wait()
+	found, errSearch := s.client.Search(criteria, nil).Wait()
 	if errSearch != nil {
-		return nil, errSearch
+		return nil, validity, errSearch
 	}
 	uids := found.AllUIDs()
 	if len(uids) == 0 {
-		return nil, nil
+		return nil, validity, nil
 	}
 	// UIDs ascend with arrival, so the tail is the newest mail.
 	if limit > 0 && len(uids) > limit {
@@ -307,7 +325,7 @@ func (s *imapSession) Recent(ctx context.Context, mailbox string, since time.Tim
 		BodySection: []*imap.FetchItemBodySection{section},
 	}).Collect()
 	if errFetch != nil {
-		return nil, errFetch
+		return nil, validity, errFetch
 	}
 	mails := make([]Mail, 0, len(buffers))
 	for _, buffer := range buffers {
@@ -327,7 +345,7 @@ func (s *imapSession) Recent(ctx context.Context, mailbox string, since time.Tim
 		parsed.UID = uint32(buffer.UID)
 		mails = append(mails, parsed)
 	}
-	return mails, nil
+	return mails, validity, nil
 }
 
 // Close ends the session.

@@ -87,6 +87,30 @@ type Record struct {
 	Mailbox *Mailbox `json:"mailbox,omitempty"`
 }
 
+// clone returns a copy that shares no mutable state with the receiver, so a
+// snapshot can be encoded while other writers keep working on the original.
+//
+// The metadata map is copied one level deep: mutators replace keys, they do not
+// reach into a nested value, so a deeper copy would buy nothing.
+func (r Record) clone() Record {
+	copied := r
+	if r.Meta != nil {
+		copied.Meta = make(map[string]any, len(r.Meta))
+		for key, value := range r.Meta {
+			copied.Meta[key] = value
+		}
+	}
+	if r.Mailbox != nil {
+		box := *r.Mailbox
+		copied.Mailbox = &box
+	}
+	if r.Registrations != nil {
+		copied.Registrations = make([]Registration, len(r.Registrations))
+		copy(copied.Registrations, r.Registrations)
+	}
+	return copied
+}
+
 // Mailbox is the per-identity way one email address reads its mail.
 //
 // It mirrors the connection details a channel carries, minus everything that
@@ -176,6 +200,12 @@ func (r Record) MetaBool(key string) bool {
 // alternative, a lock per caller, is a lock that one of them will forget.
 type Pool struct {
 	mu sync.Mutex
+
+	// saveMu serializes writes to disk. It is separate from mu on purpose: mu
+	// guards the document and is held only long enough to take a snapshot, while
+	// a write is slow. Two writers racing on the same temporary file is what a
+	// single writer at a time prevents.
+	saveMu sync.Mutex
 
 	Version int      `json:"version"`
 	Records []Record `json:"records,omitempty"`
@@ -617,6 +647,14 @@ func LoadPool(path string) (*Pool, error) {
 // slow on a large document, and holding the mutex for the whole encode would
 // stall every reader behind a disk write.
 func (l *Pool) Save(path string) error {
+	// The write lock is taken before the snapshot, not after it. A snapshot taken
+	// outside the write lock could be older than one a competing writer already
+	// persisted, and the older one would then overwrite the newer: every record
+	// the other writer added would be gone. Ordering the snapshot with the write
+	// is what makes the last save the newest state.
+	l.saveMu.Lock()
+	defer l.saveMu.Unlock()
+
 	l.mu.Lock()
 	if l.Version == 0 {
 		l.Version = poolVersion
@@ -626,8 +664,15 @@ func (l *Pool) Save(path string) error {
 		Records:  make([]Record, len(l.Records)),
 		SpendCNY: l.SpendCNY,
 	}
-	copy(snapshot.Records, l.Records)
+	for i, record := range l.Records {
+		// The record is copied deeply enough that encoding it outside the lock
+		// reads nothing another writer can still change: a shallow copy would
+		// leave the metadata map shared, and a concurrent grab would be writing
+		// it while json walks it.
+		snapshot.Records[i] = record.clone()
+	}
 	l.mu.Unlock()
+
 	return saveJSON(path, &snapshot)
 }
 
@@ -650,7 +695,8 @@ func loadJSON(path string, into any) error {
 
 // saveJSON writes one JSON document atomically, so a crash cannot truncate it.
 func saveJSON(path string, value any) error {
-	if dir := filepath.Dir(path); dir != "" && dir != "." {
+	dir := filepath.Dir(path)
+	if dir != "" && dir != "." {
 		if errMkdir := os.MkdirAll(dir, 0o755); errMkdir != nil {
 			return errMkdir
 		}
@@ -660,9 +706,33 @@ func saveJSON(path string, value any) error {
 		return errMarshal
 	}
 	raw = append(raw, '\n')
-	tmp := path + ".tmp"
-	if errWrite := os.WriteFile(tmp, raw, 0o600); errWrite != nil {
+	// A unique temporary name, so a writer that is somehow not the only one
+	// cannot interleave its bytes with another's into one file.
+	file, errTemp := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
+	if errTemp != nil {
+		return errTemp
+	}
+	tmp := file.Name()
+	// The document carries identities and, in a mailbox block, credential entry
+	// names; the permissions are tightened before anything is written into it.
+	if errChmod := file.Chmod(0o600); errChmod != nil {
+		_ = file.Close()
+		_ = os.Remove(tmp)
+		return errChmod
+	}
+	if _, errWrite := file.Write(raw); errWrite != nil {
+		_ = file.Close()
+		_ = os.Remove(tmp)
 		return errWrite
+	}
+	if errSync := file.Sync(); errSync != nil {
+		_ = file.Close()
+		_ = os.Remove(tmp)
+		return errSync
+	}
+	if errClose := file.Close(); errClose != nil {
+		_ = os.Remove(tmp)
+		return errClose
 	}
 	if errRename := os.Rename(tmp, path); errRename != nil {
 		_ = os.Remove(tmp)

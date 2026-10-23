@@ -1,7 +1,9 @@
 package supply
 
 import (
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -392,6 +394,47 @@ func TestMailboxUsable(t *testing.T) {
 	for _, testCase := range cases {
 		if got := testCase.box.Usable(); got != testCase.want {
 			t.Errorf("%s: usable = %v, want %v", testCase.name, got, testCase.want)
+		}
+	}
+}
+
+// Concurrent handouts each save the whole document, and every one of them must
+// survive. A snapshot taken outside the write lock would let an older state
+// overwrite a newer one, and the records added in between would be gone.
+func TestPoolConcurrentSaveKeepsEveryRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ledger.json")
+	pool := NewPool()
+	const writers = 8
+	const perWriter = 5
+
+	var wg sync.WaitGroup
+	for writer := range writers {
+		wg.Go(func() {
+			for index := range perWriter {
+				address := fmt.Sprintf("w%d-%d@ormnes.com", writer, index)
+				pool.Record(KindEmail, address, "ormnesqq", 0, map[string]any{"domain": "ormnes.com"}, int64(writer*10+index))
+				if errSave := pool.Save(path); errSave != nil {
+					t.Errorf("save: %v", errSave)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+
+	loaded, errLoad := LoadPool(path)
+	if errLoad != nil {
+		t.Fatalf("LoadPool: %v", errLoad)
+	}
+	if got := len(loaded.All()); got != writers*perWriter {
+		t.Fatalf("persisted %d records, want %d: a save lost another writer's records", got, writers*perWriter)
+	}
+	for writer := range writers {
+		for index := range perWriter {
+			address := fmt.Sprintf("w%d-%d@ormnes.com", writer, index)
+			if !loaded.Knows(KindEmail, address) {
+				t.Fatalf("%s is missing from the persisted document", address)
+			}
 		}
 	}
 }

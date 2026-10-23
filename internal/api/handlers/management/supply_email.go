@@ -147,6 +147,147 @@ func (h *Handler) GetSupplyEmailInbox(c *gin.Context) {
 	})
 }
 
+// emailWaitSeconds caps how long one read may wait for mail. A waiting read
+// holds a mailbox connection open, so an unbounded wait would let a few scripts
+// tie up every connection the provider allows.
+const emailWaitSeconds = 60
+
+// PostSupplyEmailGrab hands out one address from the pool.
+//
+// This is the machine surface: a script asks for an address, uses it to
+// register, and asks this same service what arrived. The answer is the pool's,
+// not the caller's — a catch-all domain yields a fresh alias, a bought mailbox
+// yields itself — so a script never has to know which kind of mailbox it got.
+//
+// An explicit address re-occupies the one a previous run used, which is how a
+// re-authentication gets back onto the same mailbox. The optional usage narrows
+// the choice to "personal" (a bought mailbox) or "self-domain" (a catch-all
+// alias) without changing anything else about the answer.
+func (h *Handler) PostSupplyEmailGrab(c *gin.Context) {
+	provider, errProvider := emailProvider()
+	if errProvider != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"status":  "error",
+			"error":   "no email mailbox is configured",
+			"code":    "email_unavailable",
+			"enabled": false,
+		})
+		return
+	}
+	var body struct {
+		Project string `json:"project"`
+		Address string `json:"address"`
+		Usage   string `json:"usage"`
+	}
+	// The body is optional: no body at all means "whatever the pool prefers".
+	_ = c.ShouldBindJSON(&body)
+	identity, errGrab := provider.Grab(c.Request.Context(), supply.GrabOptions{
+		Purpose: strings.TrimSpace(body.Project),
+		Address: strings.TrimSpace(body.Address),
+		Usage:   strings.TrimSpace(body.Usage),
+	})
+	if errGrab != nil {
+		payload := gin.H{"status": "error", "error": errGrab.Error(), "code": "grab_failed"}
+		status := http.StatusBadGateway
+		if errors.Is(errGrab, supply.ErrUnknownIdentity) {
+			// The address exists nowhere in this service: the caller's right
+			// answer is its manual path, not a retry.
+			status = http.StatusNotFound
+			payload["code"] = "unknown_identity"
+		}
+		if errors.Is(errGrab, supply.ErrUnavailable) {
+			status = http.StatusServiceUnavailable
+			payload["code"] = "email_unavailable"
+		}
+		c.JSON(status, payload)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"status":     "ok",
+		"address":    identity.Address,
+		"domain":     supply.AddressDomain(identity.Address),
+		"channel_id": identity.Code,
+		"project":    strings.TrimSpace(body.Project),
+	})
+}
+
+// GetSupplyEmailCode reports what arrived for one address after a position.
+//
+// The position is the caller's: it comes back unchanged when nothing new
+// arrived, and advances past the newest message when something did. Keeping it
+// on the caller's side means two consumers reading the same mailbox cannot take
+// mail away from each other, and a restart loses nothing.
+//
+// wait keeps the mailbox open and looks again on the same connection, so a
+// script asks once instead of rebuilding a session every few seconds. A wait
+// that expires with no mail is not an error: it is ready=false.
+func (h *Handler) GetSupplyEmailCode(c *gin.Context) {
+	provider, errProvider := emailProvider()
+	if errProvider != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"status":  "error",
+			"error":   "no email mailbox is configured",
+			"code":    "email_unavailable",
+			"enabled": false,
+		})
+		return
+	}
+	address := strings.TrimSpace(c.Query("address"))
+	if address == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"status": "error",
+			"error":  "an address is required",
+			"code":   "address_required",
+		})
+		return
+	}
+	var wait time.Duration
+	if raw := strings.TrimSpace(c.Query("wait")); raw != "" {
+		if seconds, errAtoi := strconv.Atoi(raw); errAtoi == nil && seconds > 0 {
+			wait = time.Duration(min(seconds, emailWaitSeconds)) * time.Second
+		}
+	}
+	result, errRead := provider.ReadAfter(c.Request.Context(), address, strings.TrimSpace(c.Query("cursor")), wait)
+	if errRead != nil {
+		payload := gin.H{"status": "error", "error": errRead.Error(), "code": "read_failed"}
+		status := http.StatusBadGateway
+		switch {
+		case errors.Is(errRead, email.ErrCursor):
+			// A position this build cannot read is the caller's bug, and
+			// starting over is the fix.
+			status = http.StatusBadRequest
+			payload["code"] = "cursor_invalid"
+		case errors.Is(errRead, supply.ErrUnknownIdentity):
+			status = http.StatusNotFound
+			payload["code"] = "unknown_identity"
+		case errors.Is(errRead, supply.ErrUnavailable):
+			status = http.StatusServiceUnavailable
+			payload["code"] = "email_unavailable"
+		case errors.Is(errRead, email.ErrLoginRejected):
+			payload["code"] = "login_rejected"
+		case errors.Is(errRead, email.ErrCredential):
+			payload["code"] = "credential_unavailable"
+		}
+		c.JSON(status, payload)
+		return
+	}
+	messages := make([]gin.H, 0, len(result.Mails))
+	for _, mail := range result.Mails {
+		messages = append(messages, mailView(mail))
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"status":   "ok",
+		"address":  address,
+		"domain":   supply.AddressDomain(address),
+		"mailbox":  result.Mailbox,
+		"ready":    len(result.Mails) > 0,
+		"code":     result.Code,
+		"cursor":   result.Cursor,
+		"reset":    result.Reset,
+		"messages": messages,
+	})
+}
+
 // mailView renders one message without a credential, a body, or a guess.
 func mailView(mail email.Mail) gin.H {
 	received := ""
