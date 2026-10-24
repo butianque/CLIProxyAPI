@@ -653,7 +653,10 @@ func extractLinks(html, plain string) []string {
 		}
 	}
 	for _, match := range bareURLPattern.FindAllString(plain, maxLinks*4) {
-		add(match)
+		// A URL written into a sentence carries the sentence's final mark with
+		// it; only ASCII end punctuation is dropped, because a ")" may be part
+		// of the path and a "?" may be part of the query.
+		add(strings.TrimRight(match, ".,;:!?"))
 	}
 	return links
 }

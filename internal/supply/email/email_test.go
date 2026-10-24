@@ -159,6 +159,13 @@ func TestExtractLinks(t *testing.T) {
 			want:  []string{"https://z.ai/verify?token=abc"},
 		},
 		{
+			// A URL written into an English sentence ends at the full stop, not
+			// after it.
+			name:  "bare url drops the sentence's final mark",
+			plain: "Open https://z.ai/verify?token=abc. Then sign in.",
+			want:  []string{"https://z.ai/verify?token=abc"},
+		},
+		{
 			// A Chinese sentence writes the link straight into the text, so the
 			// full-width comma must end it rather than be carried into the URL.
 			name:  "link written into Chinese text stops at its punctuation",
