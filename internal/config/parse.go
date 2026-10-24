@@ -76,6 +76,14 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 		cfg.RemoteManagement.SecretKey = string(hashed)
 	}
 
+	if cfg.RemoteManagement.AutomationKey != "" && !looksLikeBcrypt(cfg.RemoteManagement.AutomationKey) {
+		hashed, errHash := bcrypt.GenerateFromPassword([]byte(cfg.RemoteManagement.AutomationKey), bcrypt.DefaultCost)
+		if errHash != nil {
+			return nil, fmt.Errorf("hash automation key: %w", errHash)
+		}
+		cfg.RemoteManagement.AutomationKey = string(hashed)
+	}
+
 	cfg.RemoteManagement.PanelGitHubRepository = strings.TrimSpace(cfg.RemoteManagement.PanelGitHubRepository)
 	if cfg.RemoteManagement.PanelGitHubRepository == "" {
 		cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository

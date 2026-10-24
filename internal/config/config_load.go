@@ -113,23 +113,13 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		return nil, errValidate
 	}
 
-	// Hash remote management key if plaintext is detected (nested)
+	// Hash remote management keys if plaintext is detected (nested)
 	// We consider a value to be already hashed if it looks like a bcrypt hash ($2a$, $2b$, or $2y$ prefix).
-	if cfg.RemoteManagement.SecretKey != "" && !looksLikeBcrypt(cfg.RemoteManagement.SecretKey) {
-		hashed, errHash := hashSecret(cfg.RemoteManagement.SecretKey)
-		if errHash != nil {
-			return nil, fmt.Errorf("failed to hash remote management key: %w", errHash)
-		}
-		cfg.RemoteManagement.SecretKey = hashed
-
-		// Persist the hashed value back to the config file to avoid re-hashing on next startup.
-		// Preserve YAML comments and ordering; update only the nested key.
-		secretPath := []string{"remote-management", "secret-key"}
-		var source yaml.Node
-		if yaml.Unmarshal(data, &source) == nil && len(source.Content) > 0 && yamlPath(expandConfigAliases(source.Content[0]), "management.secret-key") != nil {
-			secretPath[0] = "management"
-		}
-		_ = SaveConfigPreserveCommentsUpdateNestedScalar(configFile, secretPath, hashed)
+	if errHash := hashManagementKey(configFile, data, &cfg.RemoteManagement.SecretKey, "secret-key"); errHash != nil {
+		return nil, errHash
+	}
+	if errHash := hashManagementKey(configFile, data, &cfg.RemoteManagement.AutomationKey, "automation-key"); errHash != nil {
+		return nil, errHash
 	}
 
 	cfg.RemoteManagement.PanelGitHubRepository = strings.TrimSpace(cfg.RemoteManagement.PanelGitHubRepository)
@@ -229,4 +219,34 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Return the populated configuration struct.
 	return &cfg, nil
+}
+
+// hashManagementKey replaces one plaintext management key with its bcrypt hash
+// and writes that hash back to the config file, so the next start has no
+// plaintext left to convert. A value that already looks like a hash is left
+// untouched, and an empty value is not a key at all.
+//
+// yamlKey is both the struct field's YAML name and the scalar that gets
+// rewritten, which is why the two keys share this function instead of each
+// carrying its own copy of the write-back.
+func hashManagementKey(configFile string, data []byte, field *string, yamlKey string) error {
+	if field == nil || *field == "" || looksLikeBcrypt(*field) {
+		return nil
+	}
+	hashed, errHash := hashSecret(*field)
+	if errHash != nil {
+		return fmt.Errorf("failed to hash %s: %w", yamlKey, errHash)
+	}
+	*field = hashed
+
+	// Preserve YAML comments and ordering; update only the nested key. The block
+	// may still be spelled with its pre-v8 name, so the path is chosen by what
+	// the document actually contains.
+	path := []string{"remote-management", yamlKey}
+	var source yaml.Node
+	if yaml.Unmarshal(data, &source) == nil && len(source.Content) > 0 && yamlPath(expandConfigAliases(source.Content[0]), "management."+yamlKey) != nil {
+		path[0] = "management"
+	}
+	_ = SaveConfigPreserveCommentsUpdateNestedScalar(configFile, path, hashed)
+	return nil
 }

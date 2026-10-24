@@ -474,6 +474,18 @@ type RemoteManagement struct {
 	AllowRemote bool `yaml:"allow-remote"`
 	// SecretKey is the management key (plaintext or bcrypt hashed). YAML key intentionally 'secret-key'.
 	SecretKey string `yaml:"secret-key"`
+	// AutomationKey is a second management key with a narrower reach. It
+	// authenticates exactly like SecretKey (plaintext or bcrypt, hashed on
+	// startup) but only reaches the routes AutomationAllow names, so a script or
+	// an agent can be handed a credential that cannot read the configuration or
+	// rewrite it. Empty disables the key.
+	AutomationKey string `yaml:"automation-key" json:"automation-key,omitempty"`
+	// AutomationAllow lists what AutomationKey may call, one entry per entry as
+	// "METHOD /route/pattern". A trailing * turns the entry into a prefix match.
+	// Entries are matched against the registered route, not the raw URL, so an
+	// encoded or doubled path cannot slip past a prefix. Empty selects
+	// DefaultAutomationAllow.
+	AutomationAllow []string `yaml:"automation-allow" json:"automation-allow,omitempty"`
 	// DisableControlPanel skips serving and syncing the bundled management UI when true.
 	DisableControlPanel bool `yaml:"disable-control-panel"`
 	// DisableAutoUpdatePanel disables automatic periodic background updates of the management panel asset from GitHub.

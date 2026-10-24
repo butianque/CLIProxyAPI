@@ -324,6 +324,20 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 			return
 		}
 
+		// An automation key is a second, narrower credential: it authenticates
+		// exactly like the management key but only reaches the routes the
+		// operator listed. It is checked first so a script's request costs one
+		// bcrypt comparison rather than two.
+		if h.automationKeyMatch(clientIP, localClient, provided) {
+			route := c.FullPath()
+			if !automationRouteAllowed(c.Request.Method, route, h.automationAllow()) {
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "this automation key may not call " + c.Request.Method + " " + route})
+				return
+			}
+			c.Next()
+			return
+		}
+
 		allowed, statusCode, errMsg := h.AuthenticateManagementKey(clientIP, localClient, provided)
 		if !allowed {
 			c.AbortWithStatusJSON(statusCode, gin.H{"error": errMsg})
@@ -331,6 +345,73 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 		}
 		c.Next()
 	}
+}
+
+// automationKeyMatch reports whether provided is the configured automation key.
+//
+// It applies the same remote gate as AuthenticateManagementKey, so a narrow key
+// cannot be used from an address the operator has closed, and it clears the
+// failure counter on a match for the same reason the full key does. A request
+// that fails here falls through to the full-key path, which owns the ban and the
+// failure counting.
+func (h *Handler) automationKeyMatch(clientIP string, localClient bool, provided string) bool {
+	if h == nil || h.cfg == nil || provided == "" {
+		return false
+	}
+	hash := h.cfg.RemoteManagement.AutomationKey
+	if hash == "" {
+		return false
+	}
+	if !localClient && !h.remoteManagementAllowed() {
+		return false
+	}
+	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(provided)) != nil {
+		return false
+	}
+	h.attemptsMu.Lock()
+	if ai := h.failedAttempts[clientIP]; ai != nil {
+		ai.count = 0
+		ai.blockedUntil = time.Time{}
+	}
+	h.attemptsMu.Unlock()
+	return true
+}
+
+// automationAllow returns the routes an automation key may call.
+func (h *Handler) automationAllow() []string {
+	if h == nil || h.cfg == nil {
+		return nil
+	}
+	if len(h.cfg.RemoteManagement.AutomationAllow) == 0 {
+		return config.DefaultAutomationAllow
+	}
+	return h.cfg.RemoteManagement.AutomationAllow
+}
+
+// automationRouteAllowed reports whether one call is covered by an allow list.
+//
+// An entry is "METHOD /route" matched exactly, or "METHOD /route/prefix*" matched
+// as a prefix. The route is the registered pattern rather than the raw URL, so a
+// doubled slash or an encoded segment cannot walk past a prefix entry. Both
+// halves must match: a route is never opened to a method the entry did not name.
+func automationRouteAllowed(method, route string, allow []string) bool {
+	call := method + " " + route
+	for _, entry := range allow {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		if prefix, isPrefix := strings.CutSuffix(entry, "*"); isPrefix {
+			if strings.HasPrefix(call, prefix) {
+				return true
+			}
+			continue
+		}
+		if call == entry {
+			return true
+		}
+	}
+	return false
 }
 
 // remoteManagementAllowed reports whether clients outside the loopback interface
