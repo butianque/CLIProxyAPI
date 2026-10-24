@@ -3,11 +3,13 @@ package handlers
 import (
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	coresession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
@@ -120,6 +122,48 @@ func TestRequestExecutionMetadataIncludesAllowedPools(t *testing.T) {
 			t.Fatalf("unexpected allowed pools in metadata: %v", meta[coreexecutor.AllowedPoolsMetadataKey])
 		}
 	})
+}
+
+func TestScopedModelsHonoursTheKeyCredentialScope(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	modelRegistry := registry.GetGlobalRegistry()
+	zcodeClient := "scope-test-zcode.json"
+	loomyClient := "scope-test-loomy.json"
+	modelRegistry.RegisterClient(zcodeClient, "zcode", []*registry.ModelInfo{{ID: "scope-test-zcode-model"}})
+	modelRegistry.RegisterClient(loomyClient, "loomy", []*registry.ModelInfo{{ID: "scope-test-loomy-model"}})
+	t.Cleanup(func() {
+		modelRegistry.UnregisterClient(zcodeClient)
+		modelRegistry.UnregisterClient(loomyClient)
+	})
+
+	handler := &BaseAPIHandler{}
+	modelIDs := func(models []map[string]any) []string {
+		ids := make([]string, 0, len(models))
+		for _, model := range models {
+			if id, _ := model["id"].(string); id != "" {
+				ids = append(ids, id)
+			}
+		}
+		return ids
+	}
+
+	scoped, _ := gin.CreateTestContext(httptest.NewRecorder())
+	scoped.Set("accessMetadata", map[string]string{"source": "authorization", "pools": "zcode"})
+	scopedIDs := modelIDs(handler.ScopedModels(scoped, "openai"))
+	if !slices.Contains(scopedIDs, "scope-test-zcode-model") {
+		t.Fatalf("scoped catalog %v is missing the in-scope model", scopedIDs)
+	}
+	if slices.Contains(scopedIDs, "scope-test-loomy-model") {
+		t.Fatalf("scoped catalog %v advertises a model outside the key's scope", scopedIDs)
+	}
+
+	unrestricted, _ := gin.CreateTestContext(httptest.NewRecorder())
+	unrestricted.Set("accessMetadata", map[string]string{"source": "authorization"})
+	unrestrictedIDs := modelIDs(handler.ScopedModels(unrestricted, "openai"))
+	if !slices.Contains(unrestrictedIDs, "scope-test-zcode-model") || !slices.Contains(unrestrictedIDs, "scope-test-loomy-model") {
+		t.Fatalf("unrestricted catalog %v dropped models", unrestrictedIDs)
+	}
 }
 
 func TestRequestExecutionMetadataTraceCallbackWebsocketDetection(t *testing.T) {

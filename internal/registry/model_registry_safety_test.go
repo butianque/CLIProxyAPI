@@ -1,6 +1,8 @@
 package registry
 
 import (
+	"slices"
+	"sort"
 	"testing"
 	"time"
 )
@@ -80,6 +82,62 @@ func TestGetAvailableModelsByProviderReturnsClones(t *testing.T) {
 	}
 	if second[0].Thinking == nil || len(second[0].Thinking.Levels) == 0 || second[0].Thinking.Levels[0] != "low" {
 		t.Fatalf("expected cloned thinking levels, got %+v", second[0].Thinking)
+	}
+}
+
+func TestGetAvailableModelsForScopeFiltersByCredentialScope(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("zcode-main.json", "zcode", []*ModelInfo{{ID: "glm-5.3"}, {ID: "shared-model"}})
+	r.RegisterClient("loomy-main.json", "loomy", []*ModelInfo{{ID: "kimi-k2.6"}, {ID: "shared-model"}})
+	r.RegisterClient("workbuddy-main.json", "workbuddy", []*ModelInfo{{ID: "glm-5.3-flash"}})
+
+	tests := []struct {
+		name  string
+		scope []string
+		want  []string
+	}{
+		{
+			name:  "unscoped keeps the whole catalog",
+			scope: nil,
+			want:  []string{"glm-5.3", "glm-5.3-flash", "kimi-k2.6", "shared-model"},
+		},
+		{
+			name:  "a category scope hides the models only other categories serve",
+			scope: []string{"zcode"},
+			want:  []string{"glm-5.3", "shared-model"},
+		},
+		{
+			name:  "a credential scope matches the auth file base name",
+			scope: []string{"loomy-main"},
+			want:  []string{"kimi-k2.6", "shared-model"},
+		},
+		{
+			name:  "entries are case-insensitive, padded, and combined as a union",
+			scope: []string{" Zcode ", "WORKBUDDY"},
+			want:  []string{"glm-5.3", "glm-5.3-flash", "shared-model"},
+		},
+		{
+			name:  "a scope no credential matches advertises nothing",
+			scope: []string{"no-such-category"},
+			want:  []string{},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := make([]string, 0, len(tc.want))
+			for _, model := range r.GetAvailableModelsForScope("openai", tc.scope) {
+				if id, _ := model["id"].(string); id != "" {
+					got = append(got, id)
+				}
+			}
+			sort.Strings(got)
+			want := append([]string(nil), tc.want...)
+			sort.Strings(want)
+			if !slices.Equal(got, want) {
+				t.Fatalf("GetAvailableModelsForScope(%v) = %v, want %v", tc.scope, got, want)
+			}
+		})
 	}
 }
 

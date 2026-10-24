@@ -30,7 +30,7 @@ func TestCodexClientModelsResponseMultiAgentV2FollowsConfig(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			base.Cfg.Client.Codex.OptimizeMultiAgentV2 = tt.enabled
-			response := handler.codexClientModelsResponse()
+			response := handler.codexClientModelsResponse(nil)
 			models, ok := response["models"].([]map[string]any)
 			if !ok {
 				t.Fatalf("models type = %T, want []map[string]any", response["models"])
@@ -78,7 +78,7 @@ func TestCodexClientModelsResponseClientVersionFiltering(t *testing.T) {
 	handler := NewOpenAIAPIHandler(base)
 
 	// Test with older client version 0.137.0
-	respOld := handler.codexClientModelsResponse("0.137.0")
+	respOld := handler.codexClientModelsResponse(nil, "0.137.0")
 	modelsOld, ok := respOld["models"].([]map[string]any)
 	if !ok {
 		t.Fatalf("models type = %T, want []map[string]any", respOld["models"])
@@ -107,7 +107,7 @@ func TestCodexClientModelsResponseClientVersionFiltering(t *testing.T) {
 	}
 
 	// Test with newer client version 0.149.1
-	respNew := handler.codexClientModelsResponse("0.149.1")
+	respNew := handler.codexClientModelsResponse(nil, "0.149.1")
 	modelsNew, ok := respNew["models"].([]map[string]any)
 	if !ok {
 		t.Fatalf("models type = %T, want []map[string]any", respNew["models"])
@@ -190,7 +190,7 @@ func TestCodexClientModelsResponse_OAuthAliasesIntegration(t *testing.T) {
 
 	base := handlers.NewBaseAPIHandlers(&config.SDKConfig{}, nil)
 	handler := NewOpenAIAPIHandler(base)
-	resp := handler.codexClientModelsResponse("0.153.4")
+	resp := handler.codexClientModelsResponse(nil, "0.153.4")
 	models, ok := resp["models"].([]map[string]any)
 	if !ok {
 		t.Fatalf("models type = %T, want []map[string]any", resp["models"])
@@ -268,7 +268,7 @@ func TestCodexClientModelsResponse_DevinDisplayName(t *testing.T) {
 
 	base := handlers.NewBaseAPIHandlers(&config.SDKConfig{}, nil)
 	handler := NewOpenAIAPIHandler(base)
-	resp := handler.codexClientModelsResponse("0.153.4")
+	resp := handler.codexClientModelsResponse(nil, "0.153.4")
 	models, ok := resp["models"].([]map[string]any)
 	if !ok {
 		t.Fatalf("models type = %T, want []map[string]any", resp["models"])
@@ -339,7 +339,7 @@ func TestCodexClientModelsApplyPatchRouting(t *testing.T) {
 		t.Fatalf("missing model %q", id)
 	}
 	// Models that natively declare freeform apply_patch advertise it by default under pure Codex routes.
-	assertPatch(t, handler.codexClientModelsResponse("0.153.4"), "gpt-5.5", "freeform")
+	assertPatch(t, handler.codexClientModelsResponse(nil, "0.153.4"), "gpt-5.5", "freeform")
 	manager.RegisterExecutor(executor.NewCodexAutoExecutor(&config.Config{}))
 	manager.RegisterExecutor(executor.NewOpenAICompatExecutor("catalog-custom", &config.Config{}))
 	manager.RegisterExecutor(catalogUnknownExecutor{executor.NewOpenAICompatExecutor("catalog-remote", &config.Config{})})
@@ -348,7 +348,7 @@ func TestCodexClientModelsApplyPatchRouting(t *testing.T) {
 	for _, cfg := range []*config.SDKConfig{nil, {}, enabledCfg, {}} {
 		handler.UpdateClients(cfg)
 		for _, version := range []string{"", "0.137.0", "0.153.4", "cpa"} {
-			response := handler.codexClientModelsResponse(version)
+			response := handler.codexClientModelsResponse(nil, version)
 			for _, entry := range response["models"].([]map[string]any) {
 				want := any(nil)
 				if cfg == enabledCfg {
@@ -369,7 +369,7 @@ func TestCodexClientModelsApplyPatchRouting(t *testing.T) {
 	handler.UpdateClients(enabledCfg)
 	for _, version := range []string{"", "0.137.0", "0.153.4", "cpa"} {
 		t.Run(version, func(t *testing.T) {
-			response := handler.codexClientModelsResponse(version)
+			response := handler.codexClientModelsResponse(nil, version)
 			for _, id := range []string{"gpt-5.5", "gpt-reserve", "catalog-patch-synthetic", "catalog-patch-alias", "catalog-patch-mixed"} {
 				assertPatch(t, response, id, "freeform")
 			}
@@ -379,8 +379,8 @@ func TestCodexClientModelsApplyPatchRouting(t *testing.T) {
 		})
 	}
 	manager.RegisterExecutor(catalogUnknownExecutor{executor.NewCodexAutoExecutor(&config.Config{})})
-	assertPatch(t, handler.codexClientModelsResponse("0.153.4"), "gpt-5.5", nil)
+	assertPatch(t, handler.codexClientModelsResponse(nil, "0.153.4"), "gpt-5.5", nil)
 	withoutManager := NewOpenAIAPIHandler(handlers.NewBaseAPIHandlers(enabledCfg, nil))
-	assertPatch(t, withoutManager.codexClientModelsResponse("0.153.4"), "catalog-patch-synthetic", nil)
+	assertPatch(t, withoutManager.codexClientModelsResponse(nil, "0.153.4"), "catalog-patch-synthetic", nil)
 
 }

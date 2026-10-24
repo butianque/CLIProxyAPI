@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -478,6 +479,110 @@ func (r *ModelRegistry) filterUnservableModels(models []map[string]any, servable
 
 const defaultModelRegistryHookTimeout = 5 * time.Second
 const modelQuotaExceededWindow = 5 * time.Minute
+
+// GetAvailableModelsForScope returns the models a caller restricted to a credential
+// scope can actually reach. An empty scope imposes no restriction, so the result is
+// identical to GetAvailableModels.
+//
+// Scope entries name either an account category (the credential's provider) or a
+// single credential, matching the rule the auth manager applies when it selects a
+// credential. A model is kept when at least one credential that registered it falls
+// inside the scope.
+//
+// The filter exists because the advertised catalog and the routing decision are
+// otherwise answered by two different questions. Routing already refuses a scoped
+// key's request for a model only another category serves, so advertising that model
+// produced a catalog that promised what the request would then reject.
+func (r *ModelRegistry) GetAvailableModelsForScope(handlerType string, scope []string) []map[string]any {
+	models := r.GetAvailableModels(handlerType)
+	if len(scope) == 0 || len(models) == 0 {
+		return models
+	}
+
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+	return r.filterModelsOutsideScope(models, scope)
+}
+
+// filterModelsOutsideScope drops the models no credential inside scope can serve.
+// A model nothing attributes to a client is kept: like filterUnservableModels, this
+// filter only removes what it can positively prove unreachable.
+// The caller must hold at least a read lock on r.mutex.
+func (r *ModelRegistry) filterModelsOutsideScope(models []map[string]any, scope []string) []map[string]any {
+	kept := models[:0]
+	for _, model := range models {
+		if model == nil {
+			kept = append(kept, model)
+			continue
+		}
+		modelID, _ := model["id"].(string)
+		if modelID == "" || r.modelReachableInScopeLocked(modelID, scope) {
+			kept = append(kept, model)
+		}
+	}
+	return kept
+}
+
+// modelReachableInScopeLocked reports whether any client that provides modelID is
+// named by the scope. A model no client provides is reported reachable so the
+// caller keeps it.
+func (r *ModelRegistry) modelReachableInScopeLocked(modelID string, scope []string) bool {
+	attributed := false
+	for clientID, modelIDs := range r.clientModels {
+		if !modelIDListed(modelIDs, modelID) {
+			continue
+		}
+		attributed = true
+		if clientInScope(clientID, r.clientProviders[clientID], scope) {
+			return true
+		}
+	}
+	return !attributed
+}
+
+func modelIDListed(modelIDs []string, modelID string) bool {
+	for _, id := range modelIDs {
+		if strings.TrimSpace(id) == modelID {
+			return true
+		}
+	}
+	return false
+}
+
+// clientInScope reports whether a registered client falls inside a caller's
+// credential scope. It mirrors the auth manager's selection filter, where an entry
+// matches either the credential's provider (the account category the management
+// panel offers) or the credential's own name.
+//
+// The comparison is deliberately no looser than that filter. An entry that routing
+// would reject must not keep a model advertised, so only the two forms routing
+// accepts are honoured.
+func clientInScope(clientID, provider string, scope []string) bool {
+	name := credentialBaseName(clientID)
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	for _, entry := range scope {
+		entry = strings.ToLower(strings.TrimSpace(entry))
+		if entry == "" {
+			continue
+		}
+		if provider != "" && entry == provider {
+			return true
+		}
+		if entry == name {
+			return true
+		}
+	}
+	return false
+}
+
+// credentialBaseName is the identifier a scope entry uses for one credential: the
+// backing file's base name without its extension. Registry client IDs are auth IDs,
+// which are file paths relative to the auth directory, so the base name is the only
+// form both sides agree on.
+func credentialBaseName(clientID string) string {
+	base := filepath.Base(strings.TrimSpace(clientID))
+	return strings.ToLower(strings.TrimSuffix(base, filepath.Ext(base)))
+}
 
 func (r *ModelRegistry) triggerModelsRegistered(provider, clientID string, models []*ModelInfo) {
 	hook := r.hook

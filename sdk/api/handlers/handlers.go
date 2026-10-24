@@ -19,6 +19,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -332,6 +333,36 @@ func requestAllowedPools(ginCtx *gin.Context) string {
 		return ""
 	}
 	return strings.TrimSpace(metadata["pools"])
+}
+
+// requestAllowedPoolList is requestAllowedPools split into the individual scope
+// entries the model catalog filter compares against. A nil result means the caller
+// is unrestricted.
+func requestAllowedPoolList(ginCtx *gin.Context) []string {
+	raw := requestAllowedPools(ginCtx)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	pools := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			pools = append(pools, trimmed)
+		}
+	}
+	if len(pools) == 0 {
+		return nil
+	}
+	return pools
+}
+
+// ScopedModels returns the model catalog visible to the calling client key.
+//
+// A key scoped to account categories sees only the models those categories can
+// serve, so the advertised list matches what credential selection will accept. An
+// unscoped key keeps seeing the whole catalog.
+func (h *BaseAPIHandler) ScopedModels(c *gin.Context, handlerType string) []map[string]any {
+	return registry.GetGlobalRegistry().GetAvailableModelsForScope(handlerType, requestAllowedPoolList(c))
 }
 
 func requestClientIP(request *http.Request) string {
