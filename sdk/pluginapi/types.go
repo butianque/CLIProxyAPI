@@ -1080,6 +1080,11 @@ type HostSupplyInboxResponse struct {
 	Subject string `json:"subject,omitempty"`
 	// From is the mail sender for the email kind; empty for phone.
 	From string `json:"from,omitempty"`
+	// Links are the http(s) links the message body carries, in the order they
+	// appear. A platform whose verification mail hands out a link instead of a
+	// code is only automatable if the plugin can see them: Text is the body
+	// reduced to text, so an anchor's URL is not in it.
+	Links []string `json:"links,omitempty"`
 }
 
 // HostSupplyLinkRequest asks the host to bind one identity to the account it

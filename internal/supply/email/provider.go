@@ -284,6 +284,7 @@ func (p *ProviderImpl) Read(ctx context.Context, purpose, address string) (suppl
 			Text:    newest.Text,
 			Subject: newest.Subject,
 			From:    newest.From,
+			Links:   newest.Links,
 		}, nil
 	}
 	if !scanned && firstErr != nil {

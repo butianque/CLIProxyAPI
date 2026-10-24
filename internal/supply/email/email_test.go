@@ -119,6 +119,110 @@ func TestParseMailMatchesForwardedRecipient(t *testing.T) {
 	}
 }
 
+// extractLinks is what makes a "click this link" verification mail readable:
+// htmlToText keeps text nodes only, so the href has to be read from the raw
+// body. These cases pin the quoting styles a real template uses, the entity a
+// query string arrives as, the punctuation a Chinese sentence ends a link with,
+// and the refusal to hand back a link nothing can open.
+func TestExtractLinks(t *testing.T) {
+	cases := []struct {
+		name  string
+		html  string
+		plain string
+		want  []string
+	}{
+		{
+			name: "double quoted href",
+			html: `<a href="https://z.ai/verify?token=abc">Verify</a>`,
+			want: []string{"https://z.ai/verify?token=abc"},
+		},
+		{
+			// A query string arrives escaped, and handing it back unresolved
+			// would give the caller a link that does not work.
+			name: "ampersand entity is decoded",
+			html: `<a href="https://z.ai/verify?token=abc&amp;user=1">Verify</a>`,
+			want: []string{"https://z.ai/verify?token=abc&user=1"},
+		},
+		{
+			name: "single quoted and unquoted href",
+			html: `<a href='https://z.ai/one'>1</a><a href=https://z.ai/two>2</a>`,
+			want: []string{"https://z.ai/one", "https://z.ai/two"},
+		},
+		{
+			name: "attribute name in any case",
+			html: `<a HREF="https://z.ai/upper">Verify</a>`,
+			want: []string{"https://z.ai/upper"},
+		},
+		{
+			name:  "bare url in the plain part",
+			plain: "Open https://z.ai/verify?token=abc to finish signing in.",
+			want:  []string{"https://z.ai/verify?token=abc"},
+		},
+		{
+			// A Chinese sentence writes the link straight into the text, so the
+			// full-width comma must end it rather than be carried into the URL.
+			name:  "link written into Chinese text stops at its punctuation",
+			plain: "请打开 https://z.ai/verify?token=abc，完成验证。",
+			want:  []string{"https://z.ai/verify?token=abc"},
+		},
+		{
+			// The same link appears twice and again in the text; a scheme a
+			// sign-in flow cannot open is not a link worth reporting.
+			name: "repeats collapse and other schemes are refused",
+			html: `<a href="https://z.ai/verify">Verify</a>` +
+				`<a href="https://z.ai/verify">Verify again</a>` +
+				`<a href="mailto:help@z.ai">Mail us</a>` +
+				`<a href="javascript:void(0)">Unsubscribe</a>`,
+			plain: "https://z.ai/verify",
+			want:  []string{"https://z.ai/verify"},
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			got := extractLinks(testCase.html, testCase.plain)
+			if len(got) != len(testCase.want) {
+				t.Fatalf("extractLinks = %v, want %v", got, testCase.want)
+			}
+			for index := range testCase.want {
+				if got[index] != testCase.want[index] {
+					t.Fatalf("extractLinks = %v, want %v", got, testCase.want)
+				}
+			}
+		})
+	}
+}
+
+// The links have to survive parsing, not only extraction: an HTML-only message
+// has no plain part, so its hrefs are the only place its links exist at all.
+func TestParseMailCarriesLinks(t *testing.T) {
+	raw := strings.Join([]string{
+		"From: noreply@z.ai",
+		"To: abc123@ormnes.com",
+		"Subject: Verify your account",
+		"Date: Wed, 14 Oct 2026 10:00:00 +0800",
+		"MIME-Version: 1.0",
+		"Content-Type: text/html; charset=utf-8",
+		"",
+		`<p>Confirm your address: <a href="https://z.ai/verify?token=abc&amp;user=1">Verify</a></p>`,
+		"",
+	}, "\r\n")
+	parsed, errParse := parseMail([]byte(raw))
+	if errParse != nil {
+		t.Fatalf("parseMail: %v", errParse)
+	}
+	if len(parsed.Links) != 1 || parsed.Links[0] != "https://z.ai/verify?token=abc&user=1" {
+		t.Fatalf("links = %v, want the decoded href", parsed.Links)
+	}
+	// Text keeps its meaning: the anchor's URL is not text, so the reduced body
+	// still reads as the sentence around the link.
+	if strings.Contains(parsed.Text, "https://") {
+		t.Fatalf("text = %q, want the href left out of the reduced body", parsed.Text)
+	}
+	if !strings.Contains(parsed.Text, "Confirm your address") {
+		t.Fatalf("text = %q, want the sentence around the link kept", parsed.Text)
+	}
+}
+
 // fakeSession stands in for a live mailbox so the read logic can be exercised
 // without a server.
 type fakeSession struct {

@@ -382,8 +382,15 @@ func (m graphMessage) toMail(mailbox string) Mail {
 	if len(text) > graphBodyBytes {
 		text = text[:graphBodyBytes]
 	}
+	// The links are read from the raw body, before htmlToText drops the tags:
+	// a Graph message that hands out a sign-in link instead of a code is
+	// unreadable once the href is gone.
+	var links []string
 	if strings.EqualFold(m.Body.ContentType, "html") {
+		links = extractLinks(text, "")
 		text = htmlToText(text)
+	} else {
+		links = extractLinks("", text)
 	}
 	date, _ := time.Parse(time.RFC3339, strings.TrimSpace(m.ReceivedTime))
 	return Mail{
@@ -394,6 +401,7 @@ func (m graphMessage) toMail(mailbox string) Mail {
 		Text:     text,
 		Date:     date,
 		Code:     ExtractCode(m.Subject, text),
+		Links:    links,
 		haystack: strings.ToLower(strings.Join(append(parts, from), "\n")),
 	}
 }

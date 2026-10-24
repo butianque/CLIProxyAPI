@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -48,6 +49,10 @@ const (
 	maxBodyBytes = 256 << 10
 	// defaultPort is used when the stored endpoint has no port.
 	defaultPort = "993"
+	// maxLinks bounds how many links one message reports. A newsletter can carry
+	// hundreds, and nothing downstream reads past the handful a sign-in flow
+	// needs; the cap keeps an abnormal message from bloating the response.
+	maxLinks = 20
 )
 
 // Mail is one message read out of a mailbox, reduced to what a verification
@@ -72,6 +77,11 @@ type Mail struct {
 	Date time.Time
 	// Code is the verification code the message states, or "".
 	Code string
+	// Links are the clickable links the body carries, in the order they appear
+	// and deduplicated. They exist for the platforms whose verification mail
+	// hands out a link instead of a code: Text is reduced to text nodes, so an
+	// <a href> is gone by the time a caller reads it.
+	Links []string
 
 	// haystack is every address-bearing string the message carries, lowercased,
 	// used for the "was this addressed to me" question. Forwarding rewrites the
@@ -400,6 +410,10 @@ func parseMail(raw []byte) (Mail, error) {
 			}
 		}
 	}
+	// The links are read before the text fallback below: an HTML-only message
+	// has no plain body to scan, and the hrefs are the only place its links
+	// survive.
+	links := extractLinks(html, plain)
 	if plain == "" {
 		plain = htmlToText(html)
 	}
@@ -410,6 +424,7 @@ func parseMail(raw []byte) (Mail, error) {
 		Text:     plain,
 		Date:     date,
 		Code:     ExtractCode(subject, plain),
+		Links:    links,
 		haystack: haystack,
 	}, nil
 }
@@ -587,6 +602,60 @@ func htmlUnescape(text string) string {
 		"&quot;", `"`, "&#39;", "'", "&apos;", "'",
 	)
 	return replacer.Replace(text)
+}
+
+// Link patterns. The href one accepts the three quoting styles a real message
+// uses — double, single, and none — and matches the attribute name in any case,
+// because a hand-written template is as likely as a generated one.
+var (
+	hrefPattern = regexp.MustCompile(`(?i)\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'<>]+))`)
+	// A bare URL ends at whitespace, at a quote or an angle bracket, and at CJK
+	// punctuation: a Chinese sentence writes a link straight into the text, so
+	// "https://x.example/a，请查收" must not swallow the comma.
+	bareURLPattern = regexp.MustCompile(`(?i)https?://[^\s"'<>` + "`" + `\x{3000}-\x{303F}\x{FF00}-\x{FFEF}]+`)
+)
+
+// extractLinks returns the http(s) links a message body carries, in the order
+// they appear and deduplicated.
+//
+// It exists for the platforms whose verification mail hands out a link instead
+// of a code. htmlToText keeps text nodes only, so an <a href> is already gone
+// from Text by the time a caller reads it; this reads the raw HTML for the
+// attribute and the plain part for anything written out in full.
+//
+// Entities are resolved before the scheme is checked, because a query string
+// arrives as "?a=1&amp;b=2" and comparing that raw form would still match — but
+// handing it back unresolved would give a caller a link that does not work.
+// Only http and https survive: a "javascript:" or "mailto:" attribute is not
+// something a sign-in flow can open.
+func extractLinks(html, plain string) []string {
+	links := make([]string, 0, 4)
+	seen := make(map[string]bool, 4)
+	add := func(raw string) {
+		link := strings.TrimSpace(htmlUnescape(raw))
+		lower := strings.ToLower(link)
+		if link == "" || seen[link] || len(links) >= maxLinks {
+			return
+		}
+		if !strings.HasPrefix(lower, "http://") && !strings.HasPrefix(lower, "https://") {
+			return
+		}
+		seen[link] = true
+		links = append(links, link)
+	}
+	for _, match := range hrefPattern.FindAllStringSubmatch(html, maxLinks*4) {
+		// The group that matched is the quoting style this attribute used.
+		for index := 1; index < len(match); index++ {
+			if match[index] != "" {
+				add(match[index])
+				break
+			}
+		}
+	}
+	for _, match := range bareURLPattern.FindAllString(plain, maxLinks*4) {
+		add(match)
+	}
+	return links
 }
 
 // collapseSpaces folds runs of whitespace into single spaces, so a code split

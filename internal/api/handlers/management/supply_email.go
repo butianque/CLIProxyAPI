@@ -288,7 +288,12 @@ func (h *Handler) GetSupplyEmailCode(c *gin.Context) {
 	})
 }
 
-// mailView renders one message without a credential, a body, or a guess.
+// mailView renders one message without a credential and without a guess.
+//
+// It carries the links but not the body: the list can hold fifty messages, and
+// repeating every body would turn one listing into megabytes. A preview plus the
+// extracted code and links is what a reader needs to recognise a message and to
+// act on it.
 func mailView(mail email.Mail) gin.H {
 	received := ""
 	if !mail.Date.IsZero() {
@@ -303,6 +308,7 @@ func mailView(mail email.Mail) gin.H {
 		"received_at": received,
 		"code":        mail.Code,
 		"preview":     previewText(mail.Text),
+		"links":       mail.Links,
 	}
 }
 

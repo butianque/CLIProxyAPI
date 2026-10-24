@@ -154,6 +154,7 @@ func (h *Host) callHostSupplyInbox(ctx context.Context, request []byte) ([]byte,
 		Text:    message.Text,
 		Subject: message.Subject,
 		From:    message.From,
+		Links:   message.Links,
 	})
 }
 
