@@ -12,7 +12,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sirupsen/logrus"
 	"golang.org/x/oauth2"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/secretstore"
 )
 
 // OAuth2 is the only way into a Microsoft mailbox: its IMAP server answers
@@ -72,9 +75,24 @@ func (c xoauth2Client) Next(challenge []byte) ([]byte, error) {
 	return []byte{}, nil
 }
 
-// cachedToken is one minted access token and when it stops being usable.
+// mintedToken is one exchange's answer.
+//
+// refresh is what the endpoint now considers the current refresh token. It is
+// carried alongside the access token because Microsoft's refresh tokens live on
+// a sliding window: spending one can hand back a replacement and retire the value
+// that was spent. A caller that drops it keeps spending a token the endpoint has
+// already stopped honouring.
+type mintedToken struct {
+	access  string
+	refresh string
+	expires time.Time
+}
+
+// cachedToken is one minted access token, when it stops being usable, and the
+// refresh token that was current when it was minted.
 type cachedToken struct {
 	value   string
+	refresh string
 	expires time.Time
 }
 
@@ -92,7 +110,7 @@ var accessTokens = struct {
 // oauth2Bearer returns a usable access token for one mailbox, minting one when
 // the cache has nothing recent. client is the mailbox's egress; nil means the
 // package default.
-func oauth2Bearer(ctx context.Context, clientID, refreshToken string, client *http.Client) (string, error) {
+func oauth2Bearer(ctx context.Context, clientID, refreshToken string, client *http.Client) (mintedToken, error) {
 	return bearerFor(ctx, "imap", clientID, refreshToken, client)
 }
 
@@ -102,21 +120,21 @@ func oauth2Bearer(ctx context.Context, clientID, refreshToken string, client *ht
 // refresh token: a bearer token is minted for one resource, and the token
 // endpoint refuses a scope the original grant never asked for. Graph therefore
 // names its scope explicitly, while the IMAP exchange sends none.
-func graphBearer(ctx context.Context, clientID, refreshToken string, client *http.Client) (string, error) {
+func graphBearer(ctx context.Context, clientID, refreshToken string, client *http.Client) (mintedToken, error) {
 	return bearerFor(ctx, "graph", clientID, refreshToken, client)
 }
 
 // bearerFor mints (or reuses) one access token. kind separates the two
 // resources in the cache: an IMAP token is not a Graph token, and handing one to
 // the other is a 401 that looks like a bad credential.
-func bearerFor(ctx context.Context, kind, clientID, refreshToken string, client *http.Client) (string, error) {
+func bearerFor(ctx context.Context, kind, clientID, refreshToken string, client *http.Client) (mintedToken, error) {
 	clientID = strings.TrimSpace(clientID)
 	refreshToken = strings.TrimSpace(refreshToken)
 	if clientID == "" {
-		return "", errors.New("no OAuth2 application id is configured for this mailbox")
+		return mintedToken{}, errors.New("no OAuth2 application id is configured for this mailbox")
 	}
 	if refreshToken == "" {
-		return "", errors.New("no OAuth2 refresh token is stored for this mailbox")
+		return mintedToken{}, errors.New("no OAuth2 refresh token is stored for this mailbox")
 	}
 	// The key includes the refresh token so that replacing it takes effect at
 	// once instead of after the previous token expires.
@@ -125,11 +143,11 @@ func bearerFor(ctx context.Context, kind, clientID, refreshToken string, client 
 	cached, ok := accessTokens.tokens[key]
 	accessTokens.mu.Unlock()
 	if ok && time.Now().Add(oauth2RenewBefore).Before(cached.expires) {
-		return cached.value, nil
+		return mintedToken{access: cached.value, refresh: cached.refresh, expires: cached.expires}, nil
 	}
-	value, expires, errMint := mintAccessToken(ctx, kind, clientID, refreshToken, client)
+	minted, errMint := mintAccessToken(ctx, kind, clientID, refreshToken, client)
 	if errMint != nil {
-		return "", errMint
+		return mintedToken{}, errMint
 	}
 	accessTokens.mu.Lock()
 	// Drop what has already expired: entries are small, but a process that runs
@@ -139,9 +157,37 @@ func bearerFor(ctx context.Context, kind, clientID, refreshToken string, client 
 			delete(accessTokens.tokens, stored)
 		}
 	}
-	accessTokens.tokens[key] = cachedToken{value: value, expires: expires}
+	accessTokens.tokens[key] = cachedToken{value: minted.access, refresh: minted.refresh, expires: minted.expires}
 	accessTokens.mu.Unlock()
-	return value, nil
+	return minted, nil
+}
+
+// persistRefreshToken writes a rotated refresh token back to the entry the
+// mailbox reads it from.
+//
+// This is what keeps a stored mailbox readable without an operator revisiting it:
+// Microsoft's refresh tokens expire 90 days after their last use, and spending one
+// resets that window. Without the write-back, the copy in the store would age out
+// even though the account is in daily use.
+//
+// The write is deliberately best effort. The read that triggered it already holds
+// a working access token, so a failure here must not fail the read; the next read
+// tries again with the value it has. entry is a secret-store entry name, never a
+// value, so naming it in a log line is safe.
+func persistRefreshToken(entry, spent, rotated string) {
+	entry = strings.TrimSpace(entry)
+	rotated = strings.TrimSpace(rotated)
+	if entry == "" || rotated == "" || rotated == strings.TrimSpace(spent) {
+		return
+	}
+	store := secretstore.Default()
+	if store == nil || !store.Unlocked() {
+		return
+	}
+	if errSet := store.Set(entry, rotated); errSet != nil {
+		logrus.WithError(errSet).WithField("entry", entry).
+			Warn("email: the rotated refresh token could not be written back")
+	}
 }
 
 // mintAccessToken exchanges a refresh token for an access token for one
@@ -156,7 +202,7 @@ func bearerFor(ctx context.Context, kind, clientID, refreshToken string, client 
 // The client id goes in the body rather than in a Basic header, because this is
 // a public client: there is no secret to send, and Microsoft reads the id from
 // the form.
-func mintAccessToken(ctx context.Context, kind, clientID, refreshToken string, client *http.Client) (string, time.Time, error) {
+func mintAccessToken(ctx context.Context, kind, clientID, refreshToken string, client *http.Client) (mintedToken, error) {
 	if kind != "graph" {
 		return oauth2AccessToken(ctx, oauth2TokenURL, clientID, refreshToken, client)
 	}
@@ -167,17 +213,17 @@ func mintAccessToken(ctx context.Context, kind, clientID, refreshToken string, c
 	form.Set("scope", graphScope)
 	request, errRequest := http.NewRequestWithContext(ctx, http.MethodPost, oauth2TokenURL, strings.NewReader(form.Encode()))
 	if errRequest != nil {
-		return "", time.Time{}, fmt.Errorf("the token request could not be built: %w", errRequest)
+		return mintedToken{}, fmt.Errorf("the token request could not be built: %w", errRequest)
 	}
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	response, errDo := clientOr(graphHTTPClient, client).Do(request)
 	if errDo != nil {
-		return "", time.Time{}, fmt.Errorf("the token endpoint could not be reached: %w", errDo)
+		return mintedToken{}, fmt.Errorf("the token endpoint could not be reached: %w", errDo)
 	}
 	defer func() { _ = response.Body.Close() }()
 	body, errRead := io.ReadAll(io.LimitReader(response.Body, maxTokenResponseBytes))
 	if errRead != nil {
-		return "", time.Time{}, fmt.Errorf("the token response could not be read: %w", errRead)
+		return mintedToken{}, fmt.Errorf("the token response could not be read: %w", errRead)
 	}
 	var payload struct {
 		AccessToken      string `json:"access_token"`
@@ -190,7 +236,7 @@ func mintAccessToken(ctx context.Context, kind, clientID, refreshToken string, c
 	if response.StatusCode != http.StatusOK || strings.TrimSpace(payload.AccessToken) == "" {
 		// The body is handed to the error describer, which quotes only the
 		// error code: a response body is not a place a credential may reach.
-		return "", time.Time{}, describeTokenError(&oauth2.RetrieveError{
+		return mintedToken{}, describeTokenError(&oauth2.RetrieveError{
 			ErrorCode:        payload.Error,
 			ErrorDescription: payload.ErrorDescription,
 			Response:         response,
@@ -201,7 +247,7 @@ func mintAccessToken(ctx context.Context, kind, clientID, refreshToken string, c
 	if payload.ExpiresIn > 0 {
 		expires = time.Now().Add(time.Duration(payload.ExpiresIn) * time.Second)
 	}
-	return payload.AccessToken, expires, nil
+	return mintedToken{access: payload.AccessToken, refresh: payload.RefreshToken, expires: expires}, nil
 }
 
 // oauth2AccessToken exchanges a refresh token for an access token, and reports
@@ -212,7 +258,7 @@ func mintAccessToken(ctx context.Context, kind, clientID, refreshToken string, c
 // IMAP.AccessAsUser.All. The client id goes in the body rather than in a Basic
 // header, because this is a public client — there is no secret to send, and
 // Microsoft reads the id from the form.
-func oauth2AccessToken(ctx context.Context, tokenURL, clientID, refreshToken string, client *http.Client) (string, time.Time, error) {
+func oauth2AccessToken(ctx context.Context, tokenURL, clientID, refreshToken string, client *http.Client) (mintedToken, error) {
 	config := oauth2.Config{
 		ClientID: clientID,
 		Endpoint: oauth2.Endpoint{TokenURL: tokenURL, AuthStyle: oauth2.AuthStyleInParams},
@@ -224,10 +270,10 @@ func oauth2AccessToken(ctx context.Context, tokenURL, clientID, refreshToken str
 	}
 	token, errToken := config.TokenSource(ctx, &oauth2.Token{RefreshToken: refreshToken}).Token()
 	if errToken != nil {
-		return "", time.Time{}, describeTokenError(errToken, "imap")
+		return mintedToken{}, describeTokenError(errToken, "imap")
 	}
 	if strings.TrimSpace(token.AccessToken) == "" {
-		return "", time.Time{}, errors.New("the token endpoint returned no access token")
+		return mintedToken{}, errors.New("the token endpoint returned no access token")
 	}
 	// The exchange succeeds even when the grant only covers Graph: without a
 	// named scope Microsoft hands back whatever the grant has, and the IMAP
@@ -236,13 +282,15 @@ func oauth2AccessToken(ctx context.Context, tokenURL, clientID, refreshToken str
 	// pick the other receiving method, so the granted scopes are checked here.
 	if granted, ok := token.Extra("scope").(string); ok && strings.TrimSpace(granted) != "" &&
 		!strings.Contains(strings.ToLower(granted), "imap") {
-		return "", time.Time{}, errors.New("the refresh token was not granted IMAP access; choose Graph as the receiving method")
+		return mintedToken{}, errors.New("the refresh token was not granted IMAP access; choose Graph as the receiving method")
 	}
 	expires := token.Expiry
 	if expires.IsZero() {
 		expires = time.Now().Add(oauth2AssumedLifetime)
 	}
-	return token.AccessToken, expires, nil
+	// x/oauth2 keeps whatever refresh token the endpoint returned, so a rotation
+	// arrives here without extra parsing.
+	return mintedToken{access: token.AccessToken, refresh: token.RefreshToken, expires: expires}, nil
 }
 
 // describeTokenError turns a refused exchange into something an operator can act

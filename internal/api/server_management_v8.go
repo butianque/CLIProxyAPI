@@ -157,6 +157,13 @@ func (s *Server) registerManagementV8Routes() {
 	// A batch of mailboxes from a seller's paste: one call parses every line,
 	// stores the refresh tokens, and creates one channel per mailbox.
 	v8.POST("/supply/email/import", s.mgmt.PostSupplyEmailImport)
+	// The same import for a batch that arrived as addresses alone: the operator
+	// reads a code off this panel, signs in once per mailbox on Microsoft's page,
+	// and the refresh token lands in the store without being pasted anywhere.
+	v8.POST("/supply/email/authorize", s.mgmt.PostSupplyEmailAuthorize)
+	v8.GET("/supply/email/authorize", s.mgmt.GetSupplyEmailAuthorize)
+	v8.POST("/supply/email/authorize/:id/cancel", s.mgmt.PostSupplyEmailAuthorizeCancel)
+	v8.POST("/supply/email/authorize/:id/commit", s.mgmt.PostSupplyEmailAuthorizeCommit)
 
 	// The action surface: every plugin's named operations, plus the jobs their
 	// long-running actions run as. The panel triggers actions by key instead of

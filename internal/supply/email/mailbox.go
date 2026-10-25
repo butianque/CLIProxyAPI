@@ -246,11 +246,14 @@ func authenticate(ctx context.Context, client *imapclient.Client, target Target)
 		if errClient != nil {
 			return fmt.Errorf("%w: %v", ErrProbeUnready, errClient)
 		}
-		token, errToken := oauth2Bearer(ctx, target.ClientID, target.Password, httpClient)
+		minted, errToken := oauth2Bearer(ctx, target.ClientID, target.Password, httpClient)
 		if errToken != nil {
 			return fmt.Errorf("%w: %v", ErrLoginRejected, errToken)
 		}
-		if errAuth := client.Authenticate(xoauth2Client{account: target.Account, token: token}); errAuth != nil {
+		// Microsoft's refresh tokens expire 90 days after their last use and
+		// spending one can rotate it, so the value the store holds has to follow.
+		persistRefreshToken(target.SecretName, target.Password, minted.refresh)
+		if errAuth := client.Authenticate(xoauth2Client{account: target.Account, token: minted.access}); errAuth != nil {
 			return fmt.Errorf("%w: %v", ErrLoginRejected, errAuth)
 		}
 		return nil

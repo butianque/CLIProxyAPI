@@ -63,6 +63,11 @@ type graphSession struct {
 	refresh  string
 	token    string
 
+	// secretName is the store entry the refresh token came from. A rotation is
+	// written back there; an empty name means the credential was supplied
+	// directly (a probe), so there is nothing to write back to.
+	secretName string
+
 	// http is the mailbox's exit. Graph holds no connection of its own, so this
 	// is the only thing that decides where the reads come from.
 	http *http.Client
@@ -97,12 +102,21 @@ func dialGraphSession(ctx context.Context, target Target) (Session, error) {
 	if errToken != nil {
 		return nil, fmt.Errorf("%w: %v", ErrLoginRejected, errToken)
 	}
+	// A rotation has to reach the store as soon as it is seen: the value the
+	// session carries is the one that works, and leaving the old one behind would
+	// make the mailbox unreadable after the next restart.
+	persistRefreshToken(target.SecretName, target.Password, token.refresh)
+	refresh := target.Password
+	if strings.TrimSpace(token.refresh) != "" {
+		refresh = token.refresh
+	}
 	return &graphSession{
-		account:  target.Account,
-		clientID: target.ClientID,
-		refresh:  target.Password,
-		token:    token,
-		http:     client,
+		account:    target.Account,
+		clientID:   target.ClientID,
+		refresh:    refresh,
+		secretName: target.SecretName,
+		token:      token.access,
+		http:       client,
 	}, nil
 }
 
@@ -243,11 +257,15 @@ func (s *graphSession) get(ctx context.Context, address string, into any) error 
 			return fmt.Errorf("email: the Graph answer could not be read: %w", errRead)
 		}
 		if response.StatusCode == http.StatusUnauthorized && attempt == 0 {
-			token, errToken := graphBearer(ctx, s.clientID, s.refresh, s.http)
+			minted, errToken := graphBearer(ctx, s.clientID, s.refresh, s.http)
 			if errToken != nil {
 				return fmt.Errorf("%w: %v", ErrLoginRejected, errToken)
 			}
-			s.token = token
+			persistRefreshToken(s.secretName, s.refresh, minted.refresh)
+			if strings.TrimSpace(minted.refresh) != "" {
+				s.refresh = minted.refresh
+			}
+			s.token = minted.access
 			continue
 		}
 		if response.StatusCode != http.StatusOK {
