@@ -209,6 +209,49 @@ func (h *Handler) PostSupplyPoolAccount(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
+// DeleteSupplyPoolAccount removes one identity's record from the pool.
+//
+// It deletes the ledger row only, never the credential. A record names the
+// credential an identity produced (Account, and a mailbox's Secret) but does not
+// own it: the credential lives in the credential store under that name. An
+// operator removing a row is cleaning up the supply history, not revoking an
+// account — deleting the credential is a separate, deliberate action elsewhere.
+// If that looks like a missing delete, it is not: it is the boundary.
+//
+// The identity travels as ?kind=phone|email&address=..., not as path segments:
+// an address carries '@' and '.', and the read side already filters by the same
+// kind query parameter.
+//
+// The removal is only persisted when it actually happened, so asking for an
+// identity that is not there does not rewrite the file. The pool is the same
+// in-process object the readers use, so it is not rebuilt here.
+func (h *Handler) DeleteSupplyPoolAccount(c *gin.Context) {
+	kind := supply.Kind(strings.ToLower(strings.TrimSpace(c.Query("kind"))))
+	if !kind.Valid() {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "kind must be phone or email"})
+		return
+	}
+	address := strings.TrimSpace(c.Query("address"))
+	if address == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "address is required"})
+		return
+	}
+	pool := supply.DefaultPool()
+	if pool == nil {
+		c.JSON(http.StatusOK, gin.H{"status": "ok", "enabled": false})
+		return
+	}
+	if _, removed := pool.Remove(kind, address); !removed {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "error": "no such identity", "code": "unknown_identity"})
+		return
+	}
+	if errSave := pool.Save(supply.PoolPath(supplyStateDir(h))); errSave != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": errSave.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
 // authIndexByName maps a credential name to its runtime auth index. Both the
 // credential's file name and its id are indexed, because a record's account may
 // match either, and both are normalised so the ".json" suffix and case do not

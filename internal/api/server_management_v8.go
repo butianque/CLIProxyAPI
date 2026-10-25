@@ -118,6 +118,9 @@ func (s *Server) registerManagementV8Routes() {
 	// Recording a registration the pool cannot observe on its own: the caller
 	// that ran the signup reports the platform, account and outcome.
 	v8.POST("/supply/pool/accounts", s.mgmt.PostSupplyPoolAccount)
+	// Removing one identity from the ledger. It drops the record only; the
+	// credential that record named is left in the credential store.
+	v8.DELETE("/supply/pool/accounts", s.mgmt.DeleteSupplyPoolAccount)
 
 	// The configured sources of identities. A channel is a label plus a nature
 	// plus the connection details that nature implies; the nature is what the

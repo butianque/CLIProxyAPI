@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 )
@@ -559,6 +560,30 @@ func (l *Pool) Mark(kind Kind, address, outcome, state string, now int64) {
 		record.State = state
 	}
 	record.LastUsed = now
+}
+
+// Remove deletes one identity's record and reports what was removed.
+//
+// Only the ledger entry goes. A record names the credential an identity produced
+// — Account, and a mailbox's Secret — it does not own it: those entries live in
+// the credential store, and removing a row is an operator tidying up the supply
+// history, not a request to revoke an account. Destroying the credential is a
+// separate, deliberate action.
+//
+// The caller saves; like every other write here this only edits the document in
+// memory, under the lock, so a save can be batched or skipped.
+func (l *Pool) Remove(kind Kind, address string) (Record, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	i := l.find(kind, address)
+	if i < 0 {
+		return Record{}, false
+	}
+	// The removed record is returned by value: it is out of the document now, so
+	// the caller is the only one left holding it.
+	removed := l.Records[i]
+	l.Records = slices.Delete(l.Records, i, i+1)
+	return removed, true
 }
 
 // Refund reverses one handout's recorded cost.

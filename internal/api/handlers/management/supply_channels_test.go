@@ -544,6 +544,7 @@ func setupPoolTest(t *testing.T) (*Handler, *gin.Engine) {
 	h, r := setupChannelTest(t)
 	r.GET("/supply/pool", h.GetSupplyPool)
 	r.POST("/supply/pool/accounts", h.PostSupplyPoolAccount)
+	r.DELETE("/supply/pool/accounts", h.DeleteSupplyPoolAccount)
 	return h, r
 }
 
@@ -618,6 +619,96 @@ func TestSupplyPoolAccountRejectsIncomplete(t *testing.T) {
 				t.Fatalf("%s: %d %s, want 400", name, rr.Code, rr.Body.String())
 			}
 		})
+	}
+}
+
+// TestSupplyPoolAccountDelete checks that one identity can be removed from the
+// ledger, and that removing it touches nothing else: the row is gone from the
+// next read, the other identities stay, and asking twice is not a silent
+// success.
+//
+// The credential behind the row is deliberately not deleted here. The record
+// only named it, so a removal is a cleanup of the supply history; destroying the
+// credential is a separate action, and this test would fail loudly if the
+// handler started to reach past the ledger.
+func TestSupplyPoolAccountDelete(t *testing.T) {
+	_, r := setupPoolTest(t)
+
+	post := func(body string) {
+		req := httptest.NewRequest(http.MethodPost, "/supply/pool/accounts", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		rr := httptest.NewRecorder()
+		r.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("POST /supply/pool/accounts: %d %s", rr.Code, rr.Body.String())
+		}
+	}
+	del := func(query string) *httptest.ResponseRecorder {
+		rr := httptest.NewRecorder()
+		r.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/supply/pool/accounts"+query, nil))
+		return rr
+	}
+	addresses := func() []string {
+		rr := httptest.NewRecorder()
+		r.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/supply/pool?kind=email", nil))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("GET /supply/pool: %d %s", rr.Code, rr.Body.String())
+		}
+		var resp struct {
+			Records []map[string]any `json:"records"`
+		}
+		if errUnmarshal := json.Unmarshal(rr.Body.Bytes(), &resp); errUnmarshal != nil {
+			t.Fatalf("decode: %v", errUnmarshal)
+		}
+		out := make([]string, 0, len(resp.Records))
+		for _, record := range resp.Records {
+			address, _ := record["address"].(string)
+			out = append(out, address)
+		}
+		return out
+	}
+
+	// Two identities, so a delete that emptied the ledger would be caught.
+	post(`{"kind":"email","address":"1@ormnes.com","target":"loomy","account":"loomy-1"}`)
+	post(`{"kind":"email","address":"2@ormnes.com","target":"loomy","account":"loomy-2"}`)
+	if got := addresses(); len(got) != 2 {
+		t.Fatalf("records = %v, want both identities", got)
+	}
+
+	// A kind outside the contract, and a request naming no identity, are refused
+	// before the ledger is touched.
+	if rr := del("?kind=wechat&address=1@ormnes.com"); rr.Code != http.StatusBadRequest {
+		t.Fatalf("kind=wechat: %d %s, want 400", rr.Code, rr.Body.String())
+	}
+	if rr := del("?kind=email"); rr.Code != http.StatusBadRequest {
+		t.Fatalf("no address: %d %s, want 400", rr.Code, rr.Body.String())
+	}
+	if got := addresses(); len(got) != 2 {
+		t.Fatalf("a refused request changed the ledger: %v", got)
+	}
+
+	rr := del("?kind=email&address=1@ormnes.com")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("DELETE: %d %s", rr.Code, rr.Body.String())
+	}
+	if got := addresses(); len(got) != 1 || got[0] != "2@ormnes.com" {
+		t.Fatalf("after delete records = %v, want only 2@ormnes.com", got)
+	}
+
+	// The same identity again is not a silent success: the row is gone, and the
+	// caller has to be able to tell that from "removed".
+	again := del("?kind=email&address=1@ormnes.com")
+	if again.Code != http.StatusNotFound {
+		t.Fatalf("second delete: %d %s, want 404", again.Code, again.Body.String())
+	}
+	var body struct {
+		Code string `json:"code"`
+	}
+	if errUnmarshal := json.Unmarshal(again.Body.Bytes(), &body); errUnmarshal != nil {
+		t.Fatalf("decode: %v", errUnmarshal)
+	}
+	if body.Code != "unknown_identity" {
+		t.Fatalf("code = %q, want unknown_identity", body.Code)
 	}
 }
 
