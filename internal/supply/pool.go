@@ -229,10 +229,17 @@ func NewPool() *Pool { return &Pool{Version: poolVersion} }
 func PoolPath(dir string) string { return filepath.Join(dir, "ledger.json") }
 
 // find returns the index of one identity's record, or -1.
+//
+// Matching ignores case because an address is the same identity however it was
+// spelled: a handout lowercases what it hands out, while a credential may carry
+// the address as the provider displays it. Comparing byte-for-byte therefore
+// missed records that differed only in case, which both dropped the annotation
+// and let a second record be created for an identity already in the ledger.
+// Every lookup goes through here, so this is the one place the rule has to hold.
 func (l *Pool) find(kind Kind, address string) int {
 	address = strings.TrimSpace(address)
 	for i := range l.Records {
-		if l.Records[i].Kind == kind && l.Records[i].Address == address {
+		if l.Records[i].Kind == kind && strings.EqualFold(l.Records[i].Address, address) {
 			return i
 		}
 	}

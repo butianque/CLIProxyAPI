@@ -269,6 +269,31 @@ func TestPoolLinkUnknownIdentityIsNoop(t *testing.T) {
 	}
 }
 
+// An address is one identity however it is spelled: a handout lowercases what it
+// hands out, while a credential may report the address as the provider displays
+// it, so a lookup that compared bytes dropped the annotation and let a second
+// record be created for an identity the ledger already had.
+func TestPoolMatchesIdentityRegardlessOfCase(t *testing.T) {
+	pool := NewPool()
+	pool.Record(KindEmail, "supplied@ormnes.com", "ormnes", 0, nil, 1)
+
+	pool.Link(KindEmail, "Supplied@Ormnes.com", "zcode", "zcode-supplied", "", 2)
+
+	if len(pool.Records) != 1 {
+		t.Fatalf("records = %+v, want the one identity, not a second spelled differently", pool.Records)
+	}
+	if !pool.Knows(KindEmail, "SUPPLIED@ORMNES.COM") {
+		t.Fatal("Knows = false, want the stored identity found through another spelling")
+	}
+	record, ok := pool.Get(KindEmail, "supplied@ORMNES.com")
+	if !ok {
+		t.Fatal("Get found nothing, want the stored identity")
+	}
+	if record.Account != "zcode-supplied" || record.State != "held" {
+		t.Fatalf("record = %+v, want the link to land on the existing identity", record)
+	}
+}
+
 // ForAccount and ForTarget answer the two questions the pool exists for.
 func TestPoolQueriesByAccountAndTarget(t *testing.T) {
 	pool := NewPool()
