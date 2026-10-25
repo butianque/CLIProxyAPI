@@ -427,11 +427,19 @@ func firstCode(mails []Mail) string {
 //
 // The channel is left out on purpose: the record already carries the one that
 // handed the address out, and a registration must not reassign it.
+//
+// Only an address this service handed out has a record to annotate. An account
+// the operator created by hand is not a supplied identity, so a login on it
+// leaves the ledger alone: writing a record here would put an address the pool
+// never handed out into the ledger, where it would read as a bought mailbox and
+// persist as one.
 func (p *ProviderImpl) Link(ctx context.Context, address, target, account, authIndex string) error {
 	if p.cfg.Pool == nil {
 		return nil
 	}
-	p.cfg.Pool.Register(supply.KindEmail, address, "", target, account, authIndex, "registered", time.Now().Unix())
+	if _, linked := p.cfg.Pool.Link(supply.KindEmail, address, target, account, authIndex, time.Now().Unix()); !linked {
+		return nil
+	}
 	return p.savePool()
 }
 

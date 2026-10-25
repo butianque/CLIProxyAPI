@@ -437,20 +437,23 @@ func (l *Pool) Record(kind Kind, address, source string, price float64, meta map
 // address that was never handed out is a no-op, because the pool is the host's
 // record of what it supplied, not a place to learn about identities from
 // outside; the caller that does know the identity reaches Register directly.
+// The second result says whether anything was annotated, so a caller that
+// persists the pool can skip the write when there was nothing to persist.
 //
 // It records the outcome and state of a successful registration, overwriting
 // whatever a previous attempt left. Registration is the most recent fact and a
 // definitive success, so a record that was marked timed-out or released by an
 // earlier attempt must not keep saying so once an account is bound to it: the
 // identity is held by that account now.
-func (l *Pool) Link(kind Kind, address, target, account, authIndex string, now int64) {
+func (l *Pool) Link(kind Kind, address, target, account, authIndex string, now int64) (Record, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.find(kind, address) < 0 {
-		return
+		return Record{}, false
 	}
 	record := l.registerLocked(kind, address, "", target, account, authIndex, "registered", now)
 	record.State = "held"
+	return *record, true
 }
 
 // Register notes that an identity was used to register an account, and on which

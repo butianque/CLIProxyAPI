@@ -1110,3 +1110,60 @@ func TestProviderProbeAddressReportsUnreadableCredential(t *testing.T) {
 		t.Fatalf("err = %v, want ErrCredential", errProbe)
 	}
 }
+
+// A login reports the address it registered, and only an address this service
+// handed out has a record to annotate. An account the operator created by hand
+// is not a supplied identity: writing a record for it would put an address the
+// pool never handed out into the ledger, where it would read as a bought mailbox
+// and stay there across restarts.
+func TestProviderLinkLeavesAnAddressThePoolNeverSupplied(t *testing.T) {
+	base := time.Date(2026, 10, 25, 14, 0, 0, 0, time.UTC)
+	poolPath := filepath.Join(t.TempDir(), "ledger.json")
+	pool := supply.NewPool()
+	pool.AttachMailbox(supply.KindEmail, "bought@outlook.com", supply.Mailbox{
+		Nature:   supply.NatureGraph,
+		Endpoint: "graph.microsoft.com",
+		ClientID: "app-1",
+	}, base.Unix())
+
+	provider, errNew := New(Config{
+		ChannelsPath: writeChannels(t, imapChannel("qq", "box@qq.com", "ormnes.com", true)),
+		Credential:   func(name string) (string, error) { return "secret-for-" + name, nil },
+		Dial: func(context.Context, Target) (Session, error) {
+			return &fakeSession{}, nil
+		},
+		Pool:     pool,
+		PoolPath: poolPath,
+	})
+	if errNew != nil {
+		t.Fatalf("New: %v", errNew)
+	}
+
+	if errLink := provider.Link(context.Background(), "manual@outlook.com", "zcode-zai", "zcode-manual", ""); errLink != nil {
+		t.Fatalf("Link: %v", errLink)
+	}
+	if _, known := pool.Get(supply.KindEmail, "manual@outlook.com"); known {
+		t.Fatal("a login on an address the pool never supplied must not add a record")
+	}
+	// Not writing the record is half the fix: the ledger must also not be
+	// rewritten, or the file on disk would claim a row the memory does not have.
+	if _, errStat := os.Stat(poolPath); !errors.Is(errStat, os.ErrNotExist) {
+		t.Fatalf("err = %v, want no ledger written for an unknown address", errStat)
+	}
+
+	// The address the pool did hand out is still annotated: that is what the call
+	// is for, and a fix that stopped annotating would be silent.
+	if errLink := provider.Link(context.Background(), "bought@outlook.com", "zcode-zai", "zcode-bought", ""); errLink != nil {
+		t.Fatalf("Link: %v", errLink)
+	}
+	record, known := pool.Get(supply.KindEmail, "bought@outlook.com")
+	if !known {
+		t.Fatal("the supplied address must still be in the pool")
+	}
+	if record.Target != "zcode-zai" || record.Account != "zcode-bought" || record.State != "held" {
+		t.Fatalf("record = %+v, want the registration annotated", record)
+	}
+	if _, errStat := os.Stat(poolPath); errStat != nil {
+		t.Fatalf("err = %v, want the annotation persisted", errStat)
+	}
+}
