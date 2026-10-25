@@ -395,6 +395,71 @@ func TestAuthorizeStopsTheBatchWhenTheStoreLocks(t *testing.T) {
 	}
 }
 
+// A parked sign-in holds a token that only a save can finish, so it keeps the slot
+// the same way a running batch does. Letting a new batch start would drop that token
+// without telling anyone.
+func TestAuthorizeRefusesASecondBatchWhileOneIsParked(t *testing.T) {
+	_, r, _ := setupAuthorizeTest(t)
+	unlockedEmptyStore(t)
+	store := secretstore.Default()
+	stubSignIn(t, email.GraphIdentity{Mail: "alice@hotmail.com"}, "rt-parked")
+
+	emailAuthorizes.pollSignIn = func(ctx context.Context, egress, clientID, deviceCode string) (email.DeviceToken, error) {
+		store.Lock()
+		return email.DeviceToken{AccessToken: "at", RefreshToken: "rt-parked", Expires: time.Now().Add(time.Hour)}, nil
+	}
+
+	if code, resp := startAuthorize(t, r, `{"accounts":"alice@hotmail.com"}`); code != http.StatusOK {
+		t.Fatalf("first start: %d %v", code, resp)
+	}
+	waitForStatus(t, r, authorizeAwaitingUnlock)
+	waitForIdleBatch(t)
+
+	if code, _ := startAuthorize(t, r, `{"accounts":"bob@hotmail.com"}`); code != http.StatusConflict {
+		t.Fatalf("start while parked: %d, want %d", code, http.StatusConflict)
+	}
+	// The parked one is still there, still holding its token.
+	flows := listAuthorizes(t, r)
+	if len(flows) != 1 || flows[0]["status"] != authorizeAwaitingUnlock {
+		t.Fatalf("flows = %v, want the parked one alone", flows)
+	}
+}
+
+// Stopping a parked sign-in is the only way to let go of it, so it has to actually
+// drop the token rather than answer "already finished".
+func TestAuthorizeCancelDropsAParkedToken(t *testing.T) {
+	_, r, _ := setupAuthorizeTest(t)
+	unlockedEmptyStore(t)
+	store := secretstore.Default()
+	stubSignIn(t, email.GraphIdentity{Mail: "alice@hotmail.com"}, "rt-parked")
+
+	emailAuthorizes.pollSignIn = func(ctx context.Context, egress, clientID, deviceCode string) (email.DeviceToken, error) {
+		store.Lock()
+		return email.DeviceToken{AccessToken: "at", RefreshToken: "rt-parked", Expires: time.Now().Add(time.Hour)}, nil
+	}
+
+	if code, resp := startAuthorize(t, r, `{"accounts":"alice@hotmail.com"}`); code != http.StatusOK {
+		t.Fatalf("start: %d %v", code, resp)
+	}
+	flow := waitForStatus(t, r, authorizeAwaitingUnlock)
+	waitForIdleBatch(t)
+
+	id, _ := flow["id"].(string)
+	req := httptest.NewRequest(http.MethodPost, "/supply/email/authorize/"+id+"/cancel", nil)
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("cancel: %d %s", rr.Code, rr.Body.String())
+	}
+	parked, _ := emailAuthorizes.get(id)
+	if parked.Status != authorizeCancelled {
+		t.Fatalf("status = %q, want %q", parked.Status, authorizeCancelled)
+	}
+	if parked.held != "" {
+		t.Fatal("a cancelled sign-in still holds a token")
+	}
+}
+
 // One batch at a time: a second one would mean two codes and two sign-ins against
 // the same exit in the same minute, which is exactly the pattern to avoid.
 func TestAuthorizeRefusesASecondBatch(t *testing.T) {

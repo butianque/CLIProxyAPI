@@ -361,6 +361,15 @@ func (r *emailAuthorizeRegistry) start(ctx context.Context, accounts []string, c
 		r.mu.Unlock()
 		return nil, errAuthorizeBusy
 	}
+	// A parked sign-in still holds a token that only a save can finish. Starting
+	// another batch would drop it, so it blocks the slot exactly like a running
+	// one — and the panel answers that the same way, by showing the parked one.
+	for _, id := range r.order {
+		if flow, ok := r.flows[id]; ok && flow.Status == authorizeAwaitingUnlock {
+			r.mu.Unlock()
+			return nil, errAuthorizeBusy
+		}
+	}
 	r.running = true
 	r.mu.Unlock()
 
@@ -375,6 +384,10 @@ func (r *emailAuthorizeRegistry) start(ctx context.Context, accounts []string, c
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.pruneLocked(time.Now())
+	// The rows of earlier batches have already been read by the panel, and
+	// keeping them would make this batch read "3 of 5" while showing five rows
+	// from the last one.
+	r.dropSettledLocked()
 	now := time.Now()
 	ids := make([]string, 0, len(accounts))
 	for index, account := range accounts {
@@ -581,14 +594,22 @@ func (r *emailAuthorizeRegistry) markRest(ids []string, status, detail string) {
 // cancel stops the running batch.
 func (r *emailAuthorizeRegistry) cancel(id string) error {
 	r.mu.Lock()
-	if _, ok := r.flows[id]; !ok {
+	flow, ok := r.flows[id]
+	if !ok {
 		r.mu.Unlock()
 		return errors.New("no such sign-in")
 	}
 	cancel := r.stop
+	parked := flow.Status == authorizeAwaitingUnlock
 	r.mu.Unlock()
 	if cancel != nil {
 		cancel()
+		return nil
+	}
+	if parked {
+		// Nothing is running, but this one still holds a token waiting for a
+		// save. Stopping it means dropping that token, which is what was asked.
+		r.finish(id, authorizeCancelled, "the sign-in was stopped before it was saved")
 		return nil
 	}
 	// Nothing is running: the flow has already finished, and there is nothing to
@@ -642,6 +663,22 @@ func (r *emailAuthorizeRegistry) views(only []string) []emailAuthorizeView {
 		out = append(out, view)
 	}
 	return out
+}
+
+// dropSettledLocked forgets the rows of earlier batches. A batch's result is read
+// right after it lands, so by the time another batch starts those rows have served
+// their purpose — and keeping them would make the new batch's progress count wrong.
+// It must be called with the lock held.
+func (r *emailAuthorizeRegistry) dropSettledLocked() {
+	kept := r.order[:0]
+	for _, id := range r.order {
+		if flow, ok := r.flows[id]; ok && !flow.settled() {
+			kept = append(kept, id)
+			continue
+		}
+		delete(r.flows, id)
+	}
+	r.order = kept
 }
 
 // pruneLocked drops finished flows nobody will read again. It must be called with
