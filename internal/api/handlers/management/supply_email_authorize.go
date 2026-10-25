@@ -73,7 +73,6 @@ const (
 	authorizeVerifying      = "verifying"
 	authorizeSaving         = "saving"
 	authorizeDone           = "done"
-	authorizeMismatch       = "mismatch"
 	authorizeDenied         = "denied"
 	authorizeExpired        = "expired"
 	authorizeFailed         = "failed"
@@ -93,6 +92,11 @@ type emailAuthorizeFlow struct {
 	Interval   time.Duration
 	FinishedAt time.Time
 
+	// StoredAs is the address the credential was actually filed under: the one
+	// Microsoft reports for the account that signed in. It differs from Account
+	// when the operator named an alias.
+	StoredAs string
+
 	// held is a refresh token whose sign-in succeeded but which could not be
 	// written because the store was locked. It lives in memory only, and is
 	// dropped as soon as the write happens.
@@ -103,7 +107,7 @@ type emailAuthorizeFlow struct {
 // terminal reports whether a flow will not change again.
 func (f emailAuthorizeFlow) terminal() bool {
 	switch f.Status {
-	case authorizeDone, authorizeMismatch, authorizeDenied, authorizeExpired, authorizeFailed, authorizeCancelled:
+	case authorizeDone, authorizeDenied, authorizeExpired, authorizeFailed, authorizeCancelled:
 		return true
 	}
 	return false
@@ -128,6 +132,9 @@ type emailAuthorizeView struct {
 	VerifyURL string `json:"verify_url,omitempty"`
 	ExpiresIn int    `json:"expires_in,omitempty"`
 	Interval  int    `json:"interval,omitempty"`
+	// StoredAs is the address the credential was filed under, present once the
+	// sign-in has been identified. It differs from Account for an alias.
+	StoredAs string `json:"stored_as,omitempty"`
 }
 
 // emailAuthorizeRegistry holds the flows in flight.
@@ -288,7 +295,13 @@ func (h *Handler) PostSupplyEmailAuthorizeCommit(c *gin.Context) {
 	if _, alreadyAnswered := gateSupplyWrite(c, body.Passphrase); alreadyAnswered {
 		return
 	}
-	if errCommit := h.attachAuthorizedMailbox(flow.Account, flow.heldClientID, flow.held); errCommit != nil {
+	// The parked token belongs to the account Microsoft reported, which is the
+	// address the flow recorded when it identified the sign-in.
+	storedAs := flow.StoredAs
+	if storedAs == "" {
+		storedAs = flow.Account
+	}
+	if errCommit := h.attachAuthorizedMailbox(storedAs, flow.heldClientID, flow.held); errCommit != nil {
 		c.JSON(errStatus(errCommit), gin.H{"status": "error", "error": errCommit.Error()})
 		return
 	}
@@ -472,22 +485,35 @@ func (r *emailAuthorizeRegistry) runOne(ctx context.Context, id, account, client
 		return status != authorizeCancelled
 	}
 
-	// Which account signed in is not something the token says. Asking is the only
-	// thing that keeps a request naming one address from storing another
-	// account's credential under it.
+	// Which account signed in is not something the token says, so it has to be
+	// asked. The answer is what the credential is filed under — never the address
+	// the operator typed. A personal account owns any number of aliases, and the
+	// endpoint reports only its primary ones, so a batch sold under an alias signs
+	// in as a different-looking address that is still the same mailbox. Filing by
+	// the answer keeps address and credential in agreement in that case, and in
+	// the other case — the operator signed in to the wrong account — it keeps a
+	// foreign credential from being filed under the requested address, which would
+	// make every later read of that address return someone else's mail.
 	r.update(id, func(flow *emailAuthorizeFlow) { flow.Status = authorizeVerifying })
 	identity, errIdentify := r.whoAmI(ctx, egress, token.AccessToken)
 	if errIdentify != nil {
 		r.finish(id, authorizeFailed, errIdentify.Error())
 		return true
 	}
-	if !identityMatches(identity, account) {
-		r.finish(id, authorizeMismatch, "the sign-in was for "+strings.Join(identity.Addresses(), " / ")+", not "+account)
+	addresses := identity.Addresses()
+	if len(addresses) == 0 {
+		r.finish(id, authorizeFailed, "the signed-in account reported no address")
 		return true
 	}
+	// The primary address is the one that will keep being reported on every later
+	// read, so it is the one the credential belongs to.
+	signedIn := addresses[0]
+	r.update(id, func(flow *emailAuthorizeFlow) {
+		flow.Status = authorizeSaving
+		flow.StoredAs = signedIn
+	})
 
-	r.update(id, func(flow *emailAuthorizeFlow) { flow.Status = authorizeSaving })
-	if errCommit := commit(account, clientID, token.RefreshToken); errCommit != nil {
+	if errCommit := commit(signedIn, clientID, token.RefreshToken); errCommit != nil {
 		if errors.Is(errCommit, secretstore.ErrLocked) || errors.Is(errCommit, secretstore.ErrUnauthorized) {
 			// The sign-in was real and the token is good; only the write is
 			// missing. Parking it means one unlock finishes the batch instead of
@@ -509,7 +535,14 @@ func (r *emailAuthorizeRegistry) runOne(ctx context.Context, id, account, client
 		r.finish(id, authorizeFailed, errCommit.Error())
 		return true
 	}
-	r.finish(id, authorizeDone, "")
+	// When the mailbox signs in under an alias, the operator asked for one address
+	// and the pool now holds another. Saying so is the difference between "it
+	// worked" and "it worked, but look at which address it landed on".
+	note := ""
+	if signedIn != strings.ToLower(strings.TrimSpace(account)) {
+		note = "signed in as " + signedIn
+	}
+	r.finish(id, authorizeDone, note)
 	return true
 }
 
@@ -654,6 +687,7 @@ func (r *emailAuthorizeRegistry) views(only []string) []emailAuthorizeView {
 			UserCode:  flow.UserCode,
 			VerifyURL: flow.VerifyURL,
 			Interval:  int(flow.Interval / time.Second),
+			StoredAs:  flow.StoredAs,
 		}
 		if !flow.ExpiresAt.IsZero() {
 			if remaining := int(flow.ExpiresAt.Sub(now) / time.Second); remaining > 0 {
@@ -765,44 +799,6 @@ func parseAuthorizeAccounts(text string) ([]string, error) {
 		return nil, fmt.Errorf("at most %d accounts at a time", authorizeMaxAccounts)
 	}
 	return out, nil
-}
-
-// identityMatches reports whether the account that signed in is the one that was
-// asked for.
-//
-// An exact match is not the only correct answer. A personal Microsoft account
-// owns one namespace across several domains, so the same person is
-// "name@hotmail.com" and "name@outlook.com"; a batch sold under one spelling is
-// routinely signed in under another, and refusing that would reject a correct
-// sign-in. Two different people can never share a local part across those
-// domains, which is what makes the looser comparison safe.
-func identityMatches(identity email.GraphIdentity, account string) bool {
-	account = strings.ToLower(strings.TrimSpace(account))
-	if account == "" {
-		return false
-	}
-	for _, address := range identity.Addresses() {
-		if address == account {
-			return true
-		}
-		if local, domain, found := strings.Cut(address, "@"); found &&
-			isMicrosoftConsumerDomain(domain) && strings.HasPrefix(account, local+"@") &&
-			isMicrosoftConsumerDomain(strings.TrimPrefix(account, local+"@")) {
-			return true
-		}
-	}
-	return false
-}
-
-// isMicrosoftConsumerDomain reports whether a domain belongs to the shared
-// personal-account namespace.
-func isMicrosoftConsumerDomain(domain string) bool {
-	switch domain {
-	case "msn.com", "passport.com":
-		return true
-	}
-	return strings.HasPrefix(domain, "hotmail.") || strings.HasPrefix(domain, "outlook.") ||
-		strings.HasPrefix(domain, "live.")
 }
 
 // newAuthorizeID makes an identifier for one flow. It is random rather than

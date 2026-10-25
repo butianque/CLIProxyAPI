@@ -194,8 +194,12 @@ func TestAuthorizeStoresASignedInMailbox(t *testing.T) {
 // The endpoint never says which account was signed in to. Without the identity
 // check, a batch that asked for one address and was signed in to another would
 // store that other account's token under the requested address — and every later
-// read of the requested address would return someone else's mail.
-func TestAuthorizeRefusesAnAccountThatDidNotSignIn(t *testing.T) {
+// A mailbox sold under an alias signs in as the address Microsoft reports, not
+// the one the operator typed. The credential must be filed under the reported
+// address: filing it under the typed one would hand a later read of that address
+// whatever mailbox happened to sign in, which for a wrong sign-in is someone
+// else's mail.
+func TestAuthorizeStoresTheAddressThatActuallySignedIn(t *testing.T) {
 	_, r, stateDir := setupAuthorizeTest(t)
 	unlockedEmptyStore(t)
 	stubSignIn(t, email.GraphIdentity{Mail: "bob@outlook.com"}, "rt-bob")
@@ -203,23 +207,25 @@ func TestAuthorizeRefusesAnAccountThatDidNotSignIn(t *testing.T) {
 	if code, resp := startAuthorize(t, r, `{"accounts":"alice@hotmail.com"}`); code != http.StatusOK {
 		t.Fatalf("start: %d %v", code, resp)
 	}
-	flow := waitForStatus(t, r, authorizeMismatch)
+	flow := waitForStatus(t, r, authorizeDone)
+	if got, _ := flow["stored_as"].(string); got != "bob@outlook.com" {
+		t.Fatalf("stored_as = %q, want the signed-in address", got)
+	}
 	detail, _ := flow["detail"].(string)
 	if !strings.Contains(detail, "bob@outlook.com") {
-		t.Fatalf("detail = %q, want the account that actually signed in", detail)
+		t.Fatalf("detail = %q, want the address the sign-in landed on", detail)
 	}
 
-	if records := loadPool(t, stateDir).All(); len(records) != 0 {
-		t.Fatalf("a refused sign-in wrote %d identities", len(records))
+	records := loadPool(t, stateDir).All()
+	if len(records) != 1 || records[0].Address != "bob@outlook.com" {
+		t.Fatalf("records = %+v, want the signed-in address alone", records)
 	}
 	store := secretstore.Default()
 	if _, errGet := store.Get(supply.EmailOAuth2CredentialName("alice@hotmail.com")); errGet == nil {
-		t.Fatal("a refused sign-in still stored a credential under the requested address")
+		t.Fatal("the requested address must not hold a credential for another account")
 	}
-	// The token itself must not be left behind either: it belongs to an account
-	// nobody asked for.
-	if _, errGet := store.Get(supply.EmailOAuth2CredentialName("bob@outlook.com")); errGet == nil {
-		t.Fatal("a refused sign-in stored the credential under the signed-in address")
+	if _, errGet := store.Get(supply.EmailOAuth2CredentialName("bob@outlook.com")); errGet != nil {
+		t.Fatalf("the signed-in address has no credential: %v", errGet)
 	}
 }
 
@@ -523,34 +529,6 @@ func TestAuthorizeRefusesALockedStore(t *testing.T) {
 	}
 	if flows := listAuthorizes(t, r); len(flows) != 0 {
 		t.Fatalf("a refused batch started %d flows", len(flows))
-	}
-}
-
-// A personal Microsoft account owns one namespace across several domains, so the
-// same person is name@hotmail.com and name@outlook.com. A batch sold under one
-// spelling is routinely signed in under another, and a strict comparison would
-// refuse a correct sign-in.
-func TestIdentityMatches(t *testing.T) {
-	cases := []struct {
-		name     string
-		identity email.GraphIdentity
-		account  string
-		want     bool
-	}{
-		{"exact", email.GraphIdentity{Mail: "a@hotmail.com"}, "a@hotmail.com", true},
-		{"alias domain", email.GraphIdentity{Mail: "a@outlook.com"}, "a@hotmail.com", true},
-		{"alias the other way", email.GraphIdentity{UserPrincipalName: "a@hotmail.com"}, "a@outlook.com", true},
-		{"live", email.GraphIdentity{Mail: "a@live.com"}, "a@hotmail.com", true},
-		{"different person", email.GraphIdentity{Mail: "b@outlook.com"}, "a@hotmail.com", false},
-		{"same local part, work domain", email.GraphIdentity{Mail: "a@contoso.com"}, "a@hotmail.com", false},
-		{"no address", email.GraphIdentity{}, "a@hotmail.com", false},
-		{"no account", email.GraphIdentity{Mail: "a@hotmail.com"}, "", false},
-	}
-	for _, testCase := range cases {
-		if got := identityMatches(testCase.identity, testCase.account); got != testCase.want {
-			t.Errorf("%s: identityMatches(%v, %q) = %v, want %v",
-				testCase.name, testCase.identity, testCase.account, got, testCase.want)
-		}
 	}
 }
 
