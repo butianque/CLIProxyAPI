@@ -66,6 +66,12 @@ var logFieldOrder = []string{
 	"credential", "auth_id", "auth_index", "connection", "proxy_scheme", "remote_transport",
 	"operation", "upstream_host", "reused", "was_idle", "idle_time",
 	"media_session_id", "call_id", "peer", "state", "reason",
+	// The token endpoint's error code and Microsoft's AADSTS sub-code. They are
+	// listed because the sentence a refused exchange produces cannot carry them:
+	// the description beside them is free text that may echo the request, so only
+	// the codes are safe to log — and an unlisted field is not logged at all,
+	// which is how "refused" reached the log without saying why.
+	"oauth_error", "aadsts", "resource",
 }
 
 var quotedLogFields = map[string]struct{}{

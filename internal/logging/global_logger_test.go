@@ -81,6 +81,35 @@ func TestLogFormatterPrintsMediaForwardingFields(t *testing.T) {
 	}
 }
 
+func TestLogFormatterPrintsTokenRefusalCodes(t *testing.T) {
+	entry := log.NewEntry(log.New())
+	entry.Time = time.Date(2026, 10, 26, 20, 42, 5, 0, time.Local)
+	entry.Level = log.WarnLevel
+	entry.Message = "email: the token endpoint refused the request"
+	// A refused exchange is only actionable through its codes: the description
+	// beside them is free text and never logged, so dropping these three turns
+	// "refused" into a line that says nothing about why.
+	entry.Data["oauth_error"] = "invalid_grant"
+	entry.Data["aadsts"] = "AADSTS70000"
+	entry.Data["resource"] = "graph"
+
+	formatted, errFormat := (&LogFormatter{}).Format(entry)
+	if errFormat != nil {
+		t.Fatalf("Format() error = %v", errFormat)
+	}
+
+	line := string(formatted)
+	for _, want := range []string{
+		"oauth_error=invalid_grant",
+		"aadsts=AADSTS70000",
+		"resource=graph",
+	} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("formatted line %q missing %s", line, want)
+		}
+	}
+}
+
 func TestLogFormatterPrintsPluginFields(t *testing.T) {
 	entry := log.NewEntry(log.New())
 	entry.Time = time.Date(2026, 6, 25, 20, 10, 0, 0, time.Local)
