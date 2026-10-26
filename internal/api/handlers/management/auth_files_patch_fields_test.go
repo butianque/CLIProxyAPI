@@ -388,6 +388,116 @@ func TestPatchAuthFileFields_RejectsInvalidWeights(t *testing.T) {
 	}
 }
 
+func TestPatchAuthFileFields_MaxConcurrencyPersistsAndRoundTrips(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	authDir := t.TempDir()
+	fileName := "capped.json"
+	filePath := filepath.Join(authDir, fileName)
+	store := fileauth.NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:         fileName,
+		FileName:   fileName,
+		Provider:   "zcode-bigmodel",
+		Attributes: map[string]string{"path": filePath},
+		Metadata:   map[string]any{"type": "zcode-bigmodel"},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	patch := func(value string) *httptest.ResponseRecorder {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(rec)
+		body := `{"name":"capped.json","max_concurrency":` + value + `}`
+		ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+		ctx.Request.Header.Set("Content-Type", "application/json")
+		h.PatchAuthFileFields(ctx)
+		return rec
+	}
+
+	if rec := patch("4"); rec.Code != http.StatusOK {
+		t.Fatalf("update status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	updated, ok := manager.GetByID(fileName)
+	if !ok || updated.Metadata[coreauth.AttributeMaxConcurrency] != 4 {
+		t.Fatalf("runtime max_concurrency = %#v, want 4", updated.Metadata[coreauth.AttributeMaxConcurrency])
+	}
+	raw, errRead := os.ReadFile(filePath)
+	if errRead != nil {
+		t.Fatalf("ReadFile() error = %v", errRead)
+	}
+	var persisted map[string]any
+	if errUnmarshal := json.Unmarshal(raw, &persisted); errUnmarshal != nil {
+		t.Fatalf("Unmarshal() error = %v", errUnmarshal)
+	}
+	if persisted[coreauth.AttributeMaxConcurrency] != float64(4) {
+		t.Fatalf("persisted max_concurrency = %#v, want 4", persisted[coreauth.AttributeMaxConcurrency])
+	}
+
+	// An explicit 0 disables the cap, so it has to survive the round trip instead
+	// of being dropped as if it were "unset".
+	if rec := patch("0"); rec.Code != http.StatusOK {
+		t.Fatalf("disable status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	updated, _ = manager.GetByID(fileName)
+	if updated.Metadata[coreauth.AttributeMaxConcurrency] != 0 {
+		t.Fatalf("runtime max_concurrency after disabling = %#v, want 0", updated.Metadata[coreauth.AttributeMaxConcurrency])
+	}
+
+	if rec := patch("null"); rec.Code != http.StatusOK {
+		t.Fatalf("reset status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	updated, _ = manager.GetByID(fileName)
+	if _, exists := updated.Metadata[coreauth.AttributeMaxConcurrency]; exists {
+		t.Fatal("runtime max_concurrency remains after reset")
+	}
+	raw, errRead = os.ReadFile(filePath)
+	if errRead != nil {
+		t.Fatalf("ReadFile() after reset error = %v", errRead)
+	}
+	persisted = nil
+	if errUnmarshal := json.Unmarshal(raw, &persisted); errUnmarshal != nil {
+		t.Fatalf("Unmarshal() after reset error = %v", errUnmarshal)
+	}
+	if _, exists := persisted[coreauth.AttributeMaxConcurrency]; exists {
+		t.Fatal("persisted max_concurrency remains after reset")
+	}
+}
+
+func TestPatchAuthFileFields_RejectsInvalidMaxConcurrency(t *testing.T) {
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{ID: "auth.json", FileName: "auth.json", Provider: "zcode-bigmodel", Metadata: map[string]any{"type": "zcode-bigmodel"}}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, manager)
+
+	for _, value := range []string{"-1", "1.5", `"4"`, "true", `"many"`} {
+		rec := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(rec)
+		body := `{"name":"auth.json","max_concurrency":` + value + `}`
+		ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+		ctx.Request.Header.Set("Content-Type", "application/json")
+		h.PatchAuthFileFields(ctx)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("max_concurrency %s status = %d, want 400; body=%s", value, rec.Code, rec.Body.String())
+		}
+	}
+	updated, ok := manager.GetByID("auth.json")
+	if !ok {
+		t.Fatal("auth missing after rejected patches")
+	}
+	if _, exists := updated.Metadata[coreauth.AttributeMaxConcurrency]; exists {
+		t.Fatalf("rejected patch stored max_concurrency = %#v", updated.Metadata[coreauth.AttributeMaxConcurrency])
+	}
+}
+
 func TestPatchAuthFileFields_RequestRetryRoundTrip(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 

@@ -368,6 +368,28 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		} else if rootAuthFileField(fieldPath) == coreauth.AttributeWeight {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "weight does not support nested fields"})
 			return
+		} else if fieldPath == coreauth.AttributeMaxConcurrency {
+			// The cap is stored as a whole number of concurrent requests. Rejecting
+			// a value the gate cannot honor here is what keeps the panel and the
+			// scheduler from disagreeing: at read time an unparseable value is
+			// treated as "inherit the provider default".
+			if value == nil {
+				delete(targetAuth.Metadata, coreauth.AttributeMaxConcurrency)
+			} else {
+				if _, okNumber := value.(json.Number); !okNumber {
+					c.JSON(http.StatusBadRequest, gin.H{"error": "max_concurrency must be an integer"})
+					return
+				}
+				limit, errLimit := coreauth.ParseAuthMaxConcurrency(value)
+				if errLimit != nil {
+					c.JSON(http.StatusBadRequest, gin.H{"error": errLimit.Error()})
+					return
+				}
+				targetAuth.Metadata[coreauth.AttributeMaxConcurrency] = limit
+			}
+		} else if rootAuthFileField(fieldPath) == coreauth.AttributeMaxConcurrency {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "max_concurrency does not support nested fields"})
+			return
 		} else if fieldPath == "headers" {
 			applyAuthFileHeadersPatch(targetAuth, value)
 		} else if errSet := setAuthFileMetadataValue(targetAuth.Metadata, fieldPath, value); errSet != nil {

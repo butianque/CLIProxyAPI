@@ -131,6 +131,11 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		return resp, unwrapExecutionBoundaryError(errHome)
 	}
 
+	// The concurrency slot belongs to the request, not to the selection call, so
+	// the ledger is created here and released on every return path below.
+	ctx = withCredentialCapLedger(ctx, m.newCredentialCapLedger())
+	defer credentialCapLedgerFromContext(ctx).releaseUnlessDetached()
+
 	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings()
 
 	var lastErr error
@@ -191,6 +196,11 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 		return resp, unwrapExecutionBoundaryError(errHome)
 	}
 
+	// The concurrency slot belongs to the request, not to the selection call, so
+	// the ledger is created here and released on every return path below.
+	ctx = withCredentialCapLedger(ctx, m.newCredentialCapLedger())
+	defer credentialCapLedgerFromContext(ctx).releaseUnlessDetached()
+
 	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings()
 
 	var lastErr error
@@ -244,6 +254,12 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	if len(normalized) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
+
+	// A stream keeps its slot until the last chunk is delivered, so ownership is
+	// handed to the pump in wrapStreamResult. Until that happens this defer is the
+	// one that releases it, which covers every error path below.
+	ctx = withCredentialCapLedger(ctx, m.newCredentialCapLedger())
+	defer credentialCapLedgerFromContext(ctx).releaseUnlessDetached()
 
 	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings()
 

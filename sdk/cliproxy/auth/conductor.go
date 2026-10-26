@@ -215,6 +215,15 @@ type Manager struct {
 	// authLoadGate allows concurrent credential transactions, but excludes whole-store reloads.
 	// Mutations acquire one permit; Load acquires all permits before reading the store.
 	authLoadGate *semaphore.Weighted
+
+	// credentialCap enforces the per-credential hard concurrency cap (credential_cap.go).
+	// It counts in-flight requests locally, so it applies only when Home is disabled:
+	// Home owns its own dispatch and concurrency accounting.
+	credentialCap credentialConcurrencyGate
+	// credentialCapQueueWait and credentialCapPollInterval override the full-pool wait.
+	// Zero means "use the production constants"; tests set them to avoid wall-clock waits.
+	credentialCapQueueWait    time.Duration
+	credentialCapPollInterval time.Duration
 }
 
 // NewManager constructs a manager with optional custom selector and hook.

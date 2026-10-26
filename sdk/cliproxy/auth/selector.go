@@ -1074,6 +1074,14 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		if auth == nil {
 			return nil, nil
 		}
+		// A credential that is merely at its concurrency cap is still the right home
+		// for this session. Serve this request elsewhere but keep the binding, or one
+		// busy moment would permanently move the session and lose the prompt cache
+		// locality the binding exists to preserve.
+		if _, busyOnly := busyCredentialsFromContext(ctx)[cachedAuthID]; busyOnly {
+			entry.Infof("session-affinity: bound auth is busy, spilling without rebinding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+			return auth, nil
+		}
 		bind(auth.ID)
 		entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 		return auth, nil
@@ -1145,46 +1153,65 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 		return nil, true, errAvailable
 	}
 
+	skipBind := false
 	if match, ok := s.matcher.MatchFingerprintsWithContext(namespace, fingerprints, tailFingerprints, envDigest, minPrefixLength); ok {
+		// Session identity and node kind describe the session, not the credential
+		// serving this request, so they are recorded before the availability check.
+		// A request that spills because its bound credential is busy still belongs to
+		// the same session and must not be accounted as a new one.
+		if match.SessionID != "" {
+			opts.Metadata[cliproxyexecutor.LCPAffinitySessionIDMetadataKey] = match.SessionID
+			opts.Metadata[cliproxyexecutor.CanonicalSessionIDMetadataKey] = match.SessionID
+		}
+		if match.ParentSessionID != "" {
+			opts.Metadata[cliproxyexecutor.ParentSessionIDMetadataKey] = match.ParentSessionID
+		} else if opts.Metadata != nil {
+			delete(opts.Metadata, cliproxyexecutor.ParentSessionIDMetadataKey)
+		}
+		if match.AccessNumber > 0 && opts.Metadata != nil {
+			opts.Metadata[cliproxyexecutor.LCPAccessGenerationMetadataKey] = match.AccessNumber
+		}
+		switch {
+		case match.IsFork:
+			if opts.Metadata != nil {
+				opts.Metadata[cliproxyexecutor.IsForkMetadataKey] = true
+				delete(opts.Metadata, cliproxyexecutor.IsCompactionMetadataKey)
+				opts.Metadata[cliproxyexecutor.NodeKindMetadataKey] = "fork"
+			}
+		case match.IsCompaction:
+			if opts.Metadata != nil {
+				opts.Metadata[cliproxyexecutor.IsCompactionMetadataKey] = true
+				delete(opts.Metadata, cliproxyexecutor.IsForkMetadataKey)
+				opts.Metadata[cliproxyexecutor.NodeKindMetadataKey] = "compaction"
+			}
+		default:
+			if opts.Metadata != nil {
+				delete(opts.Metadata, cliproxyexecutor.IsForkMetadataKey)
+				delete(opts.Metadata, cliproxyexecutor.IsCompactionMetadataKey)
+				delete(opts.Metadata, cliproxyexecutor.NodeKindMetadataKey)
+			}
+		}
 		for _, auth := range available {
 			if auth == nil || auth.ID != match.AuthID {
 				continue
 			}
-			if match.SessionID != "" {
-				opts.Metadata[cliproxyexecutor.LCPAffinitySessionIDMetadataKey] = match.SessionID
-				opts.Metadata[cliproxyexecutor.CanonicalSessionIDMetadataKey] = match.SessionID
-			}
-			if match.ParentSessionID != "" {
-				opts.Metadata[cliproxyexecutor.ParentSessionIDMetadataKey] = match.ParentSessionID
-			} else if opts.Metadata != nil {
-				delete(opts.Metadata, cliproxyexecutor.ParentSessionIDMetadataKey)
-			}
-			if match.AccessNumber > 0 && opts.Metadata != nil {
-				opts.Metadata[cliproxyexecutor.LCPAccessGenerationMetadataKey] = match.AccessNumber
-			}
-			if match.IsFork {
-				if opts.Metadata != nil {
-					opts.Metadata[cliproxyexecutor.IsForkMetadataKey] = true
-					delete(opts.Metadata, cliproxyexecutor.IsCompactionMetadataKey)
-					opts.Metadata[cliproxyexecutor.NodeKindMetadataKey] = "fork"
-				}
+			switch {
+			case match.IsFork:
 				entry.Infof("session-affinity: LCP fork hit | session=%s parent=%s prefix=%d auth=%s provider=%s model=%s", truncateSessionID(match.SessionID), truncateSessionID(match.ParentSessionID), match.PrefixLength, auth.ID, provider, model)
-			} else if match.IsCompaction {
-				if opts.Metadata != nil {
-					opts.Metadata[cliproxyexecutor.IsCompactionMetadataKey] = true
-					delete(opts.Metadata, cliproxyexecutor.IsForkMetadataKey)
-					opts.Metadata[cliproxyexecutor.NodeKindMetadataKey] = "compaction"
-				}
+			case match.IsCompaction:
 				entry.Infof("session-affinity: LCP compaction hit | session=%s parent=%s prefix=%d auth=%s provider=%s model=%s", truncateSessionID(match.SessionID), truncateSessionID(match.ParentSessionID), match.PrefixLength, auth.ID, provider, model)
-			} else {
-				if opts.Metadata != nil {
-					delete(opts.Metadata, cliproxyexecutor.IsForkMetadataKey)
-					delete(opts.Metadata, cliproxyexecutor.IsCompactionMetadataKey)
-					delete(opts.Metadata, cliproxyexecutor.NodeKindMetadataKey)
-				}
+			default:
 				entry.Infof("session-affinity: LCP cache hit | session=%s prefix=%d auth=%s provider=%s model=%s", truncateSessionID(match.SessionID), match.PrefixLength, auth.ID, provider, model)
 			}
 			return auth, true, nil
+		}
+		// The bound credential is absent from the candidate list. If it is only at
+		// its concurrency cap, this request is served elsewhere but the binding
+		// stays: a busy moment must not cost the session its prompt cache, the same
+		// rule the cache-hit path follows.
+		if _, busyOnly := busyCredentialsFromContext(ctx)[match.AuthID]; busyOnly {
+			entry.Infof("session-affinity: LCP bound auth is busy, spilling without rebinding | session=%s auth=%s provider=%s model=%s", truncateSessionID(match.SessionID), match.AuthID, provider, model)
+			skipBind = true
 		}
 	}
 
@@ -1195,6 +1222,9 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 	}
 	if auth == nil {
 		return nil, true, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+	}
+	if skipBind {
+		return auth, true, nil
 	}
 	if bindRes := s.matcher.BindFingerprintsWithContext(namespace, fingerprints, tailFingerprints, envDigest, minPrefixLength, auth.ID); bindRes.SessionID != "" {
 		opts.Metadata[cliproxyexecutor.LCPAffinitySessionIDMetadataKey] = bindRes.SessionID

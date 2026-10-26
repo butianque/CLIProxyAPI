@@ -123,7 +123,15 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel, routeModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, aliasResult OAuthModelAliasResult, ephemeralResult bool, opts cliproxyexecutor.Options) *cliproxyexecutor.StreamResult {
 	out := make(chan cliproxyexecutor.StreamChunk)
 	streamStart := time.Now()
+	// ExecuteStream returns before the consumer has read anything, so the request
+	// is still in flight. Hand the concurrency slot to the pump: it is released
+	// when the last chunk has been delivered, not when this function returns.
+	ledger := credentialCapLedgerFromContext(ctx)
+	ownsSlot := ledger.detach()
 	go func() {
+		if ownsSlot {
+			defer ledger.release()
+		}
 		defer close(out)
 		var failed bool
 		forward := true

@@ -1208,6 +1208,58 @@ func TestSessionAffinitySelector_FailoverWhenAuthUnavailable(t *testing.T) {
 	}
 }
 
+// A credential that is only at its concurrency cap must not move the binding: the
+// request spills to another credential, but the next request for this session goes
+// back to its home credential instead of inheriting the spill.
+func TestSessionAffinitySelector_BusyCredentialSpillsWithoutRebinding(t *testing.T) {
+	t.Parallel()
+
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &RoundRobinSelector{},
+		TTL:      time.Minute,
+	})
+	defer selector.Stop()
+
+	auths := []*Auth{
+		{ID: "auth-a"},
+		{ID: "auth-b"},
+		{ID: "auth-c"},
+	}
+	payload := []byte(`{"metadata":{"user_id":"user_xxx_account__session_busy-test-uuid"}}`)
+	opts := cliproxyexecutor.Options{OriginalRequest: payload}
+
+	home, errPick := selector.Pick(context.Background(), "claude", "claude-3", opts, auths)
+	if errPick != nil {
+		t.Fatalf("Pick() error = %v", errPick)
+	}
+
+	// The bound credential is at its cap, so admission removed it from the
+	// candidates and reported it as busy rather than unavailable.
+	others := make([]*Auth, 0, len(auths)-1)
+	for _, auth := range auths {
+		if auth.ID != home.ID {
+			others = append(others, auth)
+		}
+	}
+	busyCtx := withBusyCredentials(context.Background(), map[string]struct{}{home.ID: {}})
+	spilled, errSpill := selector.Pick(busyCtx, "claude", "claude-3", opts, others)
+	if errSpill != nil {
+		t.Fatalf("Pick() while busy error = %v", errSpill)
+	}
+	if spilled.ID == home.ID {
+		t.Fatalf("Pick() while busy returned the saturated credential %q", home.ID)
+	}
+
+	// With room again, the session must return home rather than stay on the spill.
+	back, errBack := selector.Pick(context.Background(), "claude", "claude-3", opts, auths)
+	if errBack != nil {
+		t.Fatalf("Pick() after the busy moment error = %v", errBack)
+	}
+	if back.ID != home.ID {
+		t.Fatalf("binding moved from %q to %q after a busy moment", home.ID, back.ID)
+	}
+}
+
 func TestExtractSessionID_NestedRequestSubagent(t *testing.T) {
 	t.Parallel()
 

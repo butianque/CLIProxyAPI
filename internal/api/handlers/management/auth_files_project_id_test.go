@@ -123,6 +123,26 @@ func TestListAuthFilesFromDisk_IncludesWebsockets(t *testing.T) {
 	}
 }
 
+// The disk listing is the panel's fallback view for files the manager has not
+// loaded yet, so it must report the cap the same way the scheduler reads it. Both
+// the number and the numeric string form are accepted on read.
+func TestListAuthFilesFromDisk_IncludesMaxConcurrency(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	authDir := t.TempDir()
+	filePath := filepath.Join(authDir, "codex-user@example.com-pro.json")
+	if errWrite := os.WriteFile(filePath, []byte(`{"type":"codex","email":"user@example.com","max_concurrency":"4"}`), 0o600); errWrite != nil {
+		t.Fatalf("failed to write auth file: %v", errWrite)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, nil)
+
+	entry := firstAuthFileEntry(t, h)
+	if got := entry["max_concurrency"]; got != float64(4) {
+		t.Fatalf("expected max_concurrency 4, got %#v", got)
+	}
+}
+
 func firstAuthFileEntry(t *testing.T, h *Handler) map[string]any {
 	t.Helper()
 

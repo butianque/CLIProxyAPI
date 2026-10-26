@@ -750,6 +750,49 @@ func selectionArgForSelector(selector Selector, routeModel string) string {
 	return routeModel
 }
 
+// busyCredentialsKey carries the set of credentials that were skipped because they
+// are at their concurrency cap.
+type busyCredentialsKey struct{}
+
+func withBusyCredentials(ctx context.Context, busy map[string]struct{}) context.Context {
+	if len(busy) == 0 {
+		return ctx
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, busyCredentialsKey{}, busy)
+}
+
+func busyCredentialsFromContext(ctx context.Context) map[string]struct{} {
+	if ctx == nil {
+		return nil
+	}
+	busy, _ := ctx.Value(busyCredentialsKey{}).(map[string]struct{})
+	return busy
+}
+
+// withoutBusyCredential drops one credential from the candidate lists after its
+// reservation lost a race, so the retry cannot select it again.
+func withoutBusyCredential(available, selectorAuths []*Auth, authID string, busy map[string]struct{}) ([]*Auth, []*Auth, map[string]struct{}) {
+	pruned := make(map[string]struct{}, len(busy)+1)
+	for id := range busy {
+		pruned[id] = struct{}{}
+	}
+	pruned[authID] = struct{}{}
+	keep := func(list []*Auth) []*Auth {
+		out := make([]*Auth, 0, len(list))
+		for _, auth := range list {
+			if auth != nil && auth.ID == authID {
+				continue
+			}
+			out = append(out, auth)
+		}
+		return out
+	}
+	return keep(available), keep(selectorAuths), pruned
+}
+
 func selectorContextForAvailableAuths(ctx context.Context, selector Selector, routeModel string) context.Context {
 	ctx = withWeightedSelectorStateModel(ctx, selector, routeModel)
 	if !isBuiltInSelector(selector) {
@@ -1967,24 +2010,58 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	}
 	m.mu.RUnlock()
 
-	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, provider, []string{provider}, model, opts, tried, available)
-	if errPick != nil {
-		m.warnLogAuthUnavailable(ctx, []string{provider}, model, opts, tried, errPick)
-		return nil, nil, errPick
+	// A credential at its concurrency cap is healthy, only busy, so it is removed
+	// from the candidate lists here rather than marked unavailable. Spilling to
+	// another credential happens inside this one pick: no error is raised, no
+	// result is recorded, and no cooldown starts.
+	available, selectorAuths, busy, errAdmit := m.admitCredentialConcurrency(ctx, available, selectorAuths)
+	if errAdmit != nil {
+		m.warnLogAuthUnavailable(ctx, []string{provider}, model, opts, tried, errAdmit)
+		return nil, nil, errAdmit
 	}
-	if !handled {
-		selectorCtx := selectorContextForAvailableAuths(ctx, selector, model)
-		selected, errPick = selector.Pick(selectorCtx, provider, selectionArgForSelector(selector, model), opts, selectorAuths)
+
+	// The reservation retry loop re-selects, so all three results are declared
+	// outside it. Short declarations inside would shadow the selected credential
+	// and leave the caller holding nil.
+	var selected *Auth
+	var handled bool
+	var errPick error
+	for holdAttempt := 0; ; holdAttempt++ {
+		selected, handled, errPick = m.pickViaPluginScheduler(ctx, pluginScheduler, provider, []string{provider}, model, opts, tried, available)
 		if errPick != nil {
-			if isBuiltInSelector(selector) {
-				errPick = restoreModelCooldownErrorModel(errPick, model)
-			}
 			m.warnLogAuthUnavailable(ctx, []string{provider}, model, opts, tried, errPick)
 			return nil, nil, errPick
 		}
-	}
-	if selected == nil {
-		return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+		if !handled {
+			selectorCtx := selectorContextForAvailableAuths(ctx, selector, model)
+			// Tell the selector which credentials are only busy, so it keeps the
+			// session-affinity binding instead of migrating it to another credential.
+			selectorCtx = withBusyCredentials(selectorCtx, busy)
+			selected, errPick = selector.Pick(selectorCtx, provider, selectionArgForSelector(selector, model), opts, selectorAuths)
+			if errPick != nil {
+				if isBuiltInSelector(selector) {
+					errPick = restoreModelCooldownErrorModel(errPick, model)
+				}
+				m.warnLogAuthUnavailable(ctx, []string{provider}, model, opts, tried, errPick)
+				return nil, nil, errPick
+			}
+		}
+		if selected == nil {
+			return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+		}
+		if m.holdCredentialSlot(ctx, selected) {
+			break
+		}
+		// Admission is a snapshot; another request took the last slot between it and
+		// this reservation. Drop the credential and select again, because the cap is
+		// enforced by the reservation, not by the snapshot.
+		if holdAttempt+1 >= credentialCapHoldAttempts {
+			return nil, nil, newCredentialConcurrencyBusyError(len(busy))
+		}
+		available, selectorAuths, busy = withoutBusyCredential(available, selectorAuths, selected.ID, busy)
+		if len(selectorAuths) == 0 {
+			return nil, nil, newCredentialConcurrencyBusyError(len(busy))
+		}
 	}
 	authCopy := selected.Clone()
 	if !selected.indexAssigned {
@@ -2172,7 +2249,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = provider
 	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = model
 
-	if m.hasPluginScheduler() || !m.useSchedulerFastPath() {
+	if m.hasPluginScheduler() || !m.useSchedulerFastPath() || m.credentialCapPressure([]string{provider}) {
 		return m.pickNextLegacy(ctx, provider, model, opts, tried)
 	}
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
@@ -2211,6 +2288,13 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 	}
 	if selected == nil {
 		return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+	}
+	if !m.holdCredentialSlot(ctx, selected) {
+		// The pool became saturated between the pressure check and this
+		// reservation. Hand the pick to the general path, which filters saturated
+		// credentials out of the candidate list and reports the busy error when
+		// nothing is left.
+		return m.pickNextLegacy(ctx, provider, model, opts, tried)
 	}
 	authCopy := selected.Clone()
 	if !selected.indexAssigned {
@@ -2332,24 +2416,58 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	}
 	m.mu.RUnlock()
 
-	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, "mixed", providers, model, opts, tried, available)
-	if errPick != nil {
-		m.warnLogAuthUnavailable(ctx, providers, model, opts, tried, errPick)
-		return nil, nil, "", errPick
+	// A credential at its concurrency cap is healthy, only busy, so it is removed
+	// from the candidate lists here rather than marked unavailable. Spilling to
+	// another credential happens inside this one pick: no error is raised, no
+	// result is recorded, and no cooldown starts.
+	available, selectorAuths, busy, errAdmit := m.admitCredentialConcurrency(ctx, available, selectorAuths)
+	if errAdmit != nil {
+		m.warnLogAuthUnavailable(ctx, providers, model, opts, tried, errAdmit)
+		return nil, nil, "", errAdmit
 	}
-	if !handled {
-		selectorCtx := selectorContextForAvailableAuths(ctx, selector, model)
-		selected, errPick = selector.Pick(selectorCtx, "mixed", selectionArgForSelector(selector, model), opts, selectorAuths)
+
+	// The reservation retry loop re-selects, so all three results are declared
+	// outside it. Short declarations inside would shadow the selected credential
+	// and leave the caller holding nil.
+	var selected *Auth
+	var handled bool
+	var errPick error
+	for holdAttempt := 0; ; holdAttempt++ {
+		selected, handled, errPick = m.pickViaPluginScheduler(ctx, pluginScheduler, "mixed", providers, model, opts, tried, available)
 		if errPick != nil {
-			if isBuiltInSelector(selector) {
-				errPick = restoreModelCooldownErrorModel(errPick, model)
-			}
 			m.warnLogAuthUnavailable(ctx, providers, model, opts, tried, errPick)
 			return nil, nil, "", errPick
 		}
-	}
-	if selected == nil {
-		return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+		if !handled {
+			selectorCtx := selectorContextForAvailableAuths(ctx, selector, model)
+			// Tell the selector which credentials are only busy, so it keeps the
+			// session-affinity binding instead of migrating it to another credential.
+			selectorCtx = withBusyCredentials(selectorCtx, busy)
+			selected, errPick = selector.Pick(selectorCtx, "mixed", selectionArgForSelector(selector, model), opts, selectorAuths)
+			if errPick != nil {
+				if isBuiltInSelector(selector) {
+					errPick = restoreModelCooldownErrorModel(errPick, model)
+				}
+				m.warnLogAuthUnavailable(ctx, providers, model, opts, tried, errPick)
+				return nil, nil, "", errPick
+			}
+		}
+		if selected == nil {
+			return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+		}
+		if m.holdCredentialSlot(ctx, selected) {
+			break
+		}
+		// Admission is a snapshot; another request took the last slot between it and
+		// this reservation. Drop the credential and select again, because the cap is
+		// enforced by the reservation, not by the snapshot.
+		if holdAttempt+1 >= credentialCapHoldAttempts {
+			return nil, nil, "", newCredentialConcurrencyBusyError(len(busy))
+		}
+		available, selectorAuths, busy = withoutBusyCredential(available, selectorAuths, selected.ID, busy)
+		if len(selectorAuths) == 0 {
+			return nil, nil, "", newCredentialConcurrencyBusyError(len(busy))
+		}
 	}
 	providerKey := executorKeyFromAuth(selected)
 	executor, okExecutor := m.Executor(providerKey)
@@ -2376,7 +2494,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = "mixed"
 	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = model
 
-	if m.hasPluginScheduler() || !m.useSchedulerFastPath() {
+	if m.hasPluginScheduler() || !m.useSchedulerFastPath() || m.credentialCapPressure(providers) {
 		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
 	}
 
@@ -2438,6 +2556,13 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	}
 	if selected == nil {
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+	}
+	if !m.holdCredentialSlot(ctx, selected) {
+		// The pool became saturated between the pressure check and this
+		// reservation. Hand the pick to the general path, which filters saturated
+		// credentials out of the candidate list and reports the busy error when
+		// nothing is left.
+		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
 	}
 	executor, okExecutor := m.Executor(providerKey)
 	if !okExecutor {

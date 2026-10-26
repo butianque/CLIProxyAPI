@@ -456,6 +456,17 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, pagination authFilesPagi
 					fileData["note"] = trimmed
 				}
 			}
+			if mv := gjson.GetBytes(data, coreauth.AttributeMaxConcurrency); mv.Exists() {
+				switch mv.Type {
+				case gjson.Number, gjson.String:
+					// ParseAuthMaxConcurrency accepts both the number and the numeric
+					// string form, so the listing agrees with the gate about what the
+					// file asks for.
+					if limit, errLimit := coreauth.ParseAuthMaxConcurrency(mv.Value()); errLimit == nil {
+						fileData[coreauth.AttributeMaxConcurrency] = limit
+					}
+				}
+			}
 			if wv := gjson.GetBytes(data, "websockets"); wv.Exists() {
 				switch wv.Type {
 				case gjson.True:
@@ -778,6 +789,9 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quotaSupported .
 	if weight, ok := authWeightValue(auth); ok {
 		entry[coreauth.AttributeWeight] = weight
 	}
+	if maxConcurrency, ok := authMaxConcurrencyValue(auth); ok {
+		entry[coreauth.AttributeMaxConcurrency] = maxConcurrency
+	}
 	if websockets, ok := authWebsocketsValue(auth); ok {
 		entry["websockets"] = websockets
 	}
@@ -833,6 +847,25 @@ func modelQuotaObservationPayload(provider string, states map[string]*coreauth.M
 		observations[model] = quotaObservationPayloadForProvider(provider, state.Quota)
 	}
 	return observations
+}
+
+// authMaxConcurrencyValue reports the per-credential cap stored in the auth file.
+// An absent value means "inherit the provider default", so it is left out of the
+// payload entirely: the panel must be able to tell inherit from an explicit 0,
+// which disables the cap.
+func authMaxConcurrencyValue(auth *coreauth.Auth) (int, bool) {
+	if auth == nil || auth.Metadata == nil {
+		return 0, false
+	}
+	raw, ok := auth.Metadata[coreauth.AttributeMaxConcurrency]
+	if !ok || raw == nil {
+		return 0, false
+	}
+	limit, errLimit := coreauth.ParseAuthMaxConcurrency(raw)
+	if errLimit != nil {
+		return 0, false
+	}
+	return limit, true
 }
 
 func authWeightValue(auth *coreauth.Auth) (int64, bool) {

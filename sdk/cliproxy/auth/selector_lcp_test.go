@@ -68,6 +68,66 @@ func TestSessionAffinitySelectorLCPPreservesBindingAcrossConversationGrowth(t *t
 	}
 }
 
+// The LCP path follows the same rule as the cache path: a credential that is only
+// at its concurrency cap serves this request elsewhere without losing the session.
+func TestSessionAffinitySelectorLCPBusyCredentialSpillsWithoutRebinding(t *testing.T) {
+	t.Parallel()
+
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: lastAuthSelector{},
+		TTL:      time.Minute,
+	})
+	defer selector.Stop()
+
+	auths := []*Auth{{ID: "auth-a"}, {ID: "auth-b"}}
+	options := func() cliproxyexecutor.Options {
+		return cliproxyexecutor.Options{
+			SourceFormat:    sdktranslator.FormatOpenAI,
+			OriginalRequest: []byte(`{"messages":[{"role":"system","content":"stable"},{"role":"user","content":"first"}]}`),
+			Metadata: map[string]any{
+				cliproxyexecutor.CallerScopeMetadataKey: "caller-a",
+			},
+		}
+	}
+
+	boundOpts := options()
+	bound, errBound := selector.Pick(context.Background(), "openai", "model", boundOpts, auths)
+	if errBound != nil {
+		t.Fatalf("first Pick() error = %v", errBound)
+	}
+	if bound.ID != "auth-b" {
+		t.Fatalf("first Pick() = %q, want auth-b", bound.ID)
+	}
+	boundSessionID, _ := boundOpts.Metadata[cliproxyexecutor.CanonicalSessionIDMetadataKey].(string)
+	if boundSessionID == "" {
+		t.Fatal("first Pick() recorded no canonical session ID")
+	}
+
+	// auth-b is at its cap, so admission removed it and reported it as busy.
+	busyCtx := withBusyCredentials(context.Background(), map[string]struct{}{"auth-b": {}})
+	spillOpts := options()
+	spilled, errSpill := selector.Pick(busyCtx, "openai", "model", spillOpts, []*Auth{{ID: "auth-a"}})
+	if errSpill != nil {
+		t.Fatalf("Pick() while busy error = %v", errSpill)
+	}
+	if spilled.ID != "auth-a" {
+		t.Fatalf("Pick() while busy = %q, want the spill target auth-a", spilled.ID)
+	}
+	// The spilled request is the same session, so it must be accounted as such
+	// rather than appearing as a fresh session with no identity.
+	if got, _ := spillOpts.Metadata[cliproxyexecutor.CanonicalSessionIDMetadataKey].(string); got != boundSessionID {
+		t.Fatalf("spilled request session ID = %q, want %q", got, boundSessionID)
+	}
+
+	back, errBack := selector.Pick(context.Background(), "openai", "model", options(), auths)
+	if errBack != nil {
+		t.Fatalf("Pick() after the busy moment error = %v", errBack)
+	}
+	if back.ID != "auth-b" {
+		t.Fatalf("LCP binding moved from auth-b to %q after a busy moment", back.ID)
+	}
+}
+
 func TestSessionAffinitySelectorLCPSkipsWhenCallerScopeMissing(t *testing.T) {
 	t.Parallel()
 
