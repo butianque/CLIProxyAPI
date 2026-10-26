@@ -249,6 +249,15 @@ func pluginVersionSegment(segments []string, index int) (int64, bool) {
 	return number, true
 }
 
+// cleanupUnselectedPluginFiles removes plugin files that a loaded file has
+// provably superseded.
+//
+// Only a strictly older version of the same plugin is deleted. A file that is
+// newer than the loaded one is kept and logged, because that combination means
+// the host is not running the newest artifact on disk (a pinned
+// `plugins.configs.<id>.version`, or a load that failed), and deleting it would
+// destroy the very file the operator just dropped in. Files with no version
+// segment, or versions that cannot be ordered, are kept for the same reason.
 func cleanupUnselectedPluginFiles(root string, loaded []pluginFile) error {
 	if len(loaded) == 0 {
 		return nil
@@ -257,25 +266,34 @@ func cleanupUnselectedPluginFiles(root string, loaded []pluginFile) error {
 	if errSelect != nil {
 		return errSelect
 	}
-	loadedByID := make(map[string]map[string]struct{}, len(loaded))
+	loadedByID := make(map[string][]pluginFile, len(loaded))
 	for _, file := range loaded {
 		if strings.TrimSpace(file.ID) == "" || strings.TrimSpace(file.Path) == "" {
 			continue
 		}
-		paths := loadedByID[file.ID]
-		if paths == nil {
-			paths = make(map[string]struct{})
-			loadedByID[file.ID] = paths
-		}
-		paths[filepath.Clean(file.Path)] = struct{}{}
+		loadedByID[file.ID] = append(loadedByID[file.ID], file)
 	}
 	var errs []error
 	for _, candidate := range candidates {
-		paths := loadedByID[candidate.ID]
-		if len(paths) == 0 {
+		loadedFiles := loadedByID[candidate.ID]
+		if len(loadedFiles) == 0 {
 			continue
 		}
-		if _, selected := paths[filepath.Clean(candidate.Path)]; selected {
+		candidatePath := filepath.Clean(candidate.Path)
+		selected := false
+		for _, file := range loadedFiles {
+			if filepath.Clean(file.Path) == candidatePath {
+				selected = true
+				break
+			}
+		}
+		if selected {
+			continue
+		}
+		supersededBy, superseded := supersededPluginVersion(candidate.Version, loadedFiles)
+		if !superseded {
+			log.WithFields(pluginLogFields(candidate.ID, "", candidate.Version, candidate.Path)).
+				Warn("pluginhost: keeping plugin file that is not older than the loaded one")
 			continue
 		}
 		if errRemove := os.Remove(candidate.Path); errRemove != nil && !errors.Is(errRemove, os.ErrNotExist) {
@@ -283,9 +301,29 @@ func cleanupUnselectedPluginFiles(root string, loaded []pluginFile) error {
 			log.WithError(errRemove).Warnf("pluginhost: failed to remove old plugin file %s", candidate.Path)
 			continue
 		}
-		log.WithFields(pluginLogFields(candidate.ID, "", candidate.Version, candidate.Path)).Info("pluginhost: old plugin file removed")
+		fields := pluginLogFields(candidate.ID, "", candidate.Version, candidate.Path)
+		fields["superseded_by"] = supersededBy
+		log.WithFields(fields).Info("pluginhost: old plugin file removed")
 	}
 	return errors.Join(errs...)
+}
+
+// supersededPluginVersion reports whether version is strictly older than a
+// version among loaded, and returns the loaded version that supersedes it.
+func supersededPluginVersion(version string, loaded []pluginFile) (string, bool) {
+	if version == "" {
+		return "", false
+	}
+	for _, file := range loaded {
+		if file.Version == "" {
+			continue
+		}
+		comparison, comparable := comparePluginVersions(version, file.Version)
+		if comparable && comparison < 0 {
+			return file.Version, true
+		}
+	}
+	return "", false
 }
 
 // DiscoverPluginFiles returns plugin binaries selected by the current host discovery rules.

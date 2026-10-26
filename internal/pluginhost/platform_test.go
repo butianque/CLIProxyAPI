@@ -219,3 +219,72 @@ func TestSelectPluginFilesSkipsPluginWhenConfiguredVersionIsMissing(t *testing.T
 		t.Fatalf("selectPluginFiles() = %v, want no selected alpha plugin", files)
 	}
 }
+
+func TestCleanupUnselectedPluginFilesKeepsANewerFileThanTheLoadedOne(t *testing.T) {
+	root := t.TempDir()
+	extension := pluginExtension(runtime.GOOS)
+	loadedPath := filepath.Join(root, "alpha-v1.0.3"+extension)
+	newerPath := filepath.Join(root, "alpha-v1.0.4"+extension)
+	for _, path := range []string{loadedPath, newerPath} {
+		if errWriteFile := os.WriteFile(path, []byte("x"), 0o644); errWriteFile != nil {
+			t.Fatalf("WriteFile(%s) error = %v", path, errWriteFile)
+		}
+	}
+
+	loaded := []pluginFile{{ID: "alpha", Path: loadedPath, Version: "1.0.3"}}
+	if errCleanup := cleanupUnselectedPluginFiles(root, loaded); errCleanup != nil {
+		t.Fatalf("cleanupUnselectedPluginFiles() error = %v", errCleanup)
+	}
+
+	if _, errStat := os.Stat(newerPath); errStat != nil {
+		t.Fatalf("newer plugin file %s was removed although it is newer than the loaded one: %v", newerPath, errStat)
+	}
+	if _, errStat := os.Stat(loadedPath); errStat != nil {
+		t.Fatalf("loaded plugin file %s must be kept: %v", loadedPath, errStat)
+	}
+}
+
+func TestCleanupUnselectedPluginFilesRemovesAProvablyOlderFile(t *testing.T) {
+	root := t.TempDir()
+	extension := pluginExtension(runtime.GOOS)
+	loadedPath := filepath.Join(root, "alpha-v1.0.4"+extension)
+	olderPath := filepath.Join(root, "alpha-v1.0.3"+extension)
+	for _, path := range []string{loadedPath, olderPath} {
+		if errWriteFile := os.WriteFile(path, []byte("x"), 0o644); errWriteFile != nil {
+			t.Fatalf("WriteFile(%s) error = %v", path, errWriteFile)
+		}
+	}
+
+	loaded := []pluginFile{{ID: "alpha", Path: loadedPath, Version: "1.0.4"}}
+	if errCleanup := cleanupUnselectedPluginFiles(root, loaded); errCleanup != nil {
+		t.Fatalf("cleanupUnselectedPluginFiles() error = %v", errCleanup)
+	}
+
+	if _, errStat := os.Stat(olderPath); !os.IsNotExist(errStat) {
+		t.Fatalf("older plugin file %s must be removed, stat error = %v", olderPath, errStat)
+	}
+	if _, errStat := os.Stat(loadedPath); errStat != nil {
+		t.Fatalf("loaded plugin file %s must be kept: %v", loadedPath, errStat)
+	}
+}
+
+func TestCleanupUnselectedPluginFilesKeepsAFileWithoutAVersion(t *testing.T) {
+	root := t.TempDir()
+	extension := pluginExtension(runtime.GOOS)
+	loadedPath := filepath.Join(root, "alpha-v1.0.4"+extension)
+	unversionedPath := filepath.Join(root, "alpha"+extension)
+	for _, path := range []string{loadedPath, unversionedPath} {
+		if errWriteFile := os.WriteFile(path, []byte("x"), 0o644); errWriteFile != nil {
+			t.Fatalf("WriteFile(%s) error = %v", path, errWriteFile)
+		}
+	}
+
+	loaded := []pluginFile{{ID: "alpha", Path: loadedPath, Version: "1.0.4"}}
+	if errCleanup := cleanupUnselectedPluginFiles(root, loaded); errCleanup != nil {
+		t.Fatalf("cleanupUnselectedPluginFiles() error = %v", errCleanup)
+	}
+
+	if _, errStat := os.Stat(unversionedPath); errStat != nil {
+		t.Fatalf("plugin file without a version segment must be kept, stat error = %v", errStat)
+	}
+}
