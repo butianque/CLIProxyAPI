@@ -481,6 +481,176 @@ func TestPluginTokenStorageRemovesDeletedPriority(t *testing.T) {
 	}
 }
 
+// TestPluginTokenStorageDropsClearedEgress pins that releasing a credential from
+// its exit really clears the address.
+//
+// The plugin models the exit itself, so the address lives twice: in the host's
+// metadata and in the plugin's own payload. Laying the metadata over the payload
+// can only add or overwrite, so a key the host deleted from its own map comes
+// back from the payload on the next save. Releasing a credential would then
+// report success, write the old address back to disk, and leave the panel
+// saying the account is still on the exit it was just taken off.
+func TestPluginTokenStorageDropsClearedEgress(t *testing.T) {
+	const address = "socks5://user:pass@10.0.0.2:1080"
+	auth := pluginAuthDataToCoreAuth(pluginapi.AuthData{
+		Provider: "plugin-provider",
+		ID:       "auth-1",
+		FileName: "auth-1.json",
+		Metadata: map[string]any{
+			"type":      "plugin-provider",
+			"egress_id": float64(2),
+			"proxy_url": address,
+			"opened_at": "2026-01-02T03:04:05Z",
+		},
+		StorageJSON: []byte(`{"access_token":"token","proxy_url":"` + address + `"}`),
+	}, "", "auth-1.json", "")
+	if auth == nil {
+		t.Fatal("pluginAuthDataToCoreAuth() = nil, want auth")
+	}
+	// The loader carries the file's host-managed fields onto the record, which is
+	// what puts the exit reference and its address in the host's map.
+	coreauth.MergeExistingAuthMetadata(auth, map[string]any{
+		"egress_id": float64(2),
+		"proxy_url": address,
+	})
+
+	// Releasing the credential: the management surface clears the reference and
+	// the address together, because a leftover address is a silent re-bind.
+	delete(auth.Metadata, "egress_id")
+	delete(auth.Metadata, "proxy_url")
+	auth.ProxyURL = ""
+
+	setter, okSetter := auth.Storage.(interface{ SetMetadata(map[string]any) })
+	if !okSetter {
+		t.Fatalf("storage %T cannot receive metadata", auth.Storage)
+	}
+	setter.SetMetadata(auth.Metadata)
+
+	path := filepath.Join(t.TempDir(), "auth-1.json")
+	if errSave := auth.Storage.(interface{ SaveTokenToFile(string) error }).SaveTokenToFile(path); errSave != nil {
+		t.Fatalf("SaveTokenToFile() error = %v", errSave)
+	}
+	saved, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatalf("ReadFile(saved token) error = %v", errRead)
+	}
+	var payload map[string]any
+	if errUnmarshal := json.Unmarshal(saved, &payload); errUnmarshal != nil {
+		t.Fatalf("decode saved token: %v", errUnmarshal)
+	}
+	if _, exists := payload["proxy_url"]; exists {
+		t.Fatalf("saved token still carries the released exit: %#v", payload)
+	}
+	if _, exists := payload["egress_id"]; exists {
+		t.Fatalf("saved token still names the released exit: %#v", payload)
+	}
+	if payload["access_token"] != "token" {
+		t.Fatalf("saved token lost the plugin's own payload: %#v", payload)
+	}
+	if payload["opened_at"] != "2026-01-02T03:04:05Z" {
+		t.Fatalf("saved token lost metadata the host still holds: %#v", payload)
+	}
+}
+
+// pluginEgressParser republishes a credential the way a plugin does: it models
+// the exit itself, so the address ends up in both the payload and the metadata.
+type pluginEgressParser struct {
+	host *Host
+}
+
+func (p pluginEgressParser) ParseAuth(_ context.Context, req pluginapi.AuthParseRequest) (*coreauth.Auth, bool, error) {
+	var storage struct {
+		APIKey   string `json:"api_key"`
+		ProxyURL string `json:"proxy_url"`
+	}
+	if errUnmarshal := json.Unmarshal(req.RawJSON, &storage); errUnmarshal != nil || storage.APIKey == "" {
+		return nil, false, nil
+	}
+	raw, errMarshal := json.Marshal(storage)
+	if errMarshal != nil {
+		return nil, true, errMarshal
+	}
+	return p.host.AuthDataToCoreAuth(pluginapi.AuthData{
+		Provider:    "zcode",
+		ID:          req.FileName,
+		FileName:    req.FileName,
+		ProxyURL:    storage.ProxyURL,
+		StorageJSON: raw,
+		Metadata:    map[string]any{"proxy_url": storage.ProxyURL},
+	}, req.Path, req.FileName), true, nil
+}
+
+// TestUnbindClearsTheExitOnDisk pins the operator's action from end to end:
+// choosing "direct" for a bound account has to leave no address in the file.
+//
+// The live record is not the answer here, the file is. An unbind that only
+// clears memory looks applied in the panel and comes back on the next load,
+// which is exactly what makes the dropdown report the old exit again.
+func TestUnbindClearsTheExitOnDisk(t *testing.T) {
+	const address = "socks5://user:pass@10.0.0.2:1080"
+	sdkauth.SetEgressResolver(func(int) (string, error) { return address, nil })
+	t.Cleanup(func() { sdkauth.SetEgressResolver(nil) })
+
+	host := New()
+	sdkauth.RegisterPluginAuthParser(pluginEgressParser{host: host})
+	t.Cleanup(func() { sdkauth.RegisterPluginAuthParser(nil) })
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "zcode-1.json")
+	content := []byte(`{"type":"zcode","api_key":"key","egress_id":2,"proxy_url":"` + address + `"}`)
+	if errWrite := os.WriteFile(path, content, 0o600); errWrite != nil {
+		t.Fatalf("write auth file: %v", errWrite)
+	}
+
+	store := sdkauth.NewFileTokenStore()
+	store.SetBaseDir(dir)
+	manager := coreauth.NewManager(store, nil, nil)
+
+	loaded, errList := store.List(context.Background())
+	if errList != nil {
+		t.Fatalf("List error: %v", errList)
+	}
+	if len(loaded) != 1 {
+		t.Fatalf("got %d auths, want 1", len(loaded))
+	}
+	if loaded[0].ProxyURL != address {
+		t.Fatalf("loaded ProxyURL = %q, want the pool's address", loaded[0].ProxyURL)
+	}
+	if _, errRegister := manager.Register(context.Background(), loaded[0]); errRegister != nil {
+		t.Fatalf("Register error: %v", errRegister)
+	}
+
+	live, found := manager.GetByID(loaded[0].ID)
+	if !found || live == nil {
+		t.Fatalf("registered auth %q is not in the manager", loaded[0].ID)
+	}
+	// Choosing "direct" in the panel: the reference and the address go away.
+	delete(live.Metadata, "egress_id")
+	delete(live.Metadata, "proxy_url")
+	live.ProxyURL = ""
+	if _, errUpdate := manager.Update(context.Background(), live); errUpdate != nil {
+		t.Fatalf("Update error: %v", errUpdate)
+	}
+
+	saved, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatalf("read saved auth file: %v", errRead)
+	}
+	var payload map[string]any
+	if errUnmarshal := json.Unmarshal(saved, &payload); errUnmarshal != nil {
+		t.Fatalf("decode saved auth file: %v", errUnmarshal)
+	}
+	if _, exists := payload["proxy_url"]; exists {
+		t.Fatalf("the file still carries the released exit: %#v", payload)
+	}
+	if _, exists := payload["egress_id"]; exists {
+		t.Fatalf("the file still names the released exit: %#v", payload)
+	}
+	if payload["api_key"] != "key" {
+		t.Fatalf("the save lost the credential: %#v", payload)
+	}
+}
+
 func TestHostAuthDataToCoreAuthRejectsMissingProviderAndUsesAuthDir(t *testing.T) {
 	authDir := t.TempDir()
 	host := New()

@@ -536,22 +536,44 @@ type pluginTokenStorage struct {
 	meta     map[string]any
 }
 
+// SetMetadata replaces the host's view of the credential's metadata.
+//
+// A key the host dropped has to leave the payload too. The plugin models some of
+// the same fields the host does — the exit address is one — and merging can only
+// add or overwrite, so a value the host deleted from its own map would be read
+// back from the payload on the next save. Releasing a credential from its exit
+// would then report success, write the old address back to disk, and keep
+// dialing the proxy the operator just took it off.
 func (s *pluginTokenStorage) SetMetadata(meta map[string]any) {
 	if s == nil {
 		return
 	}
-	if _, hadPriority := s.meta["priority"]; hadPriority {
-		if _, hasPriority := meta["priority"]; !hasPriority {
-			var raw map[string]any
-			if errUnmarshal := json.Unmarshal(s.rawJSON, &raw); errUnmarshal == nil {
-				delete(raw, "priority")
-				if cleaned, errMarshal := json.Marshal(raw); errMarshal == nil {
-					s.rawJSON = cleaned
-				}
-			}
+	s.dropRemovedKeys(meta)
+	s.meta = cloneAnyMap(meta)
+}
+
+// dropRemovedKeys removes from the plugin's payload every key the host used to
+// hold and no longer does.
+func (s *pluginTokenStorage) dropRemovedKeys(meta map[string]any) {
+	removed := make([]string, 0, len(s.meta))
+	for key := range s.meta {
+		if _, kept := meta[key]; !kept {
+			removed = append(removed, key)
 		}
 	}
-	s.meta = cloneAnyMap(meta)
+	if len(removed) == 0 {
+		return
+	}
+	var raw map[string]any
+	if errUnmarshal := json.Unmarshal(s.rawJSON, &raw); errUnmarshal != nil || raw == nil {
+		return
+	}
+	for _, key := range removed {
+		delete(raw, key)
+	}
+	if cleaned, errMarshal := json.Marshal(raw); errMarshal == nil {
+		s.rawJSON = cleaned
+	}
 }
 
 func (s *pluginTokenStorage) RawJSON() []byte {
@@ -715,7 +737,7 @@ func pluginAuthDataToCoreAuth(data pluginapi.AuthData, path, fileName string, au
 		ProxyURL:         strings.TrimSpace(data.ProxyURL),
 		Disabled:         data.Disabled,
 		Status:           status,
-		Storage:          &pluginTokenStorage{provider: provider, rawJSON: bytes.Clone(data.StorageJSON), meta: metadata},
+		Storage:          &pluginTokenStorage{provider: provider, rawJSON: bytes.Clone(data.StorageJSON), meta: cloneAnyMap(metadata)},
 		Metadata:         metadata,
 		Attributes:       attributes,
 		CreatedAt:        now,
