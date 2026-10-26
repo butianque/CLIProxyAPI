@@ -901,3 +901,115 @@ func TestPatchAuthFileFields_IDTokenMissingPlanTypeDefaultsToFree(t *testing.T) 
 		t.Fatalf("auth plan_type attribute = %q, want free", got)
 	}
 }
+
+func TestPatchAuthFileFields_ModelMaxConcurrencyRoundTrip(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	authDir := t.TempDir()
+	fileName := "per-model.json"
+	filePath := filepath.Join(authDir, fileName)
+	store := fileauth.NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:         fileName,
+		FileName:   fileName,
+		Provider:   "zcode-bigmodel",
+		Attributes: map[string]string{"path": filePath},
+		Metadata:   map[string]any{"type": "zcode-bigmodel"},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	patch := func(body string) *httptest.ResponseRecorder {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(rec)
+		ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(`{"name":"`+fileName+`",`+body+`}`))
+		ctx.Request.Header.Set("Content-Type", "application/json")
+		h.PatchAuthFileFields(ctx)
+		return rec
+	}
+
+	table := `"model_max_concurrency":[{"model":"GLM-5.3","max_concurrency":1},{"model":"glm-5.3-flash","max_concurrency":0}]`
+	if rec := patch(table); rec.Code != http.StatusOK {
+		t.Fatalf("update status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	entries := authModelMaxConcurrencyEntries(func() *coreauth.Auth {
+		updated, ok := manager.GetByID(fileName)
+		if !ok {
+			t.Fatal("auth missing after update")
+		}
+		return updated
+	}())
+	if len(entries) != 2 {
+		t.Fatalf("runtime model_max_concurrency = %#v, want 2 entries", entries)
+	}
+	if entries[0]["model"] != "GLM-5.3" || entries[0]["max_concurrency"] != 1 {
+		t.Fatalf("first runtime entry = %#v, want GLM-5.3 at 1", entries[0])
+	}
+	if entries[1]["model"] != "glm-5.3-flash" || entries[1]["max_concurrency"] != 0 {
+		t.Fatalf("second runtime entry = %#v, want glm-5.3-flash unlimited", entries[1])
+	}
+
+	raw, errRead := os.ReadFile(filePath)
+	if errRead != nil {
+		t.Fatalf("ReadFile() error = %v", errRead)
+	}
+	var persisted map[string]any
+	if errUnmarshal := json.Unmarshal(raw, &persisted); errUnmarshal != nil {
+		t.Fatalf("Unmarshal() error = %v", errUnmarshal)
+	}
+	persistedTable, okTable := persisted[coreauth.AttributeModelMaxConcurrency].([]any)
+	if !okTable || len(persistedTable) != 2 {
+		t.Fatalf("persisted model_max_concurrency = %#v, want 2 entries", persisted[coreauth.AttributeModelMaxConcurrency])
+	}
+
+	// A duplicate in another case is the same model to the gate, so storing both
+	// would make the effective cap depend on map iteration order.
+	duplicate := `"model_max_concurrency":[{"model":"glm-5.3","max_concurrency":1},{"model":"GLM-5.3","max_concurrency":2}]`
+	for _, body := range []string{
+		duplicate,
+		`"model_max_concurrency":[{"model":"glm-5.3","max_concurrency":-1}]`,
+		`"model_max_concurrency":[{"model":"","max_concurrency":1}]`,
+		`"model_max_concurrency":[{"model":"glm-5.3"}]`,
+		`"model_max_concurrency":[{"model":"glm-5.3","max_concurrency":1.5}]`,
+		`"model_max_concurrency":7`,
+		`"model_max_concurrency.model":"glm-5.3"`,
+	} {
+		if rec := patch(body); rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s status = %d, want 400; body=%s", body, rec.Code, rec.Body.String())
+		}
+	}
+
+	if rec := patch(`"model_max_concurrency":null`); rec.Code != http.StatusOK {
+		t.Fatalf("reset status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	updated, _ := manager.GetByID(fileName)
+	if _, exists := updated.Metadata[coreauth.AttributeModelMaxConcurrency]; exists {
+		t.Fatal("runtime model_max_concurrency remains after reset")
+	}
+}
+
+func TestAuthModelMaxConcurrencyEntriesSkipsUnusableRows(t *testing.T) {
+	auth := &coreauth.Auth{Metadata: map[string]any{
+		coreauth.AttributeModelMaxConcurrency: []any{
+			map[string]any{"model": " glm-5.3 ", "max_concurrency": "2"},
+			map[string]any{"model": "broken", "max_concurrency": -1},
+			map[string]any{"model": "", "max_concurrency": 3},
+			"not-an-object",
+		},
+	}}
+	entries := authModelMaxConcurrencyEntries(auth)
+	if len(entries) != 1 {
+		t.Fatalf("entries = %#v, want only the usable row", entries)
+	}
+	if entries[0]["model"] != "glm-5.3" || entries[0]["max_concurrency"] != 2 {
+		t.Fatalf("entry = %#v, want glm-5.3 at 2", entries[0])
+	}
+	if got := authModelMaxConcurrencyEntries(nil); len(got) != 0 {
+		t.Fatalf("nil auth entries = %#v, want empty", got)
+	}
+}

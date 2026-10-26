@@ -306,6 +306,16 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 			delete(req, key)
 		}
 	}
+	modelMaxConcurrencyPatch, errModelMaxConcurrency := decodeAuthFileModelMaxConcurrencyPatch(req)
+	if errModelMaxConcurrency != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errModelMaxConcurrency.Error()})
+		return
+	}
+	for key := range req {
+		if strings.TrimSpace(key) == coreauth.AttributeModelMaxConcurrency {
+			delete(req, key)
+		}
+	}
 
 	ctx := c.Request.Context()
 
@@ -410,6 +420,22 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		} else {
 			targetAuth.Metadata["request_retry"] = *requestRetryPatch.Value
 		}
+		changed = true
+	}
+	if modelMaxConcurrencyPatch.Set {
+		if targetAuth.Metadata == nil {
+			targetAuth.Metadata = make(map[string]any)
+		}
+		if modelMaxConcurrencyPatch.Entries == nil {
+			delete(targetAuth.Metadata, coreauth.AttributeModelMaxConcurrency)
+		} else if len(modelMaxConcurrencyPatch.Entries) == 0 {
+			// An empty list and a null both mean "no per-model cap configured";
+			// storing [] would only make the file noisier than the state it means.
+			delete(targetAuth.Metadata, coreauth.AttributeModelMaxConcurrency)
+		} else {
+			targetAuth.Metadata[coreauth.AttributeModelMaxConcurrency] = modelMaxConcurrencyPatch.Entries
+		}
+		touchedRoots[coreauth.AttributeModelMaxConcurrency] = struct{}{}
 		changed = true
 	}
 	if changed {
@@ -558,6 +584,90 @@ func decodeAuthFileRequestRetryPatch(fields map[string]json.RawMessage) (authFil
 		return authFileRequestRetryPatch{Set: true}, nil
 	}
 	return authFileRequestRetryPatch{Set: true, Value: &normalized}, nil
+}
+
+// authFileModelMaxConcurrencyPatch carries one model_max_concurrency update.
+// Entries == nil with Set == true means "delete the key".
+type authFileModelMaxConcurrencyPatch struct {
+	Set     bool
+	Entries []map[string]any
+}
+
+func decodeAuthFileModelMaxConcurrencyPatch(fields map[string]json.RawMessage) (authFileModelMaxConcurrencyPatch, error) {
+	var raw json.RawMessage
+	found := false
+	for key, value := range fields {
+		fieldPath := strings.TrimSpace(key)
+		fieldRoot := rootAuthFileField(fieldPath)
+		if fieldRoot == coreauth.AttributeModelMaxConcurrency && fieldPath != fieldRoot {
+			return authFileModelMaxConcurrencyPatch{}, fmt.Errorf("%s does not support nested fields", coreauth.AttributeModelMaxConcurrency)
+		}
+		if fieldPath == coreauth.AttributeModelMaxConcurrency {
+			found = true
+			raw = value
+		}
+	}
+	if !found {
+		return authFileModelMaxConcurrencyPatch{}, nil
+	}
+	value, errDecode := decodeAuthFileFieldValue(raw)
+	if errDecode != nil {
+		return authFileModelMaxConcurrencyPatch{}, fmt.Errorf("%s must be a list of {model, max_concurrency} objects or null", coreauth.AttributeModelMaxConcurrency)
+	}
+	if value == nil {
+		return authFileModelMaxConcurrencyPatch{Set: true}, nil
+	}
+	entries, errEntries := normalizeAuthFileModelMaxConcurrency(value)
+	if errEntries != nil {
+		return authFileModelMaxConcurrencyPatch{}, errEntries
+	}
+	return authFileModelMaxConcurrencyPatch{Set: true, Entries: entries}, nil
+}
+
+// normalizeAuthFileModelMaxConcurrency validates a per-model cap table and
+// returns it in the stored shape. Validation happens here rather than at read
+// time because a stored cap the gate cannot honor is silently ignored, which
+// would turn a panel typo into a cap that never applies.
+func normalizeAuthFileModelMaxConcurrency(value any) ([]map[string]any, error) {
+	var items []any
+	switch typed := value.(type) {
+	case []any:
+		items = typed
+	case map[string]any:
+		for model, limit := range typed {
+			items = append(items, map[string]any{"model": model, "max_concurrency": limit})
+		}
+	default:
+		return nil, fmt.Errorf("%s must be a list of {model, max_concurrency} objects or null", coreauth.AttributeModelMaxConcurrency)
+	}
+	entries := make([]map[string]any, 0, len(items))
+	seen := make(map[string]struct{}, len(items))
+	for index, item := range items {
+		entry, okEntry := item.(map[string]any)
+		if !okEntry {
+			return nil, fmt.Errorf("%s[%d] must be an object with model and max_concurrency", coreauth.AttributeModelMaxConcurrency, index)
+		}
+		model, _ := entry["model"].(string)
+		model = strings.TrimSpace(model)
+		if model == "" {
+			return nil, fmt.Errorf("%s[%d].model is required", coreauth.AttributeModelMaxConcurrency, index)
+		}
+		limitRaw, hasLimit := entry["max_concurrency"]
+		if !hasLimit || limitRaw == nil {
+			return nil, fmt.Errorf("%s[%d].max_concurrency is required", coreauth.AttributeModelMaxConcurrency, index)
+		}
+		limit, errLimit := coreauth.ParseAuthMaxConcurrency(limitRaw)
+		if errLimit != nil {
+			return nil, fmt.Errorf("%s[%s]: %w", coreauth.AttributeModelMaxConcurrency, model, errLimit)
+		}
+		dedupeKey := strings.ToLower(model)
+		if _, duplicated := seen[dedupeKey]; duplicated {
+			return nil, fmt.Errorf("%s has a duplicate entry for model %s", coreauth.AttributeModelMaxConcurrency, model)
+		}
+		seen[dedupeKey] = struct{}{}
+		entries = append(entries, map[string]any{"model": model, "max_concurrency": limit})
+	}
+	return entries, nil
 }
 
 func rootAuthFileField(path string) string {

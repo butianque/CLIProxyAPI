@@ -2014,7 +2014,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	// from the candidate lists here rather than marked unavailable. Spilling to
 	// another credential happens inside this one pick: no error is raised, no
 	// result is recorded, and no cooldown starts.
-	available, selectorAuths, busy, errAdmit := m.admitCredentialConcurrency(ctx, available, selectorAuths)
+	available, selectorAuths, busy, errAdmit := m.admitCredentialConcurrency(ctx, available, selectorAuths, model)
 	if errAdmit != nil {
 		m.warnLogAuthUnavailable(ctx, []string{provider}, model, opts, tried, errAdmit)
 		return nil, nil, errAdmit
@@ -2049,7 +2049,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if selected == nil {
 			return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 		}
-		if m.holdCredentialSlot(ctx, selected) {
+		if m.holdCredentialSlot(ctx, selected, model) {
 			break
 		}
 		// Admission is a snapshot; another request took the last slot between it and
@@ -2249,7 +2249,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = provider
 	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = model
 
-	if m.hasPluginScheduler() || !m.useSchedulerFastPath() || m.credentialCapPressure([]string{provider}) {
+	if m.hasPluginScheduler() || !m.useSchedulerFastPath() || m.credentialCapPressure([]string{provider}, model) {
 		return m.pickNextLegacy(ctx, provider, model, opts, tried)
 	}
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
@@ -2289,7 +2289,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 	if selected == nil {
 		return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 	}
-	if !m.holdCredentialSlot(ctx, selected) {
+	if !m.holdCredentialSlot(ctx, selected, model) {
 		// The pool became saturated between the pressure check and this
 		// reservation. Hand the pick to the general path, which filters saturated
 		// credentials out of the candidate list and reports the busy error when
@@ -2420,7 +2420,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	// from the candidate lists here rather than marked unavailable. Spilling to
 	// another credential happens inside this one pick: no error is raised, no
 	// result is recorded, and no cooldown starts.
-	available, selectorAuths, busy, errAdmit := m.admitCredentialConcurrency(ctx, available, selectorAuths)
+	available, selectorAuths, busy, errAdmit := m.admitCredentialConcurrency(ctx, available, selectorAuths, model)
 	if errAdmit != nil {
 		m.warnLogAuthUnavailable(ctx, providers, model, opts, tried, errAdmit)
 		return nil, nil, "", errAdmit
@@ -2455,7 +2455,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if selected == nil {
 			return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 		}
-		if m.holdCredentialSlot(ctx, selected) {
+		if m.holdCredentialSlot(ctx, selected, model) {
 			break
 		}
 		// Admission is a snapshot; another request took the last slot between it and
@@ -2494,7 +2494,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = "mixed"
 	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = model
 
-	if m.hasPluginScheduler() || !m.useSchedulerFastPath() || m.credentialCapPressure(providers) {
+	if m.hasPluginScheduler() || !m.useSchedulerFastPath() || m.credentialCapPressure(providers, model) {
 		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
 	}
 
@@ -2557,7 +2557,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	if selected == nil {
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 	}
-	if !m.holdCredentialSlot(ctx, selected) {
+	if !m.holdCredentialSlot(ctx, selected, model) {
 		// The pool became saturated between the pressure check and this
 		// reservation. Hand the pick to the general path, which filters saturated
 		// credentials out of the candidate list and reports the busy error when

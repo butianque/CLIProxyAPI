@@ -467,6 +467,22 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, pagination authFilesPagi
 					}
 				}
 			}
+			if table := gjson.GetBytes(data, coreauth.AttributeModelMaxConcurrency); table.Exists() {
+				entries := make([]map[string]any, 0)
+				for _, item := range table.Array() {
+					model := strings.TrimSpace(item.Get("model").String())
+					if model == "" {
+						continue
+					}
+					limit, errLimit := coreauth.ParseAuthMaxConcurrency(item.Get("max_concurrency").Value())
+					if errLimit != nil {
+						continue
+					}
+					entries = append(entries, map[string]any{"model": model, "max_concurrency": limit})
+				}
+				fileData[coreauth.AttributeModelMaxConcurrency] = entries
+			}
+			fileData["max_concurrency_default"] = coreauth.ProviderDefaultMaxConcurrency(typeValue)
 			if wv := gjson.GetBytes(data, "websockets"); wv.Exists() {
 				switch wv.Type {
 				case gjson.True:
@@ -792,6 +808,10 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quotaSupported .
 	if maxConcurrency, ok := authMaxConcurrencyValue(auth); ok {
 		entry[coreauth.AttributeMaxConcurrency] = maxConcurrency
 	}
+	// The panel edits the per-model table and needs the inherited value to label
+	// the models that are not listed, so both are always present.
+	entry[coreauth.AttributeModelMaxConcurrency] = authModelMaxConcurrencyEntries(auth)
+	entry["max_concurrency_default"] = coreauth.ProviderDefaultMaxConcurrency(auth.Provider)
 	if websockets, ok := authWebsocketsValue(auth); ok {
 		entry["websockets"] = websockets
 	}
@@ -866,6 +886,51 @@ func authMaxConcurrencyValue(auth *coreauth.Auth) (int, bool) {
 		return 0, false
 	}
 	return limit, true
+}
+
+// authModelMaxConcurrencyEntries renders the stored per-model cap table for the
+// panel. Entries the gate would ignore are dropped so the panel never shows a
+// cap that does not apply. The stored model spelling is preserved: the panel
+// echoes it back on save, and rewriting the operator's casing here would make
+// every save look like a change.
+func authModelMaxConcurrencyEntries(auth *coreauth.Auth) []map[string]any {
+	entries := make([]map[string]any, 0)
+	if auth == nil || auth.Metadata == nil {
+		return entries
+	}
+	raw, ok := auth.Metadata[coreauth.AttributeModelMaxConcurrency]
+	if !ok || raw == nil {
+		return entries
+	}
+	var items []any
+	switch typed := raw.(type) {
+	case []any:
+		items = typed
+	case []map[string]any:
+		items = make([]any, 0, len(typed))
+		for _, item := range typed {
+			items = append(items, item)
+		}
+	default:
+		return entries
+	}
+	for _, item := range items {
+		entry, okEntry := item.(map[string]any)
+		if !okEntry || entry == nil {
+			continue
+		}
+		model, _ := entry["model"].(string)
+		model = strings.TrimSpace(model)
+		if model == "" {
+			continue
+		}
+		limit, errLimit := coreauth.ParseAuthMaxConcurrency(entry["max_concurrency"])
+		if errLimit != nil {
+			continue
+		}
+		entries = append(entries, map[string]any{"model": model, "max_concurrency": limit})
+	}
+	return entries
 }
 
 func authWeightValue(auth *coreauth.Auth) (int64, bool) {

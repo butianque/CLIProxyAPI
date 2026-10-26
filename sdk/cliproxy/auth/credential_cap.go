@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -67,6 +68,12 @@ func providerDefaultMaxConcurrency(provider string) int {
 	default:
 		return 2
 	}
+}
+
+// ProviderDefaultMaxConcurrency exposes the provider default cap so the
+// management listing can tell the panel what an unlisted model inherits.
+func ProviderDefaultMaxConcurrency(provider string) int {
+	return providerDefaultMaxConcurrency(provider)
 }
 
 // credentialConcurrencyLimit resolves a credential's effective cap at read time.
@@ -136,6 +143,166 @@ func ParseAuthMaxConcurrency(raw any) (int, error) {
 		return 0, fmt.Errorf("max_concurrency must not be negative")
 	}
 	return limit, nil
+}
+
+// ParseAuthModelMaxConcurrency reads the per-model concurrency table stored on a
+// credential and returns it keyed by normalized model name.
+//
+// The stored shape is a list of {"model", "max_concurrency"} objects, but the
+// {model: limit} object shape and a JSON string carrying either of them are
+// accepted too, because auth files are also edited by hand. An entry that cannot
+// be honored is skipped instead of failing the whole table: a bad file must not
+// take a credential out of service. A later entry for the same model wins.
+//
+// The returned map is never nil and empty means "no per-model cap configured",
+// which falls back to the scalar max_concurrency and then to the provider
+// default.
+func ParseAuthModelMaxConcurrency(raw any) (map[string]int, error) {
+	limits := make(map[string]int)
+	switch value := raw.(type) {
+	case nil:
+		return limits, nil
+	case string:
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			return limits, nil
+		}
+		var decoded any
+		if errUnmarshal := json.Unmarshal([]byte(trimmed), &decoded); errUnmarshal != nil {
+			return limits, fmt.Errorf(`model_max_concurrency must be a list of {"model", "max_concurrency"} objects`)
+		}
+		return ParseAuthModelMaxConcurrency(decoded)
+	case []any:
+		for _, item := range value {
+			addModelConcurrencyEntry(limits, item)
+		}
+		return limits, nil
+	case []map[string]any:
+		for _, item := range value {
+			addModelConcurrencyEntry(limits, item)
+		}
+		return limits, nil
+	case map[string]any:
+		for model, limitRaw := range value {
+			key := credentialModelCapKey(model)
+			if key == "" {
+				continue
+			}
+			limit, errLimit := ParseAuthMaxConcurrency(limitRaw)
+			if errLimit != nil {
+				continue
+			}
+			limits[key] = limit
+		}
+		return limits, nil
+	default:
+		return limits, fmt.Errorf(`model_max_concurrency must be a list of {"model", "max_concurrency"} objects`)
+	}
+}
+
+// addModelConcurrencyEntry folds one stored entry into the table, ignoring an
+// entry the gate could not honor.
+func addModelConcurrencyEntry(limits map[string]int, item any) {
+	entry, okEntry := item.(map[string]any)
+	if !okEntry || entry == nil || limits == nil {
+		return
+	}
+	model, _ := entry["model"].(string)
+	key := credentialModelCapKey(model)
+	if key == "" {
+		return
+	}
+	limit, errLimit := ParseAuthMaxConcurrency(entry["max_concurrency"])
+	if errLimit != nil {
+		return
+	}
+	limits[key] = limit
+}
+
+// credentialModelCapKey normalizes a model name into the key the per-model table
+// is stored under.
+//
+// It folds case on top of the canonical model name because a client sends the
+// model with whatever case it likes while the operator types the name into the
+// panel, and a cap that only matches one spelling would silently not apply.
+func credentialModelCapKey(model string) string {
+	return strings.ToLower(canonicalModelKey(model))
+}
+
+// credentialModelConcurrencyLimits reads the per-model table from an auth.
+// Metadata wins over Attributes, matching how the scalar cap is resolved.
+func credentialModelConcurrencyLimits(auth *Auth) map[string]int {
+	if auth == nil {
+		return nil
+	}
+	if raw, ok := auth.Metadata[AttributeModelMaxConcurrency]; ok {
+		if limits, errParse := ParseAuthModelMaxConcurrency(raw); errParse == nil && len(limits) > 0 {
+			return limits
+		}
+	}
+	if raw, ok := auth.Attributes[AttributeModelMaxConcurrency]; ok {
+		if limits, errParse := ParseAuthModelMaxConcurrency(raw); errParse == nil && len(limits) > 0 {
+			return limits
+		}
+	}
+	return nil
+}
+
+// credentialConcurrencyLimitForModel resolves the cap for one credential serving
+// routeModel.
+//
+// A model listed in the per-model table wins over the scalar cap, whether it was
+// matched through the upstream model name or through the requested one (prefix
+// and alias rewriting can make the two differ). Everything else falls back to the
+// scalar max_concurrency and then to the provider default, so a credential with
+// no table behaves exactly as before.
+func (m *Manager) credentialConcurrencyLimitForModel(auth *Auth, routeModel string) int {
+	if auth == nil {
+		return 0
+	}
+	limits := credentialModelConcurrencyLimits(auth)
+	if len(limits) == 0 {
+		return credentialConcurrencyLimit(auth)
+	}
+	candidates := []string{m.selectionModelKeyForAuth(auth, routeModel), canonicalModelKey(routeModel)}
+	for _, candidate := range candidates {
+		key := credentialModelCapKey(candidate)
+		if key == "" {
+			continue
+		}
+		if limit, okLimit := limits[key]; okLimit {
+			return limit
+		}
+	}
+	return credentialConcurrencyLimit(auth)
+}
+
+// credentialCapScopeKey is the counting key for one credential and one model.
+// An empty model key degrades to the credential-level key, which is what a
+// request without a model name gets.
+func credentialCapScopeKey(auth *Auth, modelKey string) string {
+	key := credentialConcurrencyKey(auth)
+	if key == "" || modelKey == "" {
+		return key
+	}
+	return key + "|" + modelKey
+}
+
+// credentialCapScope resolves the counting key and the cap for one credential
+// serving routeModel.
+//
+// Saturation checks and reservations must agree on the key: a request that was
+// refused by the slot it already holds would spill for no reason.
+func (m *Manager) credentialCapScope(auth *Auth, routeModel string) (string, int) {
+	limit := m.credentialConcurrencyLimitForModel(auth, routeModel)
+	if strings.TrimSpace(routeModel) == "" {
+		return credentialCapScopeKey(auth, ""), limit
+	}
+	modelKey := credentialModelCapKey(m.selectionModelKeyForAuth(auth, routeModel))
+	if modelKey == "" {
+		modelKey = credentialModelCapKey(routeModel)
+	}
+	return credentialCapScopeKey(auth, modelKey), limit
 }
 
 // credentialConcurrencyKey identifies the thing a cap applies to.
@@ -361,16 +528,18 @@ func (l *credentialCapLedger) holds(key string) bool {
 //
 // The reservation lives in a per-request ledger carried by ctx, so it is released
 // exactly once, when the request ends.
-func (m *Manager) holdCredentialSlot(ctx context.Context, auth *Auth) bool {
+func (m *Manager) holdCredentialSlot(ctx context.Context, auth *Auth, routeModel string) bool {
 	ledger := credentialCapLedgerFromContext(ctx)
-	if ledger == nil || auth == nil {
+	if ledger == nil || auth == nil || m == nil {
 		return true
 	}
-	return ledger.hold(credentialConcurrencyKey(auth), m.credentialConcurrencyLimitFor(auth))
+	key, limit := m.credentialCapScope(auth, routeModel)
+	return ledger.hold(key, limit)
 }
 
 // credentialConcurrencyLimitFor resolves the cap for an auth the manager is about
-// to use.
+// to use. It is the model-agnostic fallback; the gate itself resolves the cap per
+// model through credentialConcurrencyLimitForModel.
 func (m *Manager) credentialConcurrencyLimitFor(auth *Auth) int {
 	return credentialConcurrencyLimit(auth)
 }
@@ -378,15 +547,14 @@ func (m *Manager) credentialConcurrencyLimitFor(auth *Auth) int {
 // credentialCapSaturated reports whether the credential has no free slot for this
 // request. It is a snapshot: the authoritative decision is the reservation taken
 // by hold().
-func (m *Manager) credentialCapSaturated(ctx context.Context, auth *Auth) bool {
+func (m *Manager) credentialCapSaturated(ctx context.Context, auth *Auth, routeModel string) bool {
 	if m == nil || m.HomeEnabled() || auth == nil {
 		return false
 	}
-	limit := credentialConcurrencyLimit(auth)
-	if limit <= 0 {
+	key, limit := m.credentialCapScope(auth, routeModel)
+	if key == "" || limit <= 0 {
 		return false
 	}
-	key := credentialConcurrencyKey(auth)
 	if credentialCapLedgerFromContext(ctx).holds(key) {
 		return false
 	}
@@ -400,7 +568,7 @@ func (m *Manager) credentialCapSaturated(ctx context.Context, auth *Auth) bool {
 // When every candidate is saturated the pool is genuinely full: the request waits
 // up to credentialCapQueueWait for a slot and then fails with the same busy error
 // shape Home uses, which short-circuits retry rounds and emits Retry-After.
-func (m *Manager) admitCredentialConcurrency(ctx context.Context, available, selectorAuths []*Auth) ([]*Auth, []*Auth, map[string]struct{}, error) {
+func (m *Manager) admitCredentialConcurrency(ctx context.Context, available, selectorAuths []*Auth, routeModel string) ([]*Auth, []*Auth, map[string]struct{}, error) {
 	if m == nil || m.HomeEnabled() || len(selectorAuths) == 0 {
 		return available, selectorAuths, nil, nil
 	}
@@ -412,7 +580,7 @@ func (m *Manager) admitCredentialConcurrency(ctx context.Context, available, sel
 			if auth == nil {
 				continue
 			}
-			if m.credentialCapSaturated(ctx, auth) {
+			if m.credentialCapSaturated(ctx, auth, routeModel) {
 				saturated[auth.ID] = struct{}{}
 				continue
 			}
@@ -499,7 +667,7 @@ func (m *Manager) credentialCapPollIntervalForTest() time.Duration {
 }
 
 // credentialCapPressure reports whether any credential that could serve these
-// providers is at its concurrency cap right now.
+// providers is at its concurrency cap for this model right now.
 //
 // The scheduler fast path in pickNext/pickNextMixed selects without admission
 // control, so a pick made under pressure is handed to the legacy path, which
@@ -507,7 +675,11 @@ func (m *Manager) credentialCapPollIntervalForTest() time.Duration {
 // keeps a single implementation of admission instead of two: the fast path stays
 // the cheap path while the pool has room, and the general path takes over exactly
 // when a pick has to reason about capacity.
-func (m *Manager) credentialCapPressure(providers []string) bool {
+//
+// The check is per credential and per model: a credential that is full on one
+// model must not make the whole provider look full, or every request would be
+// routed through the legacy path for no reason.
+func (m *Manager) credentialCapPressure(providers []string, routeModel string) bool {
 	if m == nil || m.HomeEnabled() {
 		return false
 	}
@@ -529,7 +701,7 @@ func (m *Manager) credentialCapPressure(providers []string) bool {
 		if _, okProvider := providerSet[canonicalSchedulingProvider(executorKeyFromAuth(auth))]; !okProvider {
 			continue
 		}
-		if m.credentialCapSaturated(nil, auth) {
+		if m.credentialCapSaturated(nil, auth, routeModel) {
 			return true
 		}
 	}
@@ -537,8 +709,8 @@ func (m *Manager) credentialCapPressure(providers []string) bool {
 }
 
 // CredentialConcurrencySnapshot reports in-flight counts and caps for the given
-// credentials. It is read-only and never blocks admission.
-func (m *Manager) CredentialConcurrencySnapshot(auths []*Auth) map[string]CredentialConcurrencyUsage {
+// credentials and model. It is read-only and never blocks admission.
+func (m *Manager) CredentialConcurrencySnapshot(auths []*Auth, routeModel string) map[string]CredentialConcurrencyUsage {
 	out := make(map[string]CredentialConcurrencyUsage, len(auths))
 	if m == nil || m.HomeEnabled() {
 		return out
@@ -547,10 +719,10 @@ func (m *Manager) CredentialConcurrencySnapshot(auths []*Auth) map[string]Creden
 		if auth == nil {
 			continue
 		}
-		key := credentialConcurrencyKey(auth)
+		key, limit := m.credentialCapScope(auth, routeModel)
 		out[auth.ID] = CredentialConcurrencyUsage{
 			InFlight: m.credentialCap.usage(key),
-			Limit:    credentialConcurrencyLimit(auth),
+			Limit:    limit,
 		}
 	}
 	return out

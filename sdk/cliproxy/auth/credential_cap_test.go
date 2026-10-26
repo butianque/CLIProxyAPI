@@ -255,10 +255,10 @@ func TestCredentialCapSpillsToAnIdleCredential(t *testing.T) {
 			t.Fatalf("auth %s success count = %d, want 1", auth.ID, auth.Success)
 		}
 	}
-	if inFlight := manager.CredentialConcurrencySnapshot(manager.List()); len(inFlight) != 2 {
+	if inFlight := manager.CredentialConcurrencySnapshot(manager.List(), ""); len(inFlight) != 2 {
 		t.Fatalf("snapshot entries = %d, want 2", len(inFlight))
 	}
-	for id, usage := range manager.CredentialConcurrencySnapshot(manager.List()) {
+	for id, usage := range manager.CredentialConcurrencySnapshot(manager.List(), "") {
 		if usage.InFlight != 0 || usage.Limit != 1 {
 			t.Fatalf("auth %s snapshot = %+v, want in-flight 0 and limit 1", id, usage)
 		}
@@ -326,7 +326,7 @@ func TestCredentialCapStreamHoldsTheSlotUntilTheLastChunk(t *testing.T) {
 	if got := waitCapCall(t, executor.started); got != "cap-stream-a" {
 		t.Fatalf("stream started on %s", got)
 	}
-	if usage := manager.CredentialConcurrencySnapshot(manager.List())["cap-stream-a"]; usage.InFlight != 1 {
+	if usage := manager.CredentialConcurrencySnapshot(manager.List(), "cap-stream-model")["cap-stream-a"]; usage.InFlight != 1 {
 		t.Fatalf("in-flight during the stream = %d, want 1", usage.InFlight)
 	}
 
@@ -347,7 +347,7 @@ func TestCredentialCapStreamHoldsTheSlotUntilTheLastChunk(t *testing.T) {
 	if chunks < 2 {
 		t.Fatalf("stream chunks = %d, want at least 2", chunks)
 	}
-	if usage := manager.CredentialConcurrencySnapshot(manager.List())["cap-stream-a"]; usage.InFlight != 0 {
+	if usage := manager.CredentialConcurrencySnapshot(manager.List(), "cap-stream-model")["cap-stream-a"]; usage.InFlight != 0 {
 		t.Fatalf("in-flight after the stream drained = %d, want 0", usage.InFlight)
 	}
 
@@ -388,7 +388,7 @@ func TestCredentialCapZeroAdmitsUnlimitedRequests(t *testing.T) {
 			t.Fatalf("execution error = %v, want nil", errExecute)
 		}
 	}
-	if usage := manager.CredentialConcurrencySnapshot(manager.List())["cap-off-a"]; usage.Limit != 0 {
+	if usage := manager.CredentialConcurrencySnapshot(manager.List(), "")["cap-off-a"]; usage.Limit != 0 {
 		t.Fatalf("snapshot limit = %d, want 0 (disabled)", usage.Limit)
 	}
 }
@@ -412,7 +412,7 @@ func TestCredentialCapUsesTheProviderDefault(t *testing.T) {
 	for range 3 {
 		waitCapCall(t, executor.started)
 	}
-	if usage := manager.CredentialConcurrencySnapshot(manager.List())["zcode-default-a"]; usage.InFlight != 3 || usage.Limit != 3 {
+	if usage := manager.CredentialConcurrencySnapshot(manager.List(), "zcode-default-model")["zcode-default-a"]; usage.InFlight != 3 || usage.Limit != 3 {
 		t.Fatalf("snapshot = %+v, want in-flight 3 of limit 3", usage)
 	}
 
@@ -436,7 +436,158 @@ func TestCredentialCapUsesTheProviderDefault(t *testing.T) {
 			t.Fatalf("admitted request error = %v, want nil", errExecute)
 		}
 	}
-	if usage := manager.CredentialConcurrencySnapshot(manager.List())["zcode-default-a"]; usage.InFlight != 0 {
+	if usage := manager.CredentialConcurrencySnapshot(manager.List(), "zcode-default-model")["zcode-default-a"]; usage.InFlight != 0 {
 		t.Fatalf("in-flight after every request finished = %d, want 0", usage.InFlight)
 	}
+}
+
+func TestParseAuthModelMaxConcurrency(t *testing.T) {
+	list := []any{
+		map[string]any{"model": "GLM-5.3", "max_concurrency": 1},
+		map[string]any{"model": "glm-5.3-flash", "max_concurrency": "20"},
+		map[string]any{"model": "", "max_concurrency": 5},
+		map[string]any{"model": "broken", "max_concurrency": -1},
+		map[string]any{"model": "glm-5.3", "max_concurrency": 4},
+	}
+	tests := []struct {
+		name string
+		raw  any
+		want map[string]int
+	}{
+		{name: "nil is empty", raw: nil, want: map[string]int{}},
+		{name: "list folds case and keeps the last duplicate", raw: list, want: map[string]int{"glm-5.3": 4, "glm-5.3-flash": 20}},
+		{name: "object shape is accepted", raw: map[string]any{"glm-5.3": 2}, want: map[string]int{"glm-5.3": 2}},
+		{name: "json string is accepted", raw: `[{"model":"glm-5.3","max_concurrency":6}]`, want: map[string]int{"glm-5.3": 6}},
+		{name: "empty string is empty", raw: "  ", want: map[string]int{}},
+		{name: "zero means unlimited", raw: []any{map[string]any{"model": "glm-5.3", "max_concurrency": 0}}, want: map[string]int{"glm-5.3": 0}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, errParse := ParseAuthModelMaxConcurrency(test.raw)
+			if errParse != nil {
+				t.Fatalf("ParseAuthModelMaxConcurrency(%v) error = %v", test.raw, errParse)
+			}
+			if len(got) != len(test.want) {
+				t.Fatalf("limits = %#v, want %#v", got, test.want)
+			}
+			for model, wantLimit := range test.want {
+				if got[model] != wantLimit {
+					t.Fatalf("limits[%s] = %d, want %d (all: %#v)", model, got[model], wantLimit, got)
+				}
+			}
+		})
+	}
+	if _, errParse := ParseAuthModelMaxConcurrency(42); errParse == nil {
+		t.Fatal("a scalar table must be rejected")
+	}
+}
+
+func TestCredentialConcurrencyLimitForModelFallsBackInOrder(t *testing.T) {
+	auth := &Auth{
+		ID:       "cap-model-resolution",
+		Provider: "zcode-bigmodel",
+		Metadata: map[string]any{
+			AttributeModelMaxConcurrency: []any{
+				map[string]any{"model": "glm-5.3", "max_concurrency": 1},
+				map[string]any{"model": "glm-5.3-flash", "max_concurrency": 0},
+			},
+		},
+	}
+	manager := NewManager(nil, nil, nil)
+
+	if got := manager.credentialConcurrencyLimitForModel(auth, "GLM-5.3"); got != 1 {
+		t.Fatalf("cap for glm-5.3 = %d, want 1", got)
+	}
+	if got := manager.credentialConcurrencyLimitForModel(auth, "glm-5.3-flash"); got != 0 {
+		t.Fatalf("cap for glm-5.3-flash = %d, want 0 (unlimited)", got)
+	}
+	if got := manager.credentialConcurrencyLimitForModel(auth, "glm-5.4"); got != 3 {
+		t.Fatalf("cap for an unlisted model = %d, want the zcode default 3", got)
+	}
+
+	auth.Metadata[AttributeMaxConcurrency] = 7
+	if got := manager.credentialConcurrencyLimitForModel(auth, "glm-5.4"); got != 7 {
+		t.Fatalf("unlisted model must inherit the scalar cap, got %d want 7", got)
+	}
+	if got := manager.credentialConcurrencyLimitForModel(auth, "glm-5.3"); got != 1 {
+		t.Fatalf("a listed model must win over the scalar cap, got %d want 1", got)
+	}
+}
+
+// A cap on one model must not consume another model's slots: the upstream counts
+// concurrency per model, so a credential that is full on glm-5.3 still has room
+// for glm-5.3-flash.
+func TestCredentialCapIsolatesModels(t *testing.T) {
+	manager, _ := newCapTestManager(t, "zcode-models", map[string]any{"zcode-models-a": nil})
+	manager.credentialCapQueueWait = 20 * time.Millisecond
+	manager.credentialCapPollInterval = time.Millisecond
+
+	auth := manager.List()[0]
+	auth.Metadata[AttributeModelMaxConcurrency] = []any{
+		map[string]any{"model": "glm-5.3", "max_concurrency": 1},
+		map[string]any{"model": "glm-5.3-flash", "max_concurrency": 2},
+	}
+
+	hold := func(model string) (context.Context, *credentialCapLedger) {
+		t.Helper()
+		ledger := manager.newCredentialCapLedger()
+		return withCredentialCapLedger(context.Background(), ledger), ledger
+	}
+
+	ctxFirst, ledgerFirst := hold("glm-5.3")
+	if !manager.holdCredentialSlot(ctxFirst, auth, "glm-5.3") {
+		t.Fatal("the first glm-5.3 request must be admitted")
+	}
+	ctxSecond, ledgerSecond := hold("glm-5.3")
+	if manager.holdCredentialSlot(ctxSecond, auth, "glm-5.3") {
+		t.Fatal("the second glm-5.3 request must be refused at a cap of 1")
+	}
+	ctxFlash, ledgerFlash := hold("glm-5.3-flash")
+	if !manager.holdCredentialSlot(ctxFlash, auth, "glm-5.3-flash") {
+		t.Fatal("glm-5.3-flash must not be blocked by a saturated glm-5.3")
+	}
+	if !manager.credentialCapSaturated(ctxSecond, auth, "glm-5.3") {
+		t.Fatal("glm-5.3 must read as saturated")
+	}
+	if manager.credentialCapSaturated(ctxFlash, auth, "glm-5.3-flash") {
+		t.Fatal("glm-5.3-flash must not read as saturated")
+	}
+
+	ledgerFirst.release()
+	if !manager.holdCredentialSlot(ctxSecond, auth, "glm-5.3") {
+		t.Fatal("releasing the first slot must admit the queued glm-5.3 request")
+	}
+	ledgerSecond.release()
+	ledgerFlash.release()
+}
+
+// Pressure is per model as well: one saturated model must not route every request
+// through the legacy scheduler path.
+func TestCredentialCapPressureIsPerModel(t *testing.T) {
+	manager, _ := newCapTestManager(t, "zcode-pressure", map[string]any{"zcode-pressure-a": nil})
+	// Pressure reads the stored auths, not the clone List returns, so the table
+	// has to land on the record the manager iterates.
+	manager.mu.Lock()
+	stored := manager.auths["zcode-pressure-a"]
+	manager.mu.Unlock()
+	if stored == nil {
+		t.Fatal("stored auth zcode-pressure-a missing")
+	}
+	auth := stored
+	auth.Metadata[AttributeModelMaxConcurrency] = []any{
+		map[string]any{"model": "glm-5.3", "max_concurrency": 1},
+	}
+
+	ledger := manager.newCredentialCapLedger()
+	ctx := withCredentialCapLedger(context.Background(), ledger)
+	if !manager.holdCredentialSlot(ctx, auth, "glm-5.3") {
+		t.Fatal("the first glm-5.3 request must be admitted")
+	}
+	if !manager.credentialCapPressure([]string{"zcode-pressure"}, "glm-5.3") {
+		t.Fatal("pressure must report a saturated model")
+	}
+	if manager.credentialCapPressure([]string{"zcode-pressure"}, "glm-5.4") {
+		t.Fatal("pressure must not report an unrelated model as saturated")
+	}
+	ledger.release()
 }

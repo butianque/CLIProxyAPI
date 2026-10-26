@@ -19,6 +19,7 @@ const (
 	AttributeCodexDisableCloaking = "codex_disable_cloaking"
 	AttributeConfigIndex          = "config_index"
 	AttributeMaxConcurrency       = "max_concurrency"
+	AttributeModelMaxConcurrency  = "model_max_concurrency"
 	AttributePath                 = "path"
 	AttributeRuntimeOnly          = "runtime_only"
 	AttributeSource               = "source"
