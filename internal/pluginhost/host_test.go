@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -813,6 +814,77 @@ func TestHostApplyConfigLogsHotReloadActiveAndRetiredVersions(t *testing.T) {
 		if !strings.Contains(logs, want) {
 			t.Fatalf("plugin hot reload log missing %s:\n%s", want, logs)
 		}
+	}
+}
+
+// A rebuild that keeps its filename replaces the library at the same path, so
+// comparing paths alone reports "unchanged" and the host keeps serving the old
+// library. The content fingerprint is what makes that upgrade visible.
+func TestHostApplyConfigReloadsPluginReplacedUnderTheSameName(t *testing.T) {
+	events := &lifecycleEventRecorder{}
+	oldClient := &lifecycleTestClient{call: func(_ context.Context, method string, _ []byte) ([]byte, error) {
+		events.add("old." + method)
+		switch method {
+		case pluginabi.MethodPluginRegister:
+			return lifecycleRegistrationResult(validTestPlugin("alpha"))
+		case pluginabi.MethodPluginQuiesce:
+			return marshalRPCResult(rpcEmptyResponse{})
+		default:
+			return nil, fmt.Errorf("unexpected old plugin method %s", method)
+		}
+	}}
+	replacementClient := &lifecycleTestClient{call: func(_ context.Context, method string, _ []byte) ([]byte, error) {
+		events.add("replacement." + method)
+		switch method {
+		case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
+			return lifecycleRegistrationResult(validTestPlugin("alpha"))
+		default:
+			return nil, fmt.Errorf("unexpected replacement plugin method %s", method)
+		}
+	}}
+	loader := &sequencePluginLoader{clients: []pluginClient{oldClient, replacementClient}}
+	h := NewForTest(loader)
+	t.Cleanup(h.ShutdownAll)
+	pluginsDir, paths := makeVersionedPluginDir(t, "alpha", "1.0.0")
+	cfg := versionedPluginHostConfig(t, pluginsDir, "1.0.0")
+
+	h.ApplyConfig(context.Background(), cfg)
+	// Same filename, different library: the upgrade an operator performs by
+	// dropping a rebuilt artifact over the old one.
+	if errWrite := os.WriteFile(paths["1.0.0"], []byte("rebuilt library"), 0o644); errWrite != nil {
+		t.Fatalf("WriteFile(%s) error = %v", paths["1.0.0"], errWrite)
+	}
+	h.ApplyConfig(context.Background(), cfg)
+
+	if got, want := events.snapshot(), []string{
+		"old." + pluginabi.MethodPluginRegister,
+		"old." + pluginabi.MethodPluginQuiesce,
+		"replacement." + pluginabi.MethodPluginRegister,
+	}; !slices.Equal(got, want) {
+		t.Fatalf("lifecycle events = %v, want %v", got, want)
+	}
+	wantFingerprint, errFingerprint := pluginFileFingerprint(paths["1.0.0"])
+	if errFingerprint != nil {
+		t.Fatalf("pluginFileFingerprint(%s) error = %v", paths["1.0.0"], errFingerprint)
+	}
+	h.mu.Lock()
+	loadedFingerprint := ""
+	if lp := h.loaded["alpha"]; lp != nil {
+		loadedFingerprint = lp.fingerprint
+	}
+	h.mu.Unlock()
+	if loadedFingerprint != wantFingerprint {
+		t.Fatalf("loaded fingerprint = %q, want %q", loadedFingerprint, wantFingerprint)
+	}
+
+	// Re-applying an unchanged config must not reload the library: the loader has
+	// no third client, and a second replacement would leave two retired plugins.
+	h.ApplyConfig(context.Background(), cfg)
+	h.mu.Lock()
+	retiredCount := len(h.retired["alpha"])
+	h.mu.Unlock()
+	if retiredCount != 1 {
+		t.Fatalf("retired plugin count after unchanged re-apply = %d, want 1", retiredCount)
 	}
 }
 

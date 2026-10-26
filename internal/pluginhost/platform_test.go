@@ -101,6 +101,32 @@ func TestSelectPluginFilesFiltersInvalidIDAndDeduplicatesByID(t *testing.T) {
 	}
 }
 
+func TestPluginDirsReportsOnlyExistingScanRoots(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "plugins")
+
+	// A plugin directory that does not exist cannot be watched, and reporting it
+	// would make startup log a failure for a layout the operator does not use.
+	if got := PluginDirs(root); len(got) != 0 {
+		t.Fatalf("PluginDirs(missing root) = %v, want no directories", got)
+	}
+
+	if errMkdirAll := os.MkdirAll(root, 0o755); errMkdirAll != nil {
+		t.Fatalf("MkdirAll(%s) error = %v", root, errMkdirAll)
+	}
+	if got := PluginDirs(root); len(got) != 1 || got[0] != root {
+		t.Fatalf("PluginDirs(root) = %v, want [%s]", got, root)
+	}
+
+	archDir := filepath.Join(root, runtime.GOOS, runtime.GOARCH)
+	if errMkdirAll := os.MkdirAll(archDir, 0o755); errMkdirAll != nil {
+		t.Fatalf("MkdirAll(%s) error = %v", archDir, errMkdirAll)
+	}
+	got := PluginDirs(root)
+	if len(got) != 2 || got[0] != archDir || got[1] != root {
+		t.Fatalf("PluginDirs(root with platform dir) = %v, want [%s %s]", got, archDir, root)
+	}
+}
+
 func TestSelectPluginFilesPrefersPlatformDirOverRootFallback(t *testing.T) {
 	root := t.TempDir()
 	archDir := filepath.Join(root, runtime.GOOS, runtime.GOARCH)

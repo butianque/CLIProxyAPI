@@ -7,6 +7,9 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+// pluginLogFields describes a plugin file. The version it carries is the one
+// parsed from the filename, which is the version the operator chose to keep on
+// disk; it is not necessarily the version the library reports about itself.
 func pluginLogFields(id, name, version, path string) log.Fields {
 	fields := log.Fields{
 		"plugin_id": strings.TrimSpace(id),
@@ -15,7 +18,7 @@ func pluginLogFields(id, name, version, path string) log.Fields {
 		fields["plugin_name"] = name
 	}
 	if version = strings.TrimSpace(version); version != "" {
-		fields["version"] = version
+		fields["file_version"] = version
 	}
 	if path = strings.TrimSpace(path); path != "" {
 		fields["path"] = path
@@ -23,8 +26,15 @@ func pluginLogFields(id, name, version, path string) log.Fields {
 	return fields
 }
 
-func pluginLogFieldsFromMetadata(id string, meta pluginapi.Metadata, path string) log.Fields {
-	return pluginLogFields(id, meta.Name, meta.Version, path)
+// pluginLogFieldsFromMetadata describes a registered plugin. It reports the
+// version the plugin declares alongside the filename version, so a library that
+// does not match the name it ships under is visible in one line.
+func pluginLogFieldsFromMetadata(id string, meta pluginapi.Metadata, fileVersion, path string) log.Fields {
+	fields := pluginLogFields(id, meta.Name, fileVersion, path)
+	if version := strings.TrimSpace(meta.Version); version != "" {
+		fields["plugin_version"] = version
+	}
+	return fields
 }
 
 func pluginHotReloadLogFields(id, activeVersion, activePath, retiredVersion, retiredPath string) log.Fields {

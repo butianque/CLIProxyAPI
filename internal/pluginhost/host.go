@@ -24,6 +24,7 @@ type loadedPlugin struct {
 	id               string
 	path             string
 	version          string
+	fingerprint      string
 	name             string
 	configYAML       []byte
 	plugin           pluginapi.Plugin
@@ -269,13 +270,21 @@ func (h *Host) ApplyConfig(ctx context.Context, cfg *config.Config) {
 		}
 		h.mu.Lock()
 		lp := h.loaded[file.ID]
-		var replaced *loadedPlugin
-		if lp != nil && cleanPluginPath(lp.path) != cleanPluginPath(file.Path) {
-			replaced = lp
-			lp = nil
+		loadedPath := ""
+		if lp != nil {
+			loadedPath = cleanPluginPath(lp.path)
 		}
 		_, disabled := h.fused[file.ID]
 		h.mu.Unlock()
+
+		// The fingerprint comparison reads the file, so it runs outside h.mu. A
+		// plugin file that is replaced under the same name is still an upgrade:
+		// the filename only carries the version the operator chose to keep.
+		var replaced *loadedPlugin
+		if lp != nil && (loadedPath != cleanPluginPath(file.Path) || pluginFileReplaced(file.Path, lp.fingerprint)) {
+			replaced = lp
+			lp = nil
+		}
 		if disabled && replaced == nil {
 			continue
 		}
@@ -353,6 +362,14 @@ func (h *Host) ApplyConfig(ctx context.Context, cfg *config.Config) {
 			lp = loadResult.loaded
 			if replaced != nil {
 				hotReloadFields = pluginHotReloadLogFields(file.ID, file.Version, file.Path, replaced.version, replaced.path)
+				// Same path with different content keeps the filename, so both versions
+				// read the same; the fingerprints are what prove the library changed.
+				hotReloadFields["reason"] = "version_changed"
+				if cleanPluginPath(replaced.path) == cleanPluginPath(file.Path) {
+					hotReloadFields["reason"] = "content_changed"
+					hotReloadFields["retired_fingerprint"] = pluginFingerprintPrefix(replaced.fingerprint)
+					hotReloadFields["loaded_fingerprint"] = pluginFingerprintPrefix(lp.fingerprint)
+				}
 				h.retireLoadedPluginLocked(replaced)
 				delete(h.fused, file.ID)
 				h.removePluginRuntimeStateLocked(file.ID)
@@ -362,7 +379,11 @@ func (h *Host) ApplyConfig(ctx context.Context, cfg *config.Config) {
 			plugin = loadResult.plugin
 			registeredNow = loadResult.initialized
 			h.mu.Unlock()
-			log.WithFields(pluginLogFields(file.ID, "", file.Version, file.Path)).Info("pluginhost: plugin loaded")
+			loadedFields := pluginLogFields(file.ID, "", file.Version, file.Path)
+			if prefix := pluginFingerprintPrefix(lp.fingerprint); prefix != "" {
+				loadedFields["fingerprint"] = prefix
+			}
+			log.WithFields(loadedFields).Info("pluginhost: plugin loaded")
 		}
 
 		if !registeredNow {
@@ -385,7 +406,7 @@ func (h *Host) ApplyConfig(ctx context.Context, cfg *config.Config) {
 		}
 		h.mu.Unlock()
 		if loadedNow {
-			log.WithFields(pluginLogFieldsFromMetadata(file.ID, plugin.Metadata, file.Path)).Info("pluginhost: plugin registered")
+			log.WithFields(pluginLogFieldsFromMetadata(file.ID, plugin.Metadata, file.Version, file.Path)).Info("pluginhost: plugin registered")
 		}
 		if hotReloadFields != nil {
 			hotReloadLogs = append(hotReloadLogs, hotReloadFields)
@@ -466,6 +487,12 @@ func (h *Host) startPluginLoad(ctx context.Context, file pluginFile, item runtim
 		ctx = context.Background()
 	}
 	go func() {
+		fingerprint, errFingerprint := pluginFileFingerprint(file.Path)
+		if errFingerprint != nil {
+			// The loader reports the authoritative error. A missing fingerprint only
+			// costs the same-path replacement check for this load.
+			log.WithError(errFingerprint).Debugf("pluginhost: cannot fingerprint plugin file %s", file.Path)
+		}
 		client, errOpen := h.loader.Open(file, h)
 		if errOpen != nil {
 			request.result <- pluginLoadResult{err: errOpen}
@@ -480,6 +507,7 @@ func (h *Host) startPluginLoad(ctx context.Context, file pluginFile, item runtim
 			id:               file.ID,
 			path:             file.Path,
 			version:          file.Version,
+			fingerprint:      fingerprint,
 			client:           guardedClient,
 			callbackInstance: pluginCallbackInstance(guardedClient),
 		}
@@ -1033,17 +1061,17 @@ func (h *Host) rollbackReplacement(lp *loadedPlugin, item runtimeItemConfig) (ca
 		return capabilityRecord{}, pluginFile{}, false
 	}
 	return capabilityRecord{
-			id:       lp.id,
-			path:     lp.path,
-			version:  lp.version,
-			priority: item.Priority,
-			meta:     plugin.Metadata,
-			plugin:   plugin,
-		}, pluginFile{
-			ID:      lp.id,
-			Path:    lp.path,
-			Version: lp.version,
-		}, true
+		id:       lp.id,
+		path:     lp.path,
+		version:  lp.version,
+		priority: item.Priority,
+		meta:     plugin.Metadata,
+		plugin:   plugin,
+	}, pluginFile{
+		ID:      lp.id,
+		Path:    lp.path,
+		Version: lp.version,
+	}, true
 }
 
 func (h *Host) callRegister(ctx context.Context, lp *loadedPlugin, item runtimeItemConfig) (pluginapi.Plugin, bool) {

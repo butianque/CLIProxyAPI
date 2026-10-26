@@ -65,6 +65,16 @@ type Watcher struct {
 	pluginAuthParser  synthesizer.PluginAuthParser
 	mirroredAuthDir   string
 	oldConfigYaml     []byte
+
+	// pluginDirs are the directories holding dynamic plugin libraries, in the
+	// order the host scans them. The host only re-reads those directories when
+	// something asks it to, so the watcher reports library changes through
+	// pluginChangeCallback.
+	pluginDirs           []string
+	pluginDirSet         map[string]struct{}
+	pluginChangeCallback func()
+	pluginReloadMu       sync.Mutex
+	pluginReloadTimer    *time.Timer
 }
 
 // AuthUpdateAction represents the type of change detected in auth sources.
@@ -146,6 +156,7 @@ func (w *Watcher) Stop() error {
 	w.stopDispatch()
 	w.stopConfigReloadTimer()
 	w.stopServerUpdateTimer()
+	w.stopPluginReloadTimer()
 	return w.watcher.Close()
 }
 
@@ -162,6 +173,34 @@ func (w *Watcher) SetPluginAuthParser(parser synthesizer.PluginAuthParser) {
 	w.clientsMutex.Lock()
 	defer w.clientsMutex.Unlock()
 	w.pluginAuthParser = parser
+}
+
+// WatchPlugins makes the watcher call onChange once a plugin library in dirs
+// settles. An empty dirs list, or a nil callback, disables the watch.
+//
+// Replacing a plugin means dropping a new dynamic library into a plugin
+// directory, which the host never notices on its own: it only applies its plugin
+// runtime when the config, the management API, or startup asks it to. Without
+// this watch a replaced library stays unused until the process restarts.
+func (w *Watcher) WatchPlugins(dirs []string, onChange func()) {
+	if w == nil {
+		return
+	}
+	watched := make([]string, 0, len(dirs))
+	set := make(map[string]struct{}, len(dirs))
+	for _, dir := range dirs {
+		dir = strings.TrimSpace(dir)
+		if dir == "" {
+			continue
+		}
+		watched = append(watched, dir)
+		set[w.normalizeAuthPath(dir)] = struct{}{}
+	}
+	w.clientsMutex.Lock()
+	w.pluginDirs = watched
+	w.pluginDirSet = set
+	w.pluginChangeCallback = onChange
+	w.clientsMutex.Unlock()
 }
 
 // SetAuthUpdateQueue sets the queue used to emit auth updates.

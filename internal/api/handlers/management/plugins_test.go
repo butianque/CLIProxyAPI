@@ -137,7 +137,7 @@ func TestListPluginsIncludesScannedAndConfiguredPlugins(t *testing.T) {
 				Enabled: false,
 				Dir:     pluginsDir,
 				Configs: map[string]config.PluginInstanceConfig{
-					"configured-only": {Enabled: &disabled},
+					"configured-only": {Enabled: &disabled, Priority: 7},
 				},
 			},
 		},
@@ -163,6 +163,7 @@ func TestListPluginsIncludesScannedAndConfiguredPlugins(t *testing.T) {
 			Registered       bool   `json:"registered"`
 			Enabled          bool   `json:"enabled"`
 			EffectiveEnabled bool   `json:"effective_enabled"`
+			Priority         int    `json:"priority"`
 			SupportsOAuth    bool   `json:"supports_oauth"`
 			OAuthProvider    string `json:"oauth_provider"`
 			Logo             string `json:"logo"`
@@ -181,6 +182,7 @@ func TestListPluginsIncludesScannedAndConfiguredPlugins(t *testing.T) {
 		Registered       bool
 		Enabled          bool
 		EffectiveEnabled bool
+		Priority         int
 		Path             string
 	}{}
 	for _, item := range body.Plugins {
@@ -189,12 +191,14 @@ func TestListPluginsIncludesScannedAndConfiguredPlugins(t *testing.T) {
 			Registered       bool
 			Enabled          bool
 			EffectiveEnabled bool
+			Priority         int
 			Path             string
 		}{
 			Configured:       item.Configured,
 			Registered:       item.Registered,
 			Enabled:          item.Enabled,
 			EffectiveEnabled: item.EffectiveEnabled,
+			Priority:         item.Priority,
 			Path:             item.Path,
 		}
 		if item.Registered ||
@@ -209,7 +213,9 @@ func TestListPluginsIncludesScannedAndConfiguredPlugins(t *testing.T) {
 	if got, ok := entries["scanned"]; !ok || got.Configured || got.Enabled || got.EffectiveEnabled || got.Path == "" {
 		t.Fatalf("scanned entry = %#v, exists=%v", got, ok)
 	}
-	if got, ok := entries["configured-only"]; !ok || !got.Configured || got.Enabled || got.EffectiveEnabled || got.Path != "" {
+	// The configured priority is reported so the value the operator sets is not a
+	// blind knob: the host uses it to order conflicting plugin declarations.
+	if got, ok := entries["configured-only"]; !ok || !got.Configured || got.Enabled || got.EffectiveEnabled || got.Path != "" || got.Priority != 7 {
 		t.Fatalf("configured-only entry = %#v, exists=%v", got, ok)
 	}
 }

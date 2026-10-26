@@ -25,12 +25,16 @@ type pluginListResponse struct {
 }
 
 type pluginListEntry struct {
-	ID                  string                  `json:"id"`
-	Path                string                  `json:"path"`
-	Configured          bool                    `json:"configured"`
-	Registered          bool                    `json:"registered"`
-	Enabled             bool                    `json:"enabled"`
-	EffectiveEnabled    bool                    `json:"effective_enabled"`
+	ID               string `json:"id"`
+	Path             string `json:"path"`
+	Configured       bool   `json:"configured"`
+	Registered       bool   `json:"registered"`
+	Enabled          bool   `json:"enabled"`
+	EffectiveEnabled bool   `json:"effective_enabled"`
+	// Priority is the ordering the host actually used. It decides which plugin
+	// wins a conflicting route, menu, or provider declaration, so it is reported
+	// next to the plugin rather than left as a blind configuration knob.
+	Priority            int                     `json:"priority"`
 	SupportsOAuth       bool                    `json:"supports_oauth"`
 	OAuthProvider       string                  `json:"oauth_provider"`
 	OAuthProviders      []string                `json:"oauth_providers,omitempty"`
@@ -111,6 +115,7 @@ func (h *Handler) ListPlugins(c *gin.Context) {
 		entry.ID = htmlsanitize.String(id)
 		entry.Configured = true
 		entry.Enabled = pluginInstanceEnabled(item)
+		entry.Priority = item.Priority
 		if entry.ConfigFields == nil {
 			entry.ConfigFields = []pluginConfigFieldInfo{}
 		}
@@ -124,6 +129,7 @@ func (h *Handler) ListPlugins(c *gin.Context) {
 			entry := entries[info.ID]
 			entry.ID = htmlsanitize.String(info.ID)
 			entry.Registered = true
+			entry.Priority = info.Priority
 			entry.SupportsOAuth = info.SupportsOAuth
 			entry.OAuthProvider = htmlsanitize.String(info.OAuthProvider)
 			entry.OAuthProviders = pluginOAuthProviders(info)

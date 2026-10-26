@@ -111,6 +111,7 @@ type WatcherWrapper struct {
 	dispatchPersistedAuth        func(update watcher.AuthUpdate) bool
 	dispatchPersistedAuthWithRev func(update *watcher.AuthUpdate) (bool, uint64)
 	setPluginAuthParser          func(parser PluginAuthParser)
+	watchPlugins                 func(dirs []string, onChange func())
 	reloadConfigIfChanged        func()
 }
 
@@ -153,6 +154,14 @@ func (w *WatcherWrapper) SetPluginAuthParser(parser PluginAuthParser) {
 		return
 	}
 	w.setPluginAuthParser(parser)
+}
+
+// WatchPlugins asks the watcher to report plugin library changes in dirs.
+func (w *WatcherWrapper) WatchPlugins(dirs []string, onChange func()) {
+	if w == nil || w.watchPlugins == nil {
+		return
+	}
+	w.watchPlugins(dirs, onChange)
 }
 
 // DispatchRuntimeAuthUpdate forwards runtime auth updates (e.g., websocket providers)

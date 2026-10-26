@@ -1,7 +1,10 @@
 package pluginhost
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -247,6 +250,78 @@ func pluginVersionSegment(segments []string, index int) (int64, bool) {
 		return 0, false
 	}
 	return number, true
+}
+
+// PluginDirs returns the directories the host scans for plugin libraries, most
+// specific first.
+//
+// Only directories that exist are returned. A watch on a directory that is not
+// there yet would either fail or silently cover a layout the operator does not
+// use, so the caller is handed the real scan roots instead of a guess.
+func PluginDirs(root string) []string {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		root = "plugins"
+	}
+	dirs := make([]string, 0, 2)
+	for _, dir := range candidateDirs(root, runtime.GOOS, runtime.GOARCH) {
+		info, errStat := os.Stat(dir)
+		if errStat != nil || !info.IsDir() {
+			continue
+		}
+		dirs = append(dirs, dir)
+	}
+	return dirs
+}
+
+// pluginFileFingerprint returns a content fingerprint for a plugin binary.
+//
+// A rebuild that keeps its version in the filename produces a different library
+// at the same path, so the path alone cannot say whether the loaded library is
+// still the one on disk. The fingerprint is what the host remembers and compares.
+func pluginFileFingerprint(path string) (string, error) {
+	file, errOpen := os.Open(path)
+	if errOpen != nil {
+		return "", errOpen
+	}
+	defer func() {
+		if errClose := file.Close(); errClose != nil {
+			log.WithError(errClose).Debugf("pluginhost: failed to close plugin file %s", path)
+		}
+	}()
+	hasher := sha256.New()
+	if _, errCopy := io.Copy(hasher, file); errCopy != nil {
+		return "", errCopy
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+// pluginFileReplaced reports whether the file at path is no longer the content
+// the host loaded.
+//
+// An unreadable file reports false. The load path owns that error, and a plugin
+// whose file vanished is still the one being served, so treating it as a
+// replacement would drop a working plugin on a transient read failure.
+func pluginFileReplaced(path, loadedFingerprint string) bool {
+	if loadedFingerprint == "" {
+		return false
+	}
+	current, errFingerprint := pluginFileFingerprint(path)
+	if errFingerprint != nil {
+		log.WithError(errFingerprint).Debugf("pluginhost: cannot fingerprint plugin file %s", path)
+		return false
+	}
+	return current != loadedFingerprint
+}
+
+// pluginFingerprintPrefix shortens a fingerprint for log output. The full value
+// is only useful for comparison, which logs do not need.
+func pluginFingerprintPrefix(fingerprint string) string {
+	const prefixLength = 12
+	if len(fingerprint) <= prefixLength {
+		return fingerprint
+	}
+	return fingerprint[:prefixLength]
 }
 
 // cleanupUnselectedPluginFiles removes plugin files that a loaded file has

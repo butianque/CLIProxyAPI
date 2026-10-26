@@ -8,7 +8,9 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/home"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
@@ -203,6 +205,17 @@ func (s *Service) Run(ctx context.Context) error {
 
 		watcherCtx, watcherCancel := context.WithCancel(context.Background())
 		s.watcherCancel = watcherCancel
+		if s.cfg.Plugins.Enabled {
+			// Plugins are shipped by dropping a library into a plugin directory, so
+			// the directories themselves are the deployment signal. Watching them
+			// keeps a replaced library from sitting unused until the next restart.
+			pluginsDir, errResolvePluginsDir := internalconfig.ResolvePluginsDir(s.cfg.Plugins.Dir)
+			if errResolvePluginsDir != nil {
+				log.WithError(errResolvePluginsDir).Warn("failed to resolve plugin directory for watching")
+			} else if dirs := pluginhost.PluginDirs(pluginsDir); len(dirs) > 0 {
+				watcherWrapper.WatchPlugins(dirs, func() { s.syncPluginRuntime(watcherCtx) })
+			}
+		}
 		if errStart := watcherWrapper.Start(watcherCtx); errStart != nil {
 			return fmt.Errorf("cliproxy: failed to start watcher: %w", errStart)
 		}

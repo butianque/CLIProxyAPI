@@ -39,6 +39,19 @@ func (w *Watcher) start(ctx context.Context) error {
 	}
 	log.Debugf("watching auth directory: %s", w.authDir)
 
+	w.clientsMutex.RLock()
+	pluginDirs := append([]string(nil), w.pluginDirs...)
+	w.clientsMutex.RUnlock()
+	for _, pluginDir := range pluginDirs {
+		// A plugin directory that cannot be watched must not stop the server: the
+		// plugins already loaded keep working, they just cannot be hot replaced.
+		if errAddPluginDir := w.watcher.Add(pluginDir); errAddPluginDir != nil {
+			log.Warnf("failed to watch plugin directory %s: %v", pluginDir, errAddPluginDir)
+			continue
+		}
+		log.Debugf("watching plugin directory: %s", pluginDir)
+	}
+
 	go w.processEvents(ctx)
 
 	w.reloadClients(true, nil, false)
@@ -65,7 +78,8 @@ func (w *Watcher) processEvents(ctx context.Context) {
 }
 
 func (w *Watcher) handleEvent(event fsnotify.Event) {
-	// Filter only relevant events: config file or auth-dir JSON files.
+	// Filter only relevant events: config file, auth-dir JSON files, or plugin
+	// libraries in the plugin directory.
 	configOps := fsnotify.Write | fsnotify.Create | fsnotify.Rename
 	normalizedName := w.normalizeAuthPath(event.Name)
 	normalizedConfigPath := w.normalizeAuthPath(w.configPath)
@@ -73,7 +87,8 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 	isConfigEvent := normalizedName == normalizedConfigPath && event.Op&configOps != 0
 	authOps := fsnotify.Create | fsnotify.Write | fsnotify.Remove | fsnotify.Rename
 	isAuthJSON := filepath.Dir(normalizedName) == normalizedAuthDir && strings.HasSuffix(normalizedName, ".json") && event.Op&authOps != 0
-	if !isConfigEvent && !isAuthJSON {
+	isPluginLibrary := w.isPluginLibraryEvent(normalizedName, event.Op)
+	if !isConfigEvent && !isAuthJSON && !isPluginLibrary {
 		// Ignore unrelated files (e.g., cookie snapshots *.cookie) and other noise.
 		return
 	}
@@ -85,6 +100,13 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 	if isConfigEvent {
 		log.Debugf("config file change details - operation: %s, timestamp: %s", event.Op.String(), now.Format("2006-01-02 15:04:05.000"))
 		w.scheduleConfigReload()
+		return
+	}
+
+	// Handle plugin library changes
+	if isPluginLibrary {
+		log.Debugf("plugin library event: %s %s", event.Op.String(), filepath.Base(event.Name))
+		w.schedulePluginReload()
 		return
 	}
 
