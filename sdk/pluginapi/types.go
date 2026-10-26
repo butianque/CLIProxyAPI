@@ -141,6 +141,11 @@ type Capabilities struct {
 	// host and its clients must not invent a label and fall back to the plugin
 	// name instead.
 	ProviderLabels map[string]string
+	// FingerprintBrowser declares that this plugin's login reads the
+	// fingerprint_browser login metadata flag, so management clients may offer
+	// the choice. The flag is a request, not a requirement: a login that cannot
+	// open a fingerprint browser must still work when it is set.
+	FingerprintBrowser bool
 }
 
 // ExecutorModelScope declares which model-registration paths a plugin executor supports.

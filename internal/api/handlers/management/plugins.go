@@ -34,17 +34,20 @@ type pluginListEntry struct {
 	// Priority is the ordering the host actually used. It decides which plugin
 	// wins a conflicting route, menu, or provider declaration, so it is reported
 	// next to the plugin rather than left as a blind configuration knob.
-	Priority            int                     `json:"priority"`
-	SupportsOAuth       bool                    `json:"supports_oauth"`
-	OAuthProvider       string                  `json:"oauth_provider"`
-	OAuthProviders      []string                `json:"oauth_providers,omitempty"`
-	OAuthProviderLabels map[string]string       `json:"oauth_provider_labels,omitempty"`
-	SupportsQuota       bool                    `json:"supports_quota"`
-	QuotaProvider       string                  `json:"quota_provider,omitempty"`
-	Logo                string                  `json:"logo"`
-	ConfigFields        []pluginConfigFieldInfo `json:"config_fields"`
-	Menus               []pluginMenuInfo        `json:"menus"`
-	Metadata            *pluginMetadataInfo     `json:"metadata"`
+	Priority            int               `json:"priority"`
+	SupportsOAuth       bool              `json:"supports_oauth"`
+	OAuthProvider       string            `json:"oauth_provider"`
+	OAuthProviders      []string          `json:"oauth_providers,omitempty"`
+	OAuthProviderLabels map[string]string `json:"oauth_provider_labels,omitempty"`
+	SupportsQuota       bool              `json:"supports_quota"`
+	QuotaProvider       string            `json:"quota_provider,omitempty"`
+	// SupportsFingerprintBrowser reports that the plugin reads the
+	// fingerprint_browser login flag, so clients may offer the choice.
+	SupportsFingerprintBrowser bool                    `json:"supports_fingerprint_browser"`
+	Logo                       string                  `json:"logo"`
+	ConfigFields               []pluginConfigFieldInfo `json:"config_fields"`
+	Menus                      []pluginMenuInfo        `json:"menus"`
+	Metadata                   *pluginMetadataInfo     `json:"metadata"`
 }
 
 type pluginMetadataInfo struct {
@@ -136,6 +139,7 @@ func (h *Handler) ListPlugins(c *gin.Context) {
 			entry.OAuthProviderLabels = pluginOAuthProviderLabels(info.OAuthProviderLabels)
 			entry.SupportsQuota = info.SupportsQuota
 			entry.QuotaProvider = htmlsanitize.String(info.QuotaProvider)
+			entry.SupportsFingerprintBrowser = info.SupportsFingerprintBrowser
 			entry.Logo = htmlsanitize.String(info.Metadata.Logo)
 			entry.ConfigFields = pluginConfigFields(info.Metadata.ConfigFields)
 			entry.Menus = pluginMenus(info.Menus)

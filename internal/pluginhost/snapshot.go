@@ -41,7 +41,12 @@ type RegisteredPluginInfo struct {
 	OAuthProviderLabels map[string]string
 	SupportsQuota       bool
 	QuotaProvider       string
-	Menus               []RegisteredPluginMenu
+	// SupportsFingerprintBrowser reports that this plugin's login reads the
+	// fingerprint_browser flag, so the panel may offer the choice. It says
+	// nothing about whether a fingerprint browser is configured: that stays a
+	// runtime decision the plugin makes.
+	SupportsFingerprintBrowser bool
+	Menus                      []RegisteredPluginMenu
 }
 
 // RegisteredPluginMenu describes a plugin-owned resource menu entry.
@@ -115,7 +120,10 @@ func (h *Host) RegisteredPlugins() []RegisteredPluginInfo {
 			OAuthProviderLabels: cloneStringMap(record.plugin.Capabilities.ProviderLabels),
 			SupportsQuota:       quotaProvider != nil,
 			QuotaProvider:       quotaIdentifier,
-			Menus:               menusByPlugin[record.id],
+			// The choice only makes sense for a plugin that reads the flag. The
+			// panel must not offer a toggle for a login that ignores it.
+			SupportsFingerprintBrowser: authProvider != nil && record.plugin.Capabilities.FingerprintBrowser,
+			Menus:                      menusByPlugin[record.id],
 		})
 	}
 	return out

@@ -48,6 +48,7 @@ type rpcCapabilities struct {
 	QuotaProvider                 bool                         `json:"quota_provider"`
 	ProviderKeys                  []string                     `json:"provider_keys,omitempty"`
 	ProviderLabels                map[string]string            `json:"provider_labels,omitempty"`
+	FingerprintBrowser            bool                         `json:"fingerprint_browser,omitempty"`
 }
 
 type rpcIdentifierResponse struct {
@@ -192,6 +193,7 @@ func rpcCapabilitiesFromPlugin(plugin pluginapi.Plugin) rpcCapabilities {
 		ManagementAPI:                 caps.ManagementAPI != nil,
 		QuotaProvider:                 caps.QuotaProvider != nil,
 		ProviderLabels:                cloneStringMap(caps.ProviderLabels),
+		FingerprintBrowser:            caps.FingerprintBrowser,
 	}
 }
 

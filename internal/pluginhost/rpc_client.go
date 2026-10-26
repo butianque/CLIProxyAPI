@@ -107,6 +107,7 @@ func registerRPCPlugin(ctx context.Context, host *Host, id string, client plugin
 			ExecutorOutputFormats:         append([]string(nil), resp.Capabilities.ExecutorOutputFormats...),
 			ProviderKeys:                  append([]string(nil), resp.Capabilities.ProviderKeys...),
 			ProviderLabels:                cloneStringMap(resp.Capabilities.ProviderLabels),
+			FingerprintBrowser:            resp.Capabilities.FingerprintBrowser,
 		},
 	}
 	if resp.Capabilities.ModelRegistrar {
