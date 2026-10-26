@@ -71,6 +71,16 @@ var (
 	ErrDeviceSlowDown = errors.New("email: the sign-in poll must slow down")
 )
 
+// ErrDeviceNoMailAccess means the person finished signing in and the grant it
+// produced cannot read mail.
+//
+// It is its own answer because it is not the person declining: the sign-in
+// worked, and what was missing is the permission that makes it useful. Reporting
+// it as a refusal would send the operator back to the code page to repeat a
+// step that already succeeded.
+var ErrDeviceNoMailAccess = errors.New(
+	"email: the sign-in did not grant permission to read mail; authorize this mailbox again and accept the mail permission")
+
 // DeviceAuthorization is one pending sign-in: the short code a person types,
 // where they type it, and how long that stays possible.
 type DeviceAuthorization struct {
@@ -92,6 +102,10 @@ type DeviceToken struct {
 	AccessToken string
 	// RefreshToken is the credential worth keeping.
 	RefreshToken string
+	// GrantedScope is what the sign-in actually granted, as the endpoint spells
+	// it. Empty when the answer names none, which is not evidence of a missing
+	// permission.
+	GrantedScope string
 	// Expires is when the access token stops working.
 	Expires time.Time
 }
@@ -212,6 +226,7 @@ func PollDeviceToken(ctx context.Context, tokenURL, clientID, deviceCode string,
 		AccessToken      string `json:"access_token"`
 		RefreshToken     string `json:"refresh_token"`
 		ExpiresIn        int    `json:"expires_in"`
+		Scope            string `json:"scope"`
 		Error            string `json:"error"`
 		ErrorDescription string `json:"error_description"`
 	}
@@ -246,6 +261,13 @@ func PollDeviceToken(ctx context.Context, tokenURL, clientID, deviceCode string,
 		// dies within the hour and the whole sign-in has to be repeated.
 		return DeviceToken{}, errors.New("the sign-in returned no refresh token; the authorization did not include offline_access")
 	}
+	// A grant that cannot read mail is refused here rather than stored: the
+	// identity it would create is one that answers a probe with "the token
+	// request was refused" forever, and the operator would be looking at a
+	// mailbox that signed in successfully and reads nothing.
+	if !grantsMailRead(payload.Scope) {
+		return DeviceToken{}, ErrDeviceNoMailAccess
+	}
 	expires := time.Now().Add(oauth2AssumedLifetime)
 	if payload.ExpiresIn > 0 {
 		expires = time.Now().Add(time.Duration(payload.ExpiresIn) * time.Second)
@@ -253,8 +275,23 @@ func PollDeviceToken(ctx context.Context, tokenURL, clientID, deviceCode string,
 	return DeviceToken{
 		AccessToken:  payload.AccessToken,
 		RefreshToken: payload.RefreshToken,
+		GrantedScope: strings.TrimSpace(payload.Scope),
 		Expires:      expires,
 	}, nil
+}
+
+// grantsMailRead reports whether the scopes a sign-in granted cover reading mail.
+//
+// An answer that names no scope is not evidence of a missing permission: the
+// field is optional, and refusing a sign-in that works would be the same mistake
+// in the other direction. Only a scope list that is present and does not name
+// Mail.Read is proof.
+func grantsMailRead(scope string) bool {
+	scope = strings.TrimSpace(scope)
+	if scope == "" {
+		return true
+	}
+	return strings.Contains(strings.ToLower(scope), "mail.read")
 }
 
 // VerifyAccount asks Graph who an access token belongs to.

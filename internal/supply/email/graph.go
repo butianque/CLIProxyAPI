@@ -100,7 +100,7 @@ func dialGraphSession(ctx context.Context, target Target) (Session, error) {
 	}
 	token, errToken := graphBearer(ctx, target.ClientID, target.Password, client)
 	if errToken != nil {
-		return nil, fmt.Errorf("%w: %v", ErrLoginRejected, errToken)
+		return nil, fmt.Errorf("%w: %v", dialRefusal(errToken), errToken)
 	}
 	// A rotation has to reach the store as soon as it is seen: the value the
 	// session carries is the one that works, and leaving the old one behind would

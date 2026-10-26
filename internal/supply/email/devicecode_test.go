@@ -2,6 +2,7 @@ package email
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -244,6 +245,69 @@ func TestPersistRefreshTokenWritesOnlyARotation(t *testing.T) {
 	persistRefreshToken(entry, "rt-new", "")
 	if value, _ := store.Get(entry); value != "rt-new" {
 		t.Fatalf("stored token = %q, want rt-new", value)
+	}
+}
+
+// A sign-in whose grant cannot read mail must be refused here rather than
+// stored: the identity it would create is one that answers every probe with "the
+// token request was refused", which reads as a mailbox that signed in and cannot
+// receive — the hardest kind of row to diagnose.
+func TestPollDeviceTokenRejectsAGrantThatCannotReadMail(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"at-1","refresh_token":"rt-1","expires_in":3600,` +
+			`"scope":"https://graph.microsoft.com/User.Read offline_access"}`))
+	}))
+	defer server.Close()
+
+	_, errPoll := PollDeviceToken(context.Background(), server.URL, "app-123", "dc-1", nil)
+	if errPoll == nil {
+		t.Fatal("a grant without Mail.Read was accepted")
+	}
+	// Its own sentinel, so a caller can tell "the person declined" from "the
+	// person signed in and the grant cannot read mail".
+	if !errors.Is(errPoll, ErrDeviceNoMailAccess) {
+		t.Fatalf("error = %q, want ErrDeviceNoMailAccess", errPoll)
+	}
+	if !strings.Contains(errPoll.Error(), "read mail") {
+		t.Fatalf("error = %q, want it to name the missing permission", errPoll)
+	}
+}
+
+// The scope field is optional. An answer that names none is not evidence of a
+// missing permission, and refusing it would reject a sign-in that works.
+func TestPollDeviceTokenKeepsASignInThatNamesNoScope(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"at-1","refresh_token":"rt-1","expires_in":3600}`))
+	}))
+	defer server.Close()
+
+	token, errPoll := PollDeviceToken(context.Background(), server.URL, "app-123", "dc-1", nil)
+	if errPoll != nil {
+		t.Fatalf("PollDeviceToken: %v", errPoll)
+	}
+	if token.GrantedScope != "" {
+		t.Fatalf("granted scope = %q, want it left empty", token.GrantedScope)
+	}
+}
+
+// A grant that does carry the permission is reported as it was spelled, so a
+// reader can tell which shape the token endpoint accepted.
+func TestPollDeviceTokenReportsTheGrantedScope(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"at-1","refresh_token":"rt-1","expires_in":3600,` +
+			`"scope":"https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/User.Read offline_access"}`))
+	}))
+	defer server.Close()
+
+	token, errPoll := PollDeviceToken(context.Background(), server.URL, "app-123", "dc-1", nil)
+	if errPoll != nil {
+		t.Fatalf("PollDeviceToken: %v", errPoll)
+	}
+	if !strings.Contains(token.GrantedScope, "Mail.Read") {
+		t.Fatalf("granted scope = %q, want it to carry Mail.Read", token.GrantedScope)
 	}
 }
 

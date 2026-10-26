@@ -206,12 +206,60 @@ func mintAccessToken(ctx context.Context, kind, clientID, refreshToken string, c
 	if kind != "graph" {
 		return oauth2AccessToken(ctx, oauth2TokenURL, clientID, refreshToken, client)
 	}
+	return mintGraphToken(ctx, oauth2TokenURL, clientID, refreshToken, client)
+}
+
+// graphScopeAttempts is what a Graph token is asked for, in the order it is
+// tried.
+//
+// ".default" comes first because it needs no scope bookkeeping: it means
+// "whatever this application declares", and it is what Microsoft's own samples
+// send. It is not the only shape the endpoint accepts, and that is the whole
+// reason this list exists: a grant narrower than the application's declaration
+// is answered with invalid_scope or invalid_request, and the mailbox then reads
+// as unreachable while its credential is perfectly good.
+//
+// The rest name the permissions a read actually needs. The first of them is
+// exactly what the device-code authorization asks for, so a grant issued by that
+// flow can always be spent; the last is the minimum a read needs, for a token
+// that came from somewhere else.
+var graphScopeAttempts = []string{
+	graphScope,
+	deviceCodeScope,
+	"https://graph.microsoft.com/Mail.Read offline_access",
+}
+
+// mintGraphToken exchanges a refresh token for a Graph access token, trying each
+// scope in graphScopeAttempts until one is accepted.
+//
+// Only a refusal about what the request asked for is retried. A credential
+// Microsoft has stopped honouring, a rejected application, or an unreachable
+// endpoint answers the same way whatever the scope says, and spending requests
+// on it is how a mailbox gets throttled.
+func mintGraphToken(ctx context.Context, tokenURL, clientID, refreshToken string, client *http.Client) (mintedToken, error) {
+	var errLast error
+	for _, scope := range graphScopeAttempts {
+		minted, errMint := mintGraphTokenWith(ctx, tokenURL, clientID, refreshToken, scope, client)
+		if errMint == nil {
+			return minted, nil
+		}
+		var refusal *tokenRefusal
+		if !errors.As(errMint, &refusal) || !refusal.asksForADifferentScope() {
+			return mintedToken{}, errMint
+		}
+		errLast = errMint
+	}
+	return mintedToken{}, errLast
+}
+
+// mintGraphTokenWith is one Graph token exchange for one named scope.
+func mintGraphTokenWith(ctx context.Context, tokenURL, clientID, refreshToken, scope string, client *http.Client) (mintedToken, error) {
 	form := url.Values{}
 	form.Set("client_id", clientID)
 	form.Set("grant_type", "refresh_token")
 	form.Set("refresh_token", refreshToken)
-	form.Set("scope", graphScope)
-	request, errRequest := http.NewRequestWithContext(ctx, http.MethodPost, oauth2TokenURL, strings.NewReader(form.Encode()))
+	form.Set("scope", scope)
+	request, errRequest := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(form.Encode()))
 	if errRequest != nil {
 		return mintedToken{}, fmt.Errorf("the token request could not be built: %w", errRequest)
 	}
@@ -282,7 +330,12 @@ func oauth2AccessToken(ctx context.Context, tokenURL, clientID, refreshToken str
 	// pick the other receiving method, so the granted scopes are checked here.
 	if granted, ok := token.Extra("scope").(string); ok && strings.TrimSpace(granted) != "" &&
 		!strings.Contains(strings.ToLower(granted), "imap") {
-		return mintedToken{}, errors.New("the refresh token was not granted IMAP access; choose Graph as the receiving method")
+		// Classified as a refusal about the scope, not about the credential: the
+		// token works, it just cannot open this protocol.
+		return mintedToken{}, &tokenRefusal{
+			code:    "invalid_scope",
+			message: "the refresh token was not granted IMAP access; choose Graph as the receiving method",
+		}
 	}
 	expires := token.Expiry
 	if expires.IsZero() {
@@ -291,6 +344,47 @@ func oauth2AccessToken(ctx context.Context, tokenURL, clientID, refreshToken str
 	// x/oauth2 keeps whatever refresh token the endpoint returned, so a rotation
 	// arrives here without extra parsing.
 	return mintedToken{access: token.AccessToken, refresh: token.RefreshToken, expires: expires}, nil
+}
+
+// tokenRefusal is a refused exchange: the sentence an operator can act on, plus
+// the OAuth error code it was built from.
+//
+// The code is kept because it is the only thing that says whether asking for
+// something else could work. The description is not: it is free text that can
+// echo the request, and these sentences reach a channel row and the probe's
+// detail — neither is a place a credential may appear.
+type tokenRefusal struct {
+	code    string
+	message string
+}
+
+func (r *tokenRefusal) Error() string { return r.message }
+
+// asksForADifferentScope reports whether the endpoint refused what the request
+// asked for rather than the credential that made it.
+//
+// That is the one class of refusal a second attempt can answer: a grant narrower
+// than the scope named is still a working grant. Everything else — an expired
+// credential, a rejected application — gives the same answer however the request
+// is spelled.
+func (r *tokenRefusal) asksForADifferentScope() bool {
+	return r.code == "invalid_scope" || r.code == "invalid_request"
+}
+
+// dialRefusal names what kind of failure a refused token exchange is, so the
+// caller can report it as the right thing.
+//
+// A credential Microsoft has stopped honouring is a login rejection: the
+// operator's next step is a new sign-in. A refusal about what the request asked
+// for is not — the credential is fine and the grant behind it is the problem.
+// Reporting the second as the first sends the operator to replace a mailbox that
+// still works, which is exactly the mistake this distinction exists to prevent.
+func dialRefusal(err error) error {
+	var refusal *tokenRefusal
+	if errors.As(err, &refusal) && refusal.asksForADifferentScope() {
+		return ErrProbeUnready
+	}
+	return ErrLoginRejected
 }
 
 // describeTokenError turns a refused exchange into something an operator can act
@@ -311,22 +405,38 @@ func describeTokenError(err error, kind string) error {
 		// quote and nothing secret to leak.
 		return fmt.Errorf("the token endpoint could not be reached: %w", err)
 	}
+	// The sub-code is what separates "consent was never granted" from "the
+	// client type is wrong", and the sentence below cannot carry it. A log line
+	// is the only place it can go without quoting the description it sits in.
+	if code := aadstsCode(retrieve.ErrorDescription); code != "" {
+		logrus.WithFields(logrus.Fields{
+			"oauth_error": retrieve.ErrorCode,
+			"aadsts":      code,
+			"resource":    kind,
+		}).Warn("email: the token endpoint refused the request")
+	}
 	switch retrieve.ErrorCode {
 	case "invalid_grant":
 		if strings.Contains(retrieve.ErrorDescription, "AADSTS70000") ||
 			strings.Contains(retrieve.ErrorDescription, "AADSTS65001") {
 			if kind == "graph" {
-				return errors.New("the refresh token was not granted Graph access")
+				return &tokenRefusal{code: retrieve.ErrorCode, message: "the refresh token was not granted Graph access"}
 			}
-			return errors.New("the refresh token was not granted IMAP access; choose Graph as the receiving method")
+			return &tokenRefusal{code: retrieve.ErrorCode, message: "the refresh token was not granted IMAP access; choose Graph as the receiving method"}
 		}
-		return errors.New("the refresh token was rejected: it has expired or been revoked")
+		return &tokenRefusal{code: retrieve.ErrorCode, message: "the refresh token was rejected: it has expired or been revoked"}
 	case "invalid_client":
-		return errors.New("the application id was rejected")
+		return &tokenRefusal{code: retrieve.ErrorCode, message: "the application id was rejected"}
 	case "unauthorized_client":
-		return errors.New("this application is not allowed to read mail for this account")
+		return &tokenRefusal{code: retrieve.ErrorCode, message: "this application is not allowed to read mail for this account"}
 	case "invalid_request", "invalid_scope":
-		return errors.New("the token request was refused")
+		// The credential is fine; what it was asked for is not. Naming the
+		// permission is what tells the operator to authorize this mailbox again
+		// rather than replace it.
+		return &tokenRefusal{
+			code:    retrieve.ErrorCode,
+			message: "the sign-in did not grant the permissions a mailbox read needs; authorize this mailbox again and accept the mail permission",
+		}
 	}
 	if retrieve.ErrorCode != "" {
 		return fmt.Errorf("the token endpoint answered %q", retrieve.ErrorCode)
@@ -335,4 +445,24 @@ func describeTokenError(err error, kind string) error {
 		return fmt.Errorf("the token endpoint answered %d", retrieve.Response.StatusCode)
 	}
 	return errors.New("the token endpoint answered without a reason")
+}
+
+// aadstsCode picks Microsoft's sub-code out of a free-text description.
+//
+// Only the code itself is taken: everything around it is the free text that must
+// never be repeated, and the code alone is what names the cause.
+func aadstsCode(description string) string {
+	const marker = "AADSTS"
+	start := strings.Index(description, marker)
+	if start < 0 {
+		return ""
+	}
+	end := start + len(marker)
+	for end < len(description) && description[end] >= '0' && description[end] <= '9' {
+		end++
+	}
+	if end == start+len(marker) {
+		return ""
+	}
+	return description[start:end]
 }

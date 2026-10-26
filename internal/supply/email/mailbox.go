@@ -248,7 +248,7 @@ func authenticate(ctx context.Context, client *imapclient.Client, target Target)
 		}
 		minted, errToken := oauth2Bearer(ctx, target.ClientID, target.Password, httpClient)
 		if errToken != nil {
-			return fmt.Errorf("%w: %v", ErrLoginRejected, errToken)
+			return fmt.Errorf("%w: %v", dialRefusal(errToken), errToken)
 		}
 		// Microsoft's refresh tokens expire 90 days after their last use and
 		// spending one can rotate it, so the value the store holds has to follow.

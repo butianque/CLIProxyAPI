@@ -580,6 +580,11 @@ func (r *emailAuthorizeRegistry) awaitSignIn(ctx context.Context, id, clientID, 
 			}
 		case errors.Is(errPoll, context.Canceled), errors.Is(errPoll, context.DeadlineExceeded):
 			return email.DeviceToken{}, authorizeCancelled, "the batch was cancelled"
+		case errors.Is(errPoll, email.ErrDeviceNoMailAccess):
+			// The person did finish signing in; what came back cannot read mail.
+			// Reporting that as a refusal would send them to the code page to
+			// repeat a step that already worked.
+			return email.DeviceToken{}, authorizeFailed, errPoll.Error()
 		default:
 			return email.DeviceToken{}, authorizeDenied, errPoll.Error()
 		}

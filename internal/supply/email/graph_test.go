@@ -2,6 +2,8 @@ package email
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -98,5 +100,98 @@ func TestGraphFolderTargetResolution(t *testing.T) {
 
 	if _, errTarget := session.folderTarget(context.Background(), "no such folder"); errTarget == nil {
 		t.Fatal("an unknown folder resolved to something")
+	}
+}
+
+// A grant narrower than the application's declaration refuses ".default" and
+// accepts the permissions it does carry. Without the second attempt the mailbox
+// reads as unreachable while its credential is perfectly good, which is exactly
+// how a mailbox that signed in successfully ends up shown as offline.
+func TestGraphTokenFallsBackToTheScopeTheGrantCarries(t *testing.T) {
+	var asked []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if errForm := r.ParseForm(); errForm != nil {
+			t.Errorf("ParseForm: %v", errForm)
+		}
+		scope := r.Form.Get("scope")
+		asked = append(asked, scope)
+		w.Header().Set("Content-Type", "application/json")
+		if scope == graphScope {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"invalid_scope","error_description":"AADSTS70011: scope refused"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"access_token":"at-1","expires_in":3600,"token_type":"Bearer"}`))
+	}))
+	defer server.Close()
+
+	token, errMint := mintGraphToken(context.Background(), server.URL, "app-123", "rt-1", nil)
+	if errMint != nil {
+		t.Fatalf("mintGraphToken: %v", errMint)
+	}
+	if token.access != "at-1" {
+		t.Fatalf("access token = %q, want at-1", token.access)
+	}
+	if len(asked) != 2 {
+		t.Fatalf("scopes asked = %v, want two attempts", asked)
+	}
+	if asked[0] != graphScope {
+		t.Fatalf("first scope = %q, want %q", asked[0], graphScope)
+	}
+	// The second attempt must be a scope the sign-in itself could have granted,
+	// otherwise a narrower grant is refused a second time for the same reason.
+	if asked[1] != deviceCodeScope {
+		t.Fatalf("second scope = %q, want %q", asked[1], deviceCodeScope)
+	}
+}
+
+// A dead credential answers the same way whatever the scope says, so retrying it
+// spends requests on an answer that cannot change — and enough of those is how a
+// mailbox gets throttled.
+func TestGraphTokenDoesNotRetryADeadCredential(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"invalid_grant","error_description":"AADSTS70008: expired"}`))
+	}))
+	defer server.Close()
+
+	_, errMint := mintGraphToken(context.Background(), server.URL, "app-123", "rt-1", nil)
+	if errMint == nil {
+		t.Fatal("a dead credential was accepted")
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", attempts)
+	}
+	if !strings.Contains(errMint.Error(), "expired or been revoked") {
+		t.Fatalf("error = %q, want it to name the dead credential", errMint)
+	}
+	// The description is free text that can echo the request, and this sentence
+	// reaches an operator's screen.
+	if strings.Contains(errMint.Error(), "AADSTS") {
+		t.Fatalf("error = %q, want the description left out", errMint)
+	}
+}
+
+// The sub-code is what separates "consent was never granted" from "the client
+// type is wrong", and the operator-facing sentence cannot carry it.
+func TestAADSTSCodeIsReadOutOfTheDescription(t *testing.T) {
+	cases := []struct {
+		name        string
+		description string
+		want        string
+	}{
+		{"present", "AADSTS65001: The user has not consented.", "AADSTS65001"},
+		{"mid sentence", "error AADSTS70011 while parsing", "AADSTS70011"},
+		{"absent", "invalid scope", ""},
+		{"marker without digits", "AADSTS something", ""},
+		{"empty", "", ""},
+	}
+	for _, testCase := range cases {
+		if got := aadstsCode(testCase.description); got != testCase.want {
+			t.Errorf("%s: aadstsCode = %q, want %q", testCase.name, got, testCase.want)
+		}
 	}
 }
