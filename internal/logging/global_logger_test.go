@@ -88,9 +88,16 @@ func TestLogFormatterPrintsPluginFields(t *testing.T) {
 	entry.Message = "pluginhost: plugin loaded"
 	entry.Data["plugin_id"] = "sample-provider"
 	entry.Data["plugin_name"] = "Sample Provider"
-	entry.Data["version"] = "0.2.0"
+	// The host reports the filename version and the self-declared version as two
+	// fields; the formatter renders only listed fields, so both must be listed or
+	// the version silently vanishes from the line the operator reads.
+	entry.Data["file_version"] = "0.2.0"
+	entry.Data["plugin_version"] = "0.1.9"
+	entry.Data["fingerprint"] = "a1b2c3d4"
 	entry.Data["active_version"] = "0.1.0"
 	entry.Data["retired_version"] = "0.2.0"
+	entry.Data["retired_fingerprint"] = "0f0e0d0c"
+	entry.Data["loaded_fingerprint"] = "a1b2c3d4"
 	entry.Data["path"] = "plugins/windows/amd64/sample-provider-v0.2.0.dll"
 	entry.Data["active_path"] = "plugins/windows/amd64/sample-provider-v0.1.0.dll"
 	entry.Data["retired_path"] = "plugins/windows/amd64/sample-provider-v0.2.0.dll"
@@ -104,9 +111,13 @@ func TestLogFormatterPrintsPluginFields(t *testing.T) {
 	for _, want := range []string{
 		"plugin_id=sample-provider",
 		"plugin_name=Sample Provider",
-		"version=0.2.0",
+		"file_version=0.2.0",
+		"plugin_version=0.1.9",
+		"fingerprint=a1b2c3d4",
 		"active_version=0.1.0",
 		"retired_version=0.2.0",
+		"retired_fingerprint=0f0e0d0c",
+		"loaded_fingerprint=a1b2c3d4",
 		"path=plugins/windows/amd64/sample-provider-v0.2.0.dll",
 		"active_path=plugins/windows/amd64/sample-provider-v0.1.0.dll",
 		"retired_path=plugins/windows/amd64/sample-provider-v0.2.0.dll",

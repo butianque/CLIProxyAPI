@@ -54,7 +54,14 @@ type LogFormatter struct{}
 var logFieldOrder = []string{
 	"provider", "model",
 	"plugin_id", "plugin_name", "source_id",
-	"version", "active_version", "retired_version", "overwritten",
+	// file_version is the version parsed from the library filename, plugin_version
+	// the one the library reports for itself. They are separate fields because a
+	// library replaced under the same name keeps its old filename; the formatter
+	// only renders fields listed here, so a renamed field that is not listed
+	// disappears from the log instead of becoming clearer.
+	"version", "file_version", "plugin_version",
+	"active_version", "retired_version", "overwritten",
+	"fingerprint", "retired_fingerprint", "loaded_fingerprint",
 	"mode", "budget", "level", "original_mode", "original_value", "min", "max", "clamped_to", "error",
 	"credential", "auth_id", "auth_index", "connection", "proxy_scheme", "remote_transport",
 	"operation", "upstream_host", "reused", "was_idle", "idle_time",
