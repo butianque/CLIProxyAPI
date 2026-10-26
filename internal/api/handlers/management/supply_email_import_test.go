@@ -282,6 +282,88 @@ func TestImportMailboxesSwitchesTheReceivingMethodInPlace(t *testing.T) {
 	}
 }
 
+// A mailbox that logs in with its own password is a different transport from a
+// token batch, and it is stored as one: the password is the credential the reader
+// spends, so it goes under the entry the IMAP reader looks for.
+func TestImportMailboxesStoresAnIMAPPassword(t *testing.T) {
+	_, r, stateDir := setupImportTest(t)
+	unlockedEmptyStore(t)
+
+	paste := strings.Join([]string{
+		"dana@own.example----imap-pw-dana",
+		"evan@other.example----imap-pw-evan----mail.other.example:143",
+	}, "\n")
+	body := `{"text":` + quote(paste) + `,"nature":"imap","host":"mail.own.example:993","probe":false}`
+	code, resp := importMailboxes(t, r, body)
+	if code != http.StatusOK {
+		t.Fatalf("import: %d %v", code, resp)
+	}
+	if resp["nature"] != "imap" {
+		t.Fatalf("answer nature = %v, want imap", resp["nature"])
+	}
+	if resp["imported"] != float64(2) {
+		t.Fatalf("imported = %v, want 2", resp["imported"])
+	}
+
+	records := loadPool(t, stateDir).Mailboxes()
+	if len(records) != 2 {
+		t.Fatalf("pool mailboxes = %d, want 2", len(records))
+	}
+	hosts := map[string]string{
+		"dana@own.example":   "mail.own.example:993",
+		"evan@other.example": "mail.other.example:143",
+	}
+	for _, record := range records {
+		box := record.Mailbox
+		if box == nil || box.Nature != supply.NatureIMAP {
+			t.Fatalf("%s mailbox = %+v, want an imap transport", record.Address, box)
+		}
+		// A line that names its own host keeps it; the batch host is only the
+		// fallback, because one paste can mix providers.
+		if want := hosts[record.Address]; box.Endpoint != want {
+			t.Fatalf("%s endpoint = %q, want %q", record.Address, box.Endpoint, want)
+		}
+		if box.ClientID != "" {
+			t.Fatalf("%s kept an application id, which a password login never uses", record.Address)
+		}
+		if want := supply.EmailCredentialName(record.Address); box.Secret != want {
+			t.Fatalf("%s credential entry = %q, want %q", record.Address, box.Secret, want)
+		}
+		if want := supply.EmailPasswordCredentialName(record.Address); box.Password != want {
+			t.Fatalf("%s password entry = %q, want %q", record.Address, box.Password, want)
+		}
+	}
+
+	store := secretstore.Default()
+	if value, errGet := store.Get(supply.EmailCredentialName("dana@own.example")); errGet != nil || value != "imap-pw-dana" {
+		t.Fatalf("stored login = %q (err %v), want the pasted password", value, errGet)
+	}
+	// The same value is kept under the manual-sign-in entry: one mailbox should
+	// not have two answers for the password a person types into its web page.
+	if value, errGet := store.Get(supply.EmailPasswordCredentialName("dana@own.example")); errGet != nil || value != "imap-pw-dana" {
+		t.Fatalf("stored password = %q (err %v)", value, errGet)
+	}
+}
+
+// An IMAP line with no host anywhere is refused rather than sent to the
+// Microsoft server: a host that never heard of the mailbox can only answer with
+// a credential failure that is not there.
+func TestImportMailboxesRefusesAnIMAPLineWithoutAHost(t *testing.T) {
+	_, r, stateDir := setupImportTest(t)
+	unlockedEmptyStore(t)
+
+	code, resp := importMailboxes(t, r, `{"text":"dana@own.example----imap-pw","nature":"imap","probe":false}`)
+	if code != http.StatusOK {
+		t.Fatalf("import: %d %v", code, resp)
+	}
+	if resp["failed"] != float64(1) || resp["imported"] != float64(0) {
+		t.Fatalf("counts = imported %v failed %v, want the line refused", resp["imported"], resp["failed"])
+	}
+	if records := loadPool(t, stateDir).All(); len(records) != 0 {
+		t.Fatalf("a refused line wrote %d identities", len(records))
+	}
+}
+
 func TestImportMailboxesRejectsAnEmptyPaste(t *testing.T) {
 	_, r, _ := setupImportTest(t)
 	unlockedEmptyStore(t)
@@ -310,13 +392,39 @@ func TestLooksLikeClientID(t *testing.T) {
 	}
 }
 
+func TestValidIMAPHost(t *testing.T) {
+	cases := []struct {
+		host string
+		want bool
+	}{
+		// A bare hostname dials on 993 with implicit TLS, which is the normal
+		// shape of a mail server on a custom domain.
+		{"imap.example.com", true},
+		{"imap.example.com:993", true},
+		{"mail.own.example:143", true},
+		// A colon that is not a port separator, or a non-numeric port, would
+		// reach the dialer as a nonsense address.
+		{"https://imap.example.com", false},
+		{"imap.example.com:imap", false},
+		{"imap.example.com/", false},
+		{"user@imap.example.com", false},
+		{"", false},
+		{":993", false},
+	}
+	for _, testCase := range cases {
+		if got := validIMAPHost(testCase.host); got != testCase.want {
+			t.Errorf("validIMAPHost(%q) = %v, want %v", testCase.host, got, testCase.want)
+		}
+	}
+}
+
 func TestParseMailboxLinesNamesTheBrokenPart(t *testing.T) {
 	lines := parseMailboxLines(strings.Join([]string{
 		"not-an-address----pw----11111111-1111-1111-1111-111111111111----tok",
 		"a@b.com----pw----not-a-guid----tok",
 		"a@b.com----pw----11111111-1111-1111-1111-111111111111----",
 		"a@b.com----pw----11111111-1111-1111-1111-111111111111----tok",
-	}, "\n"))
+	}, "\n"), supply.NatureOAuth2, "")
 	if len(lines) != 4 {
 		t.Fatalf("parsed %d lines, want 4", len(lines))
 	}
@@ -335,6 +443,58 @@ func TestParseMailboxLinesNamesTheBrokenPart(t *testing.T) {
 	// person signing in to the mailbox's own web page needs.
 	if lines[3].Password != "pw" {
 		t.Fatalf("password field = %q, want pw", lines[3].Password)
+	}
+}
+
+// An IMAP line names the host it is read from, either on the line or as the
+// batch's. A line that ends up with neither is refused here rather than at dial
+// time, where the answer would read as a credential failure.
+func TestParseIMAPLinesNamesTheBrokenPart(t *testing.T) {
+	// With no batch host, a line must carry its own. A bare hostname is enough:
+	// the reader falls back to 993 with implicit TLS.
+	unhosted := parseMailboxLines(strings.Join([]string{
+		"dana@own.example----imap-pw",
+		"evan@own.example----imap-pw----mail.own.example",
+		"frank@own.example----imap-pw----https://mail.own.example",
+	}, "\n"), supply.NatureIMAP, "")
+	if len(unhosted) != 3 {
+		t.Fatalf("parsed %d lines, want 3", len(unhosted))
+	}
+	if unhosted[0].Err == nil {
+		t.Fatalf("a line with no host anywhere parsed without an error: %+v", unhosted[0])
+	}
+	if unhosted[1].Err != nil {
+		t.Fatalf("a bare hostname was refused: %v", unhosted[1].Err)
+	}
+	if unhosted[2].Err == nil {
+		t.Fatalf("a url was accepted as a host: %+v", unhosted[2])
+	}
+
+	lines := parseMailboxLines(strings.Join([]string{
+		"finn@own.example----",
+		"not-an-address----imap-pw",
+		"gwen@own.example----imap-pw",
+		"hana@own.example----imap-pw----mail.hana.example:993",
+	}, "\n"), supply.NatureIMAP, "mail.own.example:993")
+	if len(lines) != 4 {
+		t.Fatalf("parsed %d lines, want 4", len(lines))
+	}
+	if lines[0].Err == nil || lines[1].Err == nil {
+		t.Fatalf("an empty password or a non-address was accepted: %+v %+v", lines[0], lines[1])
+	}
+	// A two-field line takes the batch host.
+	if lines[2].Err != nil {
+		t.Fatalf("two-field line reported %v", lines[2].Err)
+	}
+	if lines[2].Host != "mail.own.example:993" || lines[2].Password != "imap-pw" {
+		t.Fatalf("two-field line parsed as %+v", lines[2])
+	}
+	// A third field overrides it.
+	if lines[3].Err != nil {
+		t.Fatalf("three-field line reported %v", lines[3].Err)
+	}
+	if lines[3].Host != "mail.hana.example:993" {
+		t.Fatalf("three-field host = %q, want the line's own", lines[3].Host)
 	}
 }
 

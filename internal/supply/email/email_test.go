@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -493,7 +494,7 @@ func TestProviderInboxReportsUnreadableFolders(t *testing.T) {
 	}
 	provider := newProvider(t, session, imapChannel("qq", "box@qq.com", "ormnes.com", true))
 
-	_, errInbox := provider.Inbox(context.Background(), "", 10)
+	_, errInbox := provider.Inbox(context.Background(), "", InboxScopeChannel, 10)
 	if errInbox == nil {
 		t.Fatal("Inbox returned no error for a mailbox it could not read")
 	}
@@ -516,7 +517,7 @@ func TestProviderInboxListsNewestFirst(t *testing.T) {
 	}
 	provider := newProvider(t, session, imapChannel("qq", "box@qq.com", "ormnes.com", true))
 
-	reading, errInbox := provider.Inbox(context.Background(), "", 10)
+	reading, errInbox := provider.Inbox(context.Background(), "", InboxScopeChannel, 10)
 	if errInbox != nil {
 		t.Fatalf("Inbox: %v", errInbox)
 	}
@@ -546,7 +547,7 @@ func TestProviderInboxListsNewestFirst(t *testing.T) {
 func TestProviderInboxCountsPerMailbox(t *testing.T) {
 	empty := &fakeSession{folders: []string{"INBOX"}, mails: map[string][]Mail{}}
 	provider := newProvider(t, empty, imapChannel("quiet", "box@qq.com", "ormnes.com", true))
-	reading, errInbox := provider.Inbox(context.Background(), "", 10)
+	reading, errInbox := provider.Inbox(context.Background(), "", InboxScopeChannel, 10)
 	if errInbox != nil {
 		t.Fatalf("Inbox: %v", errInbox)
 	}
@@ -770,7 +771,7 @@ func TestProviderTargetsOAuth2Mailbox(t *testing.T) {
 	if want := supply.EmailOAuth2CredentialName("box@outlook.com"); targets[0].SecretName != want {
 		t.Fatalf("secret name = %q, want %q", targets[0].SecretName, want)
 	}
-	if _, errInbox := provider.Inbox(context.Background(), "", 10); errInbox != nil {
+	if _, errInbox := provider.Inbox(context.Background(), "", InboxScopeChannel, 10); errInbox != nil {
 		t.Fatalf("Inbox: %v", errInbox)
 	}
 	if want := "auth-code-for-" + targets[0].SecretName; session.dialled != want {
@@ -1039,7 +1040,7 @@ func TestProviderInboxReadsChannelMailboxesOnly(t *testing.T) {
 		t.Fatalf("New: %v", errNew)
 	}
 
-	reading, errInbox := provider.Inbox(context.Background(), "", 5)
+	reading, errInbox := provider.Inbox(context.Background(), "", InboxScopeChannel, 5)
 	if errInbox != nil {
 		t.Fatalf("Inbox: %v", errInbox)
 	}
@@ -1055,8 +1056,117 @@ func TestProviderInboxReadsChannelMailboxesOnly(t *testing.T) {
 
 	// An address no mailbox receives is not "no mail": nothing was read, and
 	// saying otherwise would hide the address behind a convincing empty answer.
-	if _, errUnknown := provider.Inbox(context.Background(), "x@elsewhere.com", 5); !errors.Is(errUnknown, supply.ErrUnknownIdentity) {
+	if _, errUnknown := provider.Inbox(context.Background(), "x@elsewhere.com", InboxScopeChannel, 5); !errors.Is(errUnknown, supply.ErrUnknownIdentity) {
 		t.Fatalf("err = %v, want ErrUnknownIdentity", errUnknown)
+	}
+}
+
+// The pool table asks for its own mail. An identity is one address carrying its
+// own credential, and an answer that opened a channel's mailbox would report on a
+// row the table does not list.
+func TestProviderInboxReadsPoolIdentitiesOnly(t *testing.T) {
+	base := time.Date(2026, 10, 14, 10, 0, 0, 0, time.UTC)
+	session := &fakeSession{
+		folders: []string{"INBOX"},
+		mails:   map[string][]Mail{"INBOX": {mailTo("bought@outlook.com", "222222", base)}},
+	}
+	pool := supply.NewPool()
+	pool.AttachMailbox(supply.KindEmail, "bought@outlook.com", supply.Mailbox{
+		Nature:   supply.NatureIMAP,
+		Endpoint: "imap.outlook.example:993",
+		Secret:   supply.EmailCredentialName("bought@outlook.com"),
+	}, base.Unix())
+
+	provider, errNew := New(Config{
+		ChannelsPath: writeChannels(t, imapChannel("qq", "box@qq.com", "ormnes.com", true)),
+		Credential:   func(name string) (string, error) { return "secret-for-" + name, nil },
+		Dial: func(ctx context.Context, target Target) (Session, error) {
+			session.dialled = target.Account
+			return session, nil
+		},
+		Pool: pool,
+	})
+	if errNew != nil {
+		t.Fatalf("New: %v", errNew)
+	}
+
+	reading, errInbox := provider.Inbox(context.Background(), "", InboxScopePool, 10)
+	if errInbox != nil {
+		t.Fatalf("Inbox: %v", errInbox)
+	}
+	if len(reading.Mailboxes) != 1 {
+		t.Fatalf("read %d mailboxes, want only the pool's one", len(reading.Mailboxes))
+	}
+	if got := reading.Mailboxes[0].Account; got != "bought@outlook.com" {
+		t.Fatalf("mailbox = %q, want the pool identity", got)
+	}
+	if reading.Mailboxes[0].ChannelID != "" {
+		t.Fatalf("channel = %q, want no channel on a pool identity", reading.Mailboxes[0].ChannelID)
+	}
+	if session.dialled != "bought@outlook.com" {
+		t.Fatalf("opened %q, want the pool identity only", session.dialled)
+	}
+	if len(reading.Mails) != 1 || reading.Mails[0].Code != "222222" {
+		t.Fatalf("mails = %+v, want the pool identity's one message", reading.Mails)
+	}
+}
+
+// A scope this build cannot answer is refused instead of being read as the
+// default: silently answering about the wrong table is worse than an error.
+func TestProviderInboxRefusesUnknownScope(t *testing.T) {
+	provider := newProvider(t, &fakeSession{folders: []string{"INBOX"}},
+		imapChannel("qq", "box@qq.com", "ormnes.com", true))
+
+	if _, errInbox := provider.Inbox(context.Background(), "", "everyone", 10); !errors.Is(errInbox, ErrInboxScope) {
+		t.Fatalf("err = %v, want ErrInboxScope", errInbox)
+	}
+	// A named address does not make an unknown scope valid: the caller still
+	// asked for a range this build does not have.
+	if _, errInbox := provider.Inbox(context.Background(), "box@qq.com", "everyone", 10); !errors.Is(errInbox, ErrInboxScope) {
+		t.Fatalf("err with an address = %v, want ErrInboxScope", errInbox)
+	}
+}
+
+// The answer is reported in mailbox order, not in the order the mailboxes
+// happened to answer: a row that moved because one server was slow would make
+// the operator read the wrong mailbox.
+func TestProviderInboxKeepsMailboxOrder(t *testing.T) {
+	accounts := []string{"first@a.example", "second@b.example", "third@c.example"}
+	channels := make([]supply.Channel, 0, len(accounts))
+	for _, account := range accounts {
+		channels = append(channels, imapChannel(account, account, "", true))
+	}
+	var others sync.WaitGroup
+	others.Add(len(accounts) - 1)
+	provider, errNew := New(Config{
+		ChannelsPath: writeChannels(t, channels...),
+		Credential:   func(name string) (string, error) { return "secret-for-" + name, nil },
+		Dial: func(ctx context.Context, target Target) (Session, error) {
+			if target.Account == accounts[0] {
+				// The first mailbox answers last, so an answer assembled in
+				// completion order would report it at the end.
+				others.Wait()
+			} else {
+				others.Done()
+			}
+			return &fakeSession{folders: []string{"INBOX"}}, nil
+		},
+	})
+	if errNew != nil {
+		t.Fatalf("New: %v", errNew)
+	}
+
+	reading, errInbox := provider.Inbox(context.Background(), "", InboxScopeChannel, 10)
+	if errInbox != nil {
+		t.Fatalf("Inbox: %v", errInbox)
+	}
+	if len(reading.Mailboxes) != len(accounts) {
+		t.Fatalf("read %d mailboxes, want %d", len(reading.Mailboxes), len(accounts))
+	}
+	for index, account := range accounts {
+		if got := reading.Mailboxes[index].Account; got != account {
+			t.Fatalf("mailbox %d = %q, want %q", index, got, account)
+		}
 	}
 }
 

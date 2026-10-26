@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/secretstore"
@@ -480,18 +481,58 @@ type InboxMailbox struct {
 	Err string
 }
 
+// InboxScope names which mailboxes an inbox read covers.
+//
+// The two are separate tables in the panel, and they are separate things: a
+// channel is one connection that covers many addresses, a pool identity is one
+// address that carries its own credential. A read that mixed them would answer
+// about mailboxes the table on screen does not list, and a row would report "no
+// mail" for a mailbox the read never opened.
+const (
+	// InboxScopeChannel reads the mailboxes of channels only.
+	InboxScopeChannel = "channel"
+	// InboxScopePool reads the individually-held identities only.
+	InboxScopePool = "pool"
+)
+
+// ErrInboxScope reports an inbox scope this provider does not know. It is kept
+// apart from the read failures because it is the caller's mistake rather than the
+// mailbox's, so the handler answers it with 400 instead of blaming a mailbox.
+var ErrInboxScope = errors.New("email: unknown inbox scope")
+
+// inboxReadWorkers is how many mailboxes one inbox read opens at once. A read is
+// network-bound and mostly waiting, so a small pool turns a hundred mailboxes
+// from a hundred sequential connections into a few rounds; the cap keeps one
+// panel view from opening every mailbox the service holds at the same instant.
+// The dial gate still bounds how many sessions are actually open.
+const inboxReadWorkers = 6
+
+// inboxRead is one mailbox's answer within a parallel read.
+type inboxRead struct {
+	mails []Mail
+	err   error
+}
+
 // Inbox returns recent mail across the configured mailboxes, newest first.
 //
 // This is the management surface's read: the operator wants to see what
-// actually arrived, including mail that states no code. An empty address means
-// "everything the channels hold", which is what a channel row reports.
+// actually arrived, including mail that states no code. address narrows the read
+// to mail addressed to one address; scope names which table's mailboxes are read
+// when it is empty (see InboxScope). An empty scope keeps the older meaning, the
+// channel mailboxes, so a caller written before the pool had an inbox view of its
+// own keeps its answer.
 //
-// It deliberately does not walk the bought mailboxes: one address, one mailbox,
-// is what ReadAfter is for. Opening a thousand bought mailboxes to fill one
-// panel would cost a thousand connections per view, and a channel row has
-// nothing to say about a mailbox that no channel issued.
-func (p *ProviderImpl) Inbox(ctx context.Context, address string, limit int) (InboxReading, error) {
+// A named address ignores scope: only the mailboxes that can receive it are
+// opened, whichever table they are filed under.
+func (p *ProviderImpl) Inbox(ctx context.Context, address, scope string, limit int) (InboxReading, error) {
 	wanted := strings.ToLower(strings.TrimSpace(address))
+	switch strings.ToLower(strings.TrimSpace(scope)) {
+	case "", InboxScopeChannel:
+		scope = InboxScopeChannel
+	case InboxScopePool:
+	default:
+		return InboxReading{}, fmt.Errorf("%w: %q", ErrInboxScope, scope)
+	}
 	if limit <= 0 {
 		limit = p.cfg.MaxMessages
 	}
@@ -503,19 +544,23 @@ func (p *ProviderImpl) Inbox(ctx context.Context, address string, limit int) (In
 		return InboxReading{}, supply.ErrUnavailable
 	}
 	// A mailbox that cannot receive the address cannot hold its mail, so reading
-	// it would only cost a connection. An empty address asks for the channels'
-	// own mailboxes, which are the ones a row speaks for.
+	// it would only cost a connection. An empty address asks for one table's
+	// mailboxes: the channels' own, or the pool's identities.
 	narrowed := make([]Target, 0, len(targets))
 	for _, target := range orderTargets(targets, wanted) {
-		if wanted == "" {
-			if strings.TrimSpace(target.ChannelID) != "" {
+		if wanted != "" {
+			if target.Covers(wanted) {
 				narrowed = append(narrowed, target)
 			}
 			continue
 		}
-		if target.Covers(wanted) {
-			narrowed = append(narrowed, target)
+		// A pool identity is filed without a channel: it is not a source of
+		// addresses, so an answer about it must not point at one.
+		isChannel := strings.TrimSpace(target.ChannelID) != ""
+		if isChannel != (scope == InboxScopeChannel) {
+			continue
 		}
+		narrowed = append(narrowed, target)
 	}
 	if wanted != "" && len(narrowed) == 0 {
 		// Nothing here receives this address, so this service never handed it
@@ -528,39 +573,60 @@ func (p *ProviderImpl) Inbox(ctx context.Context, address string, limit int) (In
 	}
 	reading := InboxReading{
 		Window:    p.cfg.PollWindow,
-		Mailboxes: make([]InboxMailbox, 0, len(targets)),
+		Mailboxes: make([]InboxMailbox, len(targets)),
 	}
+	// Each mailbox writes its own index, so the answer is reported in the order
+	// the mailboxes were ordered in rather than in the order they happened to
+	// answer, and no lock is needed to keep the two apart.
+	answers := make([]inboxRead, len(targets))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, inboxReadWorkers)
+	for index, target := range targets {
+		wg.Go(func() {
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				answers[index] = inboxRead{err: ctx.Err()}
+				return
+			}
+			defer func() { <-sem }()
+			mails, _, errScan := p.scan(ctx, target, wanted, Cursor{}, limit)
+			answers[index] = inboxRead{mails: mails, err: errScan}
+		})
+	}
+	wg.Wait()
+
 	collected := make([]Mail, 0, limit)
 	var firstErr error
 	scanned := false
-	for _, target := range orderTargets(targets, wanted) {
+	for index, target := range targets {
+		answer := answers[index]
 		summary := InboxMailbox{
 			ChannelID: target.ChannelID,
 			Label:     target.Label,
 			Account:   target.Account,
 			Domain:    target.Domain,
 		}
-		mails, _, errScan := p.scan(ctx, target, wanted, Cursor{}, limit)
-		if errScan != nil {
+		if answer.err != nil {
 			// One mailbox failing is not the whole read failing: another may
-			// answer. But the failure is reported per mailbox, because a channel
-			// row that says "no mail" while its mailbox was never opened is the
+			// answer. But the failure is reported per mailbox, because a row
+			// that says "no mail" while its mailbox was never opened is the
 			// kind of answer that sends the operator looking in the wrong place.
-			summary.Err = errScan.Error()
+			summary.Err = answer.err.Error()
 			if firstErr == nil {
-				firstErr = errScan
+				firstErr = answer.err
 			}
-			reading.Mailboxes = append(reading.Mailboxes, summary)
+			reading.Mailboxes[index] = summary
 			continue
 		}
 		scanned = true
-		summary.Count = len(mails)
-		if len(mails) > 0 {
-			latest := mails[0]
+		summary.Count = len(answer.mails)
+		if len(answer.mails) > 0 {
+			latest := answer.mails[0]
 			summary.Latest = &latest
 		}
-		reading.Mailboxes = append(reading.Mailboxes, summary)
-		collected = append(collected, mails...)
+		reading.Mailboxes[index] = summary
+		collected = append(collected, answer.mails...)
 	}
 	if !scanned && firstErr != nil {
 		return InboxReading{}, firstErr

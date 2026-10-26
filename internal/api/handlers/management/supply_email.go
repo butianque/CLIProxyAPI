@@ -84,7 +84,10 @@ func (h *Handler) GetSupplyEmailStatus(c *gin.Context) {
 //
 // The address parameter narrows the listing to mail addressed to one address;
 // without it the listing is the mailboxes' recent mail, which is what an inbox
-// view shows before anything is searched for.
+// view shows before anything is searched for. The scope parameter names which
+// table that listing covers: the channel mailboxes (the default) or the pool
+// identities, because the panel shows them as two tables and each one asks for
+// its own mail.
 func (h *Handler) GetSupplyEmailInbox(c *gin.Context) {
 	provider, errProvider := emailProvider()
 	if errProvider != nil {
@@ -103,8 +106,16 @@ func (h *Handler) GetSupplyEmailInbox(c *gin.Context) {
 		}
 	}
 	address := strings.TrimSpace(c.Query("address"))
-	reading, errInbox := provider.Inbox(c.Request.Context(), address, limit)
+	scope := strings.TrimSpace(c.Query("scope"))
+	reading, errInbox := provider.Inbox(c.Request.Context(), address, scope, limit)
 	if errInbox != nil {
+		// An unknown scope is the caller's mistake, not a mailbox failure: it is
+		// refused before any mailbox is opened, and saying so keeps the operator
+		// from reading a bad query parameter as a broken mailbox.
+		if errors.Is(errInbox, email.ErrInboxScope) {
+			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "unknown inbox scope"})
+			return
+		}
 		// A read that could not run is not an empty inbox: reporting it as one
 		// would hide a broken mailbox behind a convincing "no mail".
 		payload := gin.H{"status": "error", "error": errInbox.Error(), "enabled": true}
