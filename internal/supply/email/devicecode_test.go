@@ -311,6 +311,43 @@ func TestPollDeviceTokenReportsTheGrantedScope(t *testing.T) {
 	}
 }
 
+// The permission a scope names has to match exactly, because "Mail.ReadBasic"
+// grants metadata only: a mailbox authorized for it lists its folders — so a
+// probe reports it online — and then never yields a code. Accepting it by
+// substring would make this check a guarantee it cannot keep.
+func TestPollDeviceTokenReadsThePermissionExactly(t *testing.T) {
+	cases := []struct {
+		name  string
+		scope string
+		want  bool
+	}{
+		{"body read", "https://graph.microsoft.com/Mail.Read offline_access", true},
+		{"body read and write", "https://graph.microsoft.com/Mail.ReadWrite", true},
+		{"shared mailbox", "https://graph.microsoft.com/Mail.Read.Shared", true},
+		{"metadata only", "https://graph.microsoft.com/Mail.ReadBasic offline_access", false},
+		{"metadata only, application permission", "https://graph.microsoft.com/Mail.ReadBasic.All", false},
+		{"unrelated permission", "https://graph.microsoft.com/User.Read offline_access", false},
+		{"permission without a resource", "Mail.Read offline_access", true},
+		{"no scope named", "", true},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"access_token":"at-1","refresh_token":"rt-1","expires_in":3600,` +
+					`"scope":"` + testCase.scope + `"}`))
+			}))
+			defer server.Close()
+
+			_, errPoll := PollDeviceToken(context.Background(), server.URL, "app-123", "dc-1", nil)
+			if accepted := errPoll == nil; accepted != testCase.want {
+				t.Fatalf("scope %q accepted = %v, want %v (error: %v)",
+					testCase.scope, accepted, testCase.want, errPoll)
+			}
+		})
+	}
+}
+
 // unlockedTestStore gives a test a real, open secret store. The write-back is a
 // store operation, so faking the store would test nothing.
 func unlockedTestStore(t *testing.T) *secretstore.Store {

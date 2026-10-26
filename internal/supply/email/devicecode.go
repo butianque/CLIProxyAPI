@@ -284,14 +284,45 @@ func PollDeviceToken(ctx context.Context, tokenURL, clientID, deviceCode string,
 //
 // An answer that names no scope is not evidence of a missing permission: the
 // field is optional, and refusing a sign-in that works would be the same mistake
-// in the other direction. Only a scope list that is present and does not name
-// Mail.Read is proof.
+// in the other direction. Only a scope list that is present and names no readable
+// permission is proof.
 func grantsMailRead(scope string) bool {
 	scope = strings.TrimSpace(scope)
 	if scope == "" {
 		return true
 	}
-	return strings.Contains(strings.ToLower(scope), "mail.read")
+	for granted := range strings.FieldsSeq(scope) {
+		if readsMailBody(granted) {
+			return true
+		}
+	}
+	return false
+}
+
+// readsMailBody reports whether one granted scope is a permission that can read a
+// message body.
+//
+// The permission is the last path segment: "https://graph.microsoft.com/Mail.Read"
+// is the permission "Mail.Read". It has to be compared exactly, because
+// "Mail.ReadBasic" sits one word away from "Mail.Read" and grants metadata only.
+// A substring test accepts it, and the mailbox it produces answers a probe — a
+// folder listing is metadata — while never yielding a code, which is a harder
+// failure to diagnose than a refused sign-in.
+//
+// "Mail.ReadWrite" and the ".Shared" variants do read a body, so they count. An
+// unrecognised permission does not: the list below is the whole delegated family
+// that can read mail, and a name outside it is more likely to be a narrower
+// permission than one this code has not heard of.
+func readsMailBody(granted string) bool {
+	permission := granted
+	if cut := strings.LastIndex(permission, "/"); cut >= 0 {
+		permission = permission[cut+1:]
+	}
+	switch strings.ToLower(permission) {
+	case "mail.read", "mail.read.shared", "mail.readwrite", "mail.readwrite.shared":
+		return true
+	}
+	return false
 }
 
 // VerifyAccount asks Graph who an access token belongs to.
