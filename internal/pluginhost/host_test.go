@@ -935,6 +935,81 @@ func TestHostApplyConfigQuiescesBeforeHotReloadRegistration(t *testing.T) {
 	}
 }
 
+// Replacing a plugin keeps the previous instance resident so in-flight calls can
+// finish where they started, but keeping every generation leaks a library and
+// its goroutines per deploy. The retained window is bounded and the oldest
+// generation is closed through the normal unload path once it falls out.
+func TestHostApplyConfigReclaimsOldestRetiredPluginInstance(t *testing.T) {
+	var out bytes.Buffer
+	originalOut := log.StandardLogger().Out
+	originalFormatter := log.StandardLogger().Formatter
+	originalLevel := log.GetLevel()
+	log.SetOutput(&out)
+	log.SetFormatter(&log.TextFormatter{DisableColors: true, DisableTimestamp: true})
+	log.SetLevel(log.InfoLevel)
+	t.Cleanup(func() {
+		log.SetOutput(originalOut)
+		log.SetFormatter(originalFormatter)
+		log.SetLevel(originalLevel)
+	})
+
+	clients := make([]*lifecycleTestClient, 0, 4)
+	sequencedClients := make([]pluginClient, 0, 4)
+	for range 4 {
+		client := &lifecycleTestClient{call: func(_ context.Context, method string, _ []byte) ([]byte, error) {
+			switch method {
+			case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
+				return lifecycleRegistrationResult(validTestPlugin("alpha"))
+			case pluginabi.MethodPluginQuiesce:
+				return marshalRPCResult(rpcEmptyResponse{})
+			default:
+				return nil, fmt.Errorf("unexpected plugin method %s", method)
+			}
+		}}
+		clients = append(clients, client)
+		sequencedClients = append(sequencedClients, client)
+	}
+	h := NewForTest(&sequencePluginLoader{clients: sequencedClients})
+	t.Cleanup(h.ShutdownAll)
+	pluginsDir, _ := makeVersionedPluginDir(t, "alpha", "1.0.0")
+
+	h.ApplyConfig(context.Background(), versionedPluginHostConfig(t, pluginsDir, "1.0.0"))
+	for _, version := range []string{"1.1.0", "1.2.0", "1.3.0"} {
+		writeVersionedPluginFile(t, pluginsDir, "alpha", version)
+		h.ApplyConfig(context.Background(), versionedPluginHostConfig(t, pluginsDir, version))
+	}
+
+	// Three replacements leave two retired generations; the oldest is reclaimed.
+	if got := clients[0].shutdownCalls.Load(); got != 1 {
+		t.Fatalf("oldest retired instance shutdown calls = %d, want 1", got)
+	}
+	for index := 1; index < len(clients); index++ {
+		if got := clients[index].shutdownCalls.Load(); got != 0 {
+			t.Fatalf("retained instance %d shutdown calls = %d, want 0", index, got)
+		}
+	}
+
+	h.mu.Lock()
+	retiredVersions := make([]string, 0, len(h.retired["alpha"]))
+	for _, lp := range h.retired["alpha"] {
+		retiredVersions = append(retiredVersions, lp.version)
+	}
+	h.mu.Unlock()
+	if got, want := retiredVersions, []string{"1.1.0", "1.2.0"}; !slices.Equal(got, want) {
+		t.Fatalf("retired versions = %v, want %v", got, want)
+	}
+
+	logs := out.String()
+	if count := strings.Count(logs, `msg="pluginhost: retired plugin instance reclaimed"`); count != 1 {
+		t.Fatalf("reclaim log count = %d, want 1\n%s", count, logs)
+	}
+	for _, want := range []string{"plugin_id=alpha", "file_version=1.0.0", "retired_instances=2"} {
+		if !strings.Contains(logs, want) {
+			t.Fatalf("reclaim log missing %s:\n%s", want, logs)
+		}
+	}
+}
+
 func TestHostApplyConfigRollsBackQuiescedPluginWhenReplacementFails(t *testing.T) {
 	events := &lifecycleEventRecorder{}
 	var configMu sync.Mutex

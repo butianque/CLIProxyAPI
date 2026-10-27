@@ -21,6 +21,20 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+// maxRetiredPluginInstances bounds how many replaced instances stay resident per
+// plugin id. A retired instance is kept so in-flight calls can finish on the
+// library they started in: client_guard drains those calls before the library is
+// closed, so the newest retired instance is the one that matters. One more is
+// slack for two deployments landing back to back before the first generation has
+// drained. Everything older is reclaimed here instead of accumulating until the
+// plugin is unloaded or the process exits.
+//
+// Reclaiming is deliberately not "shutdown the replaced instance immediately":
+// a plugin may implement cliproxy_shutdown_plugin as a no-op because touching Go
+// synchronization primitives on the cgo exit path crashes it, and a hot reload
+// must not drag that risk into every deploy.
+const maxRetiredPluginInstances = 2
+
 type loadedPlugin struct {
 	id               string
 	path             string
@@ -296,6 +310,7 @@ func (h *Host) ApplyConfig(ctx context.Context, cfg *config.Config) {
 
 		loadedNow := false
 		var hotReloadFields log.Fields
+		var reclaimedRetired []*loadedPlugin
 		var plugin pluginapi.Plugin
 		registeredNow := false
 		if lp == nil {
@@ -375,7 +390,7 @@ func (h *Host) ApplyConfig(ctx context.Context, cfg *config.Config) {
 					hotReloadFields["retired_fingerprint"] = pluginFingerprintPrefix(replaced.fingerprint)
 					hotReloadFields["loaded_fingerprint"] = pluginFingerprintPrefix(lp.fingerprint)
 				}
-				h.retireLoadedPluginLocked(replaced)
+				reclaimedRetired = h.retireLoadedPluginLocked(replaced)
 				delete(h.fused, file.ID)
 				h.removePluginRuntimeStateLocked(file.ID)
 			}
@@ -384,6 +399,10 @@ func (h *Host) ApplyConfig(ctx context.Context, cfg *config.Config) {
 			plugin = loadResult.plugin
 			registeredNow = loadResult.initialized
 			h.mu.Unlock()
+			// Trimmed under the lock above, closed here: shutdown drains in-flight
+			// calls through client_guard and those callbacks read host state, so
+			// closing while holding h.mu could deadlock against them.
+			h.closeRetiredPluginInstances(reclaimedRetired)
 			loadedFields := pluginLogFields(file.ID, "", file.Version, file.Path)
 			if prefix := pluginFingerprintPrefix(lp.fingerprint); prefix != "" {
 				loadedFields["fingerprint"] = prefix
@@ -890,11 +909,44 @@ func cleanPluginPath(path string) string {
 	return filepath.Clean(path)
 }
 
-func (h *Host) retireLoadedPluginLocked(lp *loadedPlugin) {
+// retireLoadedPluginLocked appends lp to the plugin's retired list and returns
+// the instances that no longer fit in the retained window, oldest first. The
+// caller must close them after releasing h.mu; see closeRetiredPluginInstances.
+func (h *Host) retireLoadedPluginLocked(lp *loadedPlugin) []*loadedPlugin {
 	if h == nil || lp == nil {
-		return
+		return nil
 	}
-	h.retired[lp.id] = append(h.retired[lp.id], lp)
+	retired := append(h.retired[lp.id], lp)
+	if len(retired) <= maxRetiredPluginInstances {
+		h.retired[lp.id] = retired
+		return nil
+	}
+	evicted := len(retired) - maxRetiredPluginInstances
+	reclaimed := append([]*loadedPlugin(nil), retired[:evicted]...)
+	retained := append([]*loadedPlugin(nil), retired[evicted:]...)
+	h.retired[lp.id] = retained
+	return reclaimed
+}
+
+// closeRetiredPluginInstances reclaims retired instances that fell out of the
+// window. It mirrors the unload path (instance-scoped callback cleanup, then
+// shutdownPluginClient, which runs cliproxy_shutdown_plugin and dlclose) but
+// never runs under h.mu: client shutdown drains in-flight calls and those
+// callbacks read host state, so holding the lock across it risks a deadlock.
+func (h *Host) closeRetiredPluginInstances(instances []*loadedPlugin) {
+	for _, lp := range instances {
+		if lp == nil {
+			continue
+		}
+		h.closeHostHTTPCallbackInstance(lp.id, lp.callbackInstance)
+		shutdownPluginClient(context.Background(), lp.client)
+		h.mu.Lock()
+		remaining := len(h.retired[lp.id])
+		h.mu.Unlock()
+		fields := pluginLogFields(lp.id, lp.name, lp.version, lp.path)
+		fields["retired_instances"] = remaining
+		log.WithFields(fields).Info("pluginhost: retired plugin instance reclaimed")
+	}
 }
 
 func (h *Host) recordCurrent(record capabilityRecord) bool {
