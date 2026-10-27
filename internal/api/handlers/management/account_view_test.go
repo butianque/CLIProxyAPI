@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
@@ -388,6 +389,7 @@ func TestListAccountsReportsCachedQuotaAndFailedProbe(t *testing.T) {
 							DisplayName: "start-plan",
 							Buckets: []pluginapi.QuotaBucket{{
 								Model:             "glm-5.3",
+								Label:             "  Coding Plan  ",
 								Window:            "plan",
 								RemainingFraction: 0.12,
 								Remaining:         &remaining,
@@ -432,6 +434,11 @@ func TestListAccountsReportsCachedQuotaAndFailedProbe(t *testing.T) {
 	if bucket["model"] != "glm-5.3" || bucket["remaining"] != float64(12) || bucket["total"] != float64(100) {
 		t.Fatalf("quota bucket = %#v", bucket)
 	}
+	// The row title is its own field, independent of the model, and padded
+	// whitespace is trimmed on the way out.
+	if bucket["label"] != "Coding Plan" {
+		t.Fatalf("quota bucket label = %#v, want trimmed %q", bucket["label"], "Coding Plan")
+	}
 
 	// The channel list is what the credential can actually route through: a
 	// padded key is trimmed, and a channel without a key is dropped because a
@@ -467,6 +474,17 @@ func TestListAccountsReportsCachedQuotaAndFailedProbe(t *testing.T) {
 	channels, ok = account["channels"].([]any)
 	if !ok || len(channels) != 2 {
 		t.Fatalf("a failed probe must keep the last known channels, got %#v", account["channels"])
+	}
+
+	// A reading past its freshness window is still reported, but flagged stale,
+	// so the panel can show it as an old number instead of a live balance.
+	host.SetQuotaClockForTest(func() time.Time { return time.Now().Add(time.Hour) })
+	account = accountList(t, listAccounts(t, h, "/v8/management/accounts"))[0]
+	if account["quota_stale"] != true {
+		t.Fatalf("quota_stale = %#v, want true for a reading past its freshness window", account["quota_stale"])
+	}
+	if _, ok := account["fetched_at"].(string); !ok {
+		t.Fatalf("a stale reading must keep reporting when it was fetched, got %#v", account["fetched_at"])
 	}
 }
 

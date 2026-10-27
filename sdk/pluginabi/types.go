@@ -111,7 +111,16 @@ const (
 	MethodHostAuthSave           = "host.auth.save"
 	MethodHostAffinityLookup     = "host.affinity.lookup"
 
+	// MethodHostRoutingResetCooldown clears quota and cooldown state for one
+	// credential. Clearing is host-owned: a plugin that hit a cooldown asks the
+	// host to forget it instead of tracking the deadline itself.
 	MethodHostRoutingResetCooldown = "host.routing.reset_cooldown"
+	// MethodHostRoutingSetCooldown puts one credential, or one model on it, into
+	// a cooldown until a stated time. A plugin that learns a provider's real
+	// reset time (a 429 with Retry-After, a quota response saying when the plan
+	// refills) reports it here, so the routing decision and the reported state
+	// come from one clock instead of the plugin keeping its own.
+	MethodHostRoutingSetCooldown = "host.routing.set_cooldown"
 
 	// MethodHostSecretStatus reports whether the host secret store is available
 	// and which secret names exist.
@@ -155,7 +164,13 @@ type Envelope struct {
 }
 
 type Error struct {
-	Code      string `json:"code"`
+	Code string `json:"code"`
+	// Message is shown to the caller and, for a credential failure, to the
+	// operator in the panel. It is therefore not a free-form diagnostic sink:
+	// text copied from an upstream response must be passed through
+	// pluginapi.SafeUserText first, because an upstream error body can quote the
+	// credential that failed. Full detail belongs in the host's logs, which
+	// redact and bound it independently.
 	Message   string `json:"message"`
 	Retryable bool   `json:"retryable,omitempty"`
 	// HTTPStatus is the HTTP status code (e.g. 401, 403, 429) to surface to the client.

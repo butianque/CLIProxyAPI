@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
@@ -96,7 +97,10 @@ type Host struct {
 	callbackContexts       *callbackContextRegistry
 	quotaMu                sync.Mutex
 	quotaSnapshots         map[string]quotaSnapshotRecord
-	snapshot               atomic.Value
+	// quotaNow is the snapshot store's clock. It is replaced in tests so expiry
+	// and eviction are exercised without waiting on the wall clock.
+	quotaNow func() time.Time
+	snapshot atomic.Value
 }
 
 func New() *Host {
@@ -130,6 +134,7 @@ func New() *Host {
 		modelStreams:           newModelStreamBridge(),
 		callbackContexts:       newCallbackContextRegistry(),
 		quotaSnapshots:         make(map[string]quotaSnapshotRecord),
+		quotaNow:               time.Now,
 	}
 	h.snapshot.Store(emptySnapshot())
 	return h

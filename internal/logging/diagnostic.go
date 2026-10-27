@@ -9,6 +9,8 @@ import (
 	"regexp"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 const (
@@ -17,16 +19,18 @@ const (
 )
 
 var (
-	accessTokenExpiredLogPattern  = regexp.MustCompile(`(?i)access token expired`)
-	sensitiveLogAssignmentPattern = regexp.MustCompile(`(?i)(["']?(?:access[\s_-]*token|refresh[\s_-]*token|id[\s_-]*token|api[\s_-]*key|client[\s_-]*secret|private[\s_-]*key|proxy[\s_-]*authorization|authorization|password|credential|token|secret)["']?\s*[:=]\s*)(?:(?:bearer|basic)\s+[^\s,;]+|"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s,;&}\]]+)`)
-	authorizationLogPattern       = regexp.MustCompile(`(?i)\b(bearer|basic)\s+[^\s,;]+`)
-	urlUserinfoLogPattern         = regexp.MustCompile(`(?i)([a-z][a-z0-9+.-]*://)[^/\s@]+@`)
-	diagnosticStatusPattern       = regexp.MustCompile(`(?i)\bstatus(?:\s+code)?\s*[:=]?\s*([1-5][0-9]{2})\b`)
+	accessTokenExpiredLogPattern = regexp.MustCompile(`(?i)access token expired`)
+	diagnosticStatusPattern      = regexp.MustCompile(`(?i)\bstatus(?:\s+code)?\s*[:=]?\s*([1-5][0-9]{2})\b`)
 )
 
 // SafeDiagnosticForLog returns a bounded, single-line diagnostic suitable for
 // ordinary application logs. It preserves the access-token-expired signal while
 // redacting credential values and URL userinfo.
+//
+// The redaction rules themselves live in pluginapi.RedactUserText, because the
+// same text also reaches operators through plugin-facing contract fields. One
+// implementation means a credential cannot leak through the surface that forgot
+// to redact it.
 func SafeDiagnosticForLog(message string) string {
 	excerpt, sourceTruncated := diagnosticRunePrefix(message, diagnosticLogScanRuneLimit)
 	if sourceTruncated && !accessTokenExpiredLogPattern.MatchString(excerpt) {
@@ -35,13 +39,10 @@ func SafeDiagnosticForLog(message string) string {
 		}
 	}
 
-	excerpt = strings.Join(strings.Fields(excerpt), " ")
+	excerpt = pluginapi.RedactUserText(excerpt)
 	if excerpt == "" {
 		return ""
 	}
-	excerpt = urlUserinfoLogPattern.ReplaceAllString(excerpt, `${1}[REDACTED]@`)
-	excerpt = sensitiveLogAssignmentPattern.ReplaceAllString(excerpt, `${1}"[REDACTED]"`)
-	excerpt = authorizationLogPattern.ReplaceAllString(excerpt, `${1} [REDACTED]`)
 
 	return truncateDiagnosticLogExcerpt(excerpt, sourceTruncated)
 }

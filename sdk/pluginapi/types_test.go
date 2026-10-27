@@ -936,3 +936,70 @@ func TestQuotaBucketZeroRemainingFractionPreserved(t *testing.T) {
 		t.Fatalf("expected remainingFraction 0 to be preserved, got %f", bucket.RemainingFraction)
 	}
 }
+
+func TestQuotaBucketLabelIsIndependentOfModel(t *testing.T) {
+	// A balance row titles itself through label and carries no model; the custom
+	// UnmarshalJSON must not swallow the new field, and a round trip must keep it.
+	var bucket QuotaBucket
+	if err := json.Unmarshal([]byte(`{"label":"Permanent credits","remainingFraction":0}`), &bucket); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if bucket.Label != "Permanent credits" {
+		t.Fatalf("label = %q, want %q", bucket.Label, "Permanent credits")
+	}
+	if bucket.Model != "" {
+		t.Fatalf("model = %q, want empty", bucket.Model)
+	}
+
+	raw, errMarshal := json.Marshal(bucket)
+	if errMarshal != nil {
+		t.Fatalf("marshal error: %v", errMarshal)
+	}
+	var roundTripped QuotaBucket
+	if err := json.Unmarshal(raw, &roundTripped); err != nil {
+		t.Fatalf("round trip unmarshal error: %v", err)
+	}
+	if roundTripped.Label != bucket.Label || roundTripped.RemainingFraction != 0 {
+		t.Fatalf("round trip = %+v, want label %q and fraction 0", roundTripped, bucket.Label)
+	}
+
+	// An absent label must stay empty rather than borrow the model name.
+	var modelScoped QuotaBucket
+	if err := json.Unmarshal([]byte(`{"model":"gpt-5"}`), &modelScoped); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if modelScoped.Label != "" || modelScoped.Model != "gpt-5" {
+		t.Fatalf("model-scoped bucket = %+v, want empty label and model gpt-5", modelScoped)
+	}
+}
+
+func TestSafeUserTextRedactsBoundsAndFlattens(t *testing.T) {
+	// Provider-authored text reaches an operator through a contract field, so the
+	// credential-shaped parts of it must not survive the trip.
+	upstream := "upstream rejected request\n" +
+		`access_token=access-secret api key: "api-secret" Authorization=Bearer bearer-secret ` +
+		`Post "https://user:password@provider.example/quota?refresh_token=query-secret" failed`
+	got := SafeUserText(upstream)
+	for _, secret := range []string{"access-secret", "api-secret", "bearer-secret", "query-secret", "user:password"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("SafeUserText leaked %q: %q", secret, got)
+		}
+	}
+	if strings.ContainsAny(got, "\r\n") {
+		t.Fatalf("SafeUserText retained a line break: %q", got)
+	}
+	if !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("SafeUserText did not mark redacted values: %q", got)
+	}
+	// The non-secret part stays readable: the point is to keep the diagnosis.
+	if !strings.Contains(got, "upstream rejected request") {
+		t.Fatalf("SafeUserText dropped the diagnosis: %q", got)
+	}
+
+	if bounded := SafeUserText(strings.Repeat("x", 900)); len([]rune(bounded)) != 303 || !strings.HasSuffix(bounded, "...") {
+		t.Fatalf("SafeUserText length = %d, want 303 with ellipsis", len([]rune(bounded)))
+	}
+	if empty := SafeUserText("   \n\t "); empty != "" {
+		t.Fatalf("SafeUserText(blank) = %q, want empty", empty)
+	}
+}

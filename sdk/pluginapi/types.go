@@ -916,6 +916,42 @@ type HostRoutingResetCooldownResponse struct {
 	Models []string `json:"models,omitempty"`
 }
 
+// HostRoutingSetCooldownRequest asks the host to stop routing to one credential,
+// or to one model on it, until a stated time.
+//
+// The plugin supplies the deadline, not a duration: a provider says "retry after
+// 17:40:00", and turning that into a local countdown is how two clocks end up
+// disagreeing. Exactly one of CooldownUntil and RetryAfterSeconds must be set.
+type HostRoutingSetCooldownRequest struct {
+	// AuthIndex identifies the credential index.
+	AuthIndex string `json:"auth_index"`
+	// Model limits the cooldown to one model key. Empty means the whole
+	// credential is cooling down, which is what a credential-level 429 or a
+	// spent plan means.
+	Model string `json:"model,omitempty"`
+	// CooldownUntil is the RFC3339 time the credential may be used again.
+	CooldownUntil string `json:"cooldown_until,omitempty"`
+	// RetryAfterSeconds is the same deadline expressed as a delay, for a
+	// provider that answers with Retry-After instead of a timestamp.
+	RetryAfterSeconds int `json:"retry_after_seconds,omitempty"`
+	// Reason is a short machine-readable cause ("quota", "rate_limit"). It is
+	// stored on the credential and shown to the operator.
+	Reason string `json:"reason,omitempty"`
+}
+
+// HostRoutingSetCooldownResponse reports the state the host actually recorded.
+// The host may extend a cooldown it already holds, never shorten it, so the
+// response is the caller's only reliable view of the deadline in force.
+type HostRoutingSetCooldownResponse struct {
+	// AuthIndex identifies the credential index.
+	AuthIndex string `json:"auth_index"`
+	// Models lists the model keys that are now cooling down. It is empty for a
+	// credential-level cooldown.
+	Models []string `json:"models,omitempty"`
+	// CooldownUntil is the RFC3339 deadline now in force.
+	CooldownUntil string `json:"cooldown_until,omitempty"`
+}
+
 // HostSecretStatusRequest asks the host for the state of its secret store.
 type HostSecretStatusRequest struct{}
 
@@ -2059,16 +2095,26 @@ type QuotaBucket struct {
 	// Model is the model this bucket applies to. Empty means the bucket is not
 	// model-scoped.
 	Model string `json:"model,omitempty"`
+	// Label is the bucket's user-facing row title. It is deliberately separate
+	// from Model: a bucket that is not model-scoped (a balance, a plan total)
+	// names itself here and leaves Model empty, so no reader has to treat a
+	// balance name as if it were a model. Empty means the row is titled by
+	// whatever else the bucket carries.
+	Label string `json:"label,omitempty"`
 	// Window names the bucket's limit window (for example "hourly" or "plan").
 	Window            string  `json:"window,omitempty"`
 	RemainingFraction float64 `json:"remainingFraction"`
 	// Remaining and Total are absolute amounts when the provider reports them.
 	// Both are nil when the provider only reports a fraction, so an absent
 	// amount stays distinguishable from an amount that really is zero.
-	Remaining   *float64 `json:"remaining,omitempty"`
-	Total       *float64 `json:"total,omitempty"`
-	ResetTime   string   `json:"resetTime,omitempty"`
-	Description string   `json:"description,omitempty"`
+	Remaining *float64 `json:"remaining,omitempty"`
+	Total     *float64 `json:"total,omitempty"`
+	ResetTime string   `json:"resetTime,omitempty"`
+	// Description is the sentence shown under the bucket's row. It may quote
+	// provider-authored text, so a plugin must pass it through
+	// pluginapi.SafeUserText before setting it: this field reaches an operator,
+	// and upstream error bodies can carry the credential that failed.
+	Description string `json:"description,omitempty"`
 }
 
 // UnmarshalJSON supports both camelCase and snake_case field names.

@@ -23,7 +23,7 @@ import (
 //	auth store    -> identity, parsed, enabled, manually_disabled, auth_state
 //	supply pool   -> source_kind (which identity is behind the credential)
 //	auth metadata -> policy
-//	quota cache   -> quota_state, fetched_at, plan_id, channel, quota
+//	quota cache   -> quota_state, quota_stale, fetched_at, plan_id, channel, quota
 //	auth health   -> request counts and the heatmap
 //
 // Two rules are not negotiable. A value that cannot be determined is omitted or
@@ -70,8 +70,12 @@ type accountView struct {
 	// credential: the plugin writes it from what its upstream reports.
 	OpenedAt string `json:"opened_at,omitempty"`
 
-	QuotaState string               `json:"quota_state"`
-	FetchedAt  string               `json:"fetched_at,omitempty"`
+	QuotaState string `json:"quota_state"`
+	FetchedAt  string `json:"fetched_at,omitempty"`
+	// QuotaStale reports that the quota fields come from a reading older than
+	// the freshness window. It is a separate axis from quota_state: that field
+	// says what the provider answered, this one says how old the answer is.
+	QuotaStale bool                 `json:"quota_stale,omitempty"`
 	Quota      []accountQuotaBucket `json:"quota,omitempty"`
 	// Channels lists every routing channel the credential actually carries, so
 	// the management UI can offer a routing choice that exists instead of a
@@ -86,10 +90,12 @@ type accountView struct {
 
 // accountQuotaBucket is one quota window of one account. Model is the model the
 // window applies to, so a provider that reports per-model limits no longer has
-// to pack the model name into a description.
+// to pack the model name into a description. Label is the row title for windows
+// that are not model-scoped, so a balance row no longer has to ride Model.
 type accountQuotaBucket struct {
 	Group             string   `json:"group,omitempty"`
 	Model             string   `json:"model,omitempty"`
+	Label             string   `json:"label,omitempty"`
 	Window            string   `json:"window,omitempty"`
 	RemainingFraction float64  `json:"remaining_fraction"`
 	Remaining         *float64 `json:"remaining,omitempty"`
@@ -258,6 +264,7 @@ func applyCachedQuota(view *accountView, host *pluginhost.Host) {
 		return
 	}
 	view.FetchedAt = snapshot.FetchedAt.UTC().Format(time.RFC3339)
+	view.QuotaStale = snapshot.Stale
 	if subscription := snapshot.Response.Subscription; subscription != nil {
 		view.PlanID = strings.TrimSpace(subscription.Plan)
 		view.Channel = strings.TrimSpace(subscription.TierName)
@@ -281,12 +288,16 @@ func applyCachedQuota(view *accountView, host *pluginhost.Host) {
 			view.Quota = append(view.Quota, accountQuotaBucket{
 				Group:             strings.TrimSpace(group.DisplayName),
 				Model:             strings.TrimSpace(bucket.Model),
+				Label:             strings.TrimSpace(bucket.Label),
 				Window:            strings.TrimSpace(bucket.Window),
 				RemainingFraction: bucket.RemainingFraction,
 				Remaining:         bucket.Remaining,
 				Total:             bucket.Total,
 				ResetAt:           strings.TrimSpace(bucket.ResetTime),
-				Description:       strings.TrimSpace(bucket.Description),
+				// A plugin is expected to redact its own description, but the
+				// panel reads this field, so the host bounds and redacts it again
+				// rather than trusting every plugin to remember.
+				Description: pluginapi.SafeUserText(bucket.Description),
 			})
 		}
 	}

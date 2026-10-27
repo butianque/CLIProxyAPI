@@ -103,10 +103,10 @@ func (h *Handler) FetchCredentialQuota(c *gin.Context) {
 		if handled {
 			if errFetch != nil {
 				log.WithError(errFetch).Warnf("failed to fetch quota for credential %s", auth.Index)
-				c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("failed to fetch quota: %v", errFetch)})
+				c.JSON(http.StatusBadGateway, gin.H{"error": pluginapi.SafeUserText(fmt.Sprintf("failed to fetch quota: %v", errFetch))})
 				return
 			}
-			c.JSON(http.StatusOK, quotaResp)
+			c.JSON(http.StatusOK, redactQuotaResponse(quotaResp))
 			return
 		}
 	}
@@ -118,10 +118,10 @@ func (h *Handler) FetchCredentialQuota(c *gin.Context) {
 				quotaResp, handledProbe, errProbe := h.executeQuotaProbe(c, auth, probeMap)
 				if handledProbe {
 					if errProbe != nil {
-						c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("quota probe failed: %v", errProbe)})
+						c.JSON(http.StatusBadGateway, gin.H{"error": pluginapi.SafeUserText(fmt.Sprintf("quota probe failed: %v", errProbe))})
 						return
 					}
-					c.JSON(http.StatusOK, quotaResp)
+					c.JSON(http.StatusOK, redactQuotaResponse(quotaResp))
 					return
 				}
 			}
@@ -129,6 +129,26 @@ func (h *Handler) FetchCredentialQuota(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusNotImplemented, gin.H{"error": "no quota provider available for credential"})
+}
+
+// redactQuotaResponse bounds and redacts the provider-authored text a quota
+// response carries. The plugin that produced it is expected to redact already,
+// but this response is rendered in the panel, and a bucket description can quote
+// an upstream error body that quotes the credential. The buckets are copied so
+// the caller's response is not modified in place.
+func redactQuotaResponse(resp pluginapi.QuotaFetchResponse) pluginapi.QuotaFetchResponse {
+	groups := make([]pluginapi.QuotaGroup, len(resp.Groups))
+	for groupIndex, group := range resp.Groups {
+		buckets := make([]pluginapi.QuotaBucket, len(group.Buckets))
+		copy(buckets, group.Buckets)
+		for bucketIndex := range buckets {
+			buckets[bucketIndex].Description = pluginapi.SafeUserText(buckets[bucketIndex].Description)
+		}
+		group.Buckets = buckets
+		groups[groupIndex] = group
+	}
+	resp.Groups = groups
+	return resp
 }
 
 // ResetCredentialQuota resets quota or usage for a credential.
@@ -456,7 +476,7 @@ func (h *Handler) executeQuotaProbe(c *gin.Context, auth *coreauth.Auth, probe m
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return pluginapi.QuotaFetchResponse{}, true, fmt.Errorf("probe returned status %d: %s", resp.StatusCode, string(respBytes))
+		return pluginapi.QuotaFetchResponse{}, true, fmt.Errorf("probe returned status %d: %s", resp.StatusCode, pluginapi.SafeUserText(string(respBytes)))
 	}
 
 	if !json.Valid(respBytes) {

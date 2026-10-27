@@ -112,6 +112,9 @@ func TestMethodNamesAreStable(t *testing.T) {
 	if MethodHostRoutingResetCooldown != "host.routing.reset_cooldown" {
 		t.Fatalf("MethodHostRoutingResetCooldown = %q", MethodHostRoutingResetCooldown)
 	}
+	if MethodHostRoutingSetCooldown != "host.routing.set_cooldown" {
+		t.Fatalf("MethodHostRoutingSetCooldown = %q", MethodHostRoutingSetCooldown)
+	}
 	if MethodExecutorExecuteStream != "executor.execute_stream" {
 		t.Fatalf("MethodExecutorExecuteStream = %q", MethodExecutorExecuteStream)
 	}

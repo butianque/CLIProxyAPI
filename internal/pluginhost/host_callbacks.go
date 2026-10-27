@@ -185,6 +185,8 @@ func (h *Host) callFromPlugin(ctx context.Context, method string, request []byte
 		return h.callHostAffinityLookup(ctx, request)
 	case pluginabi.MethodHostRoutingResetCooldown:
 		return h.callHostRoutingResetCooldown(ctx, request)
+	case pluginabi.MethodHostRoutingSetCooldown:
+		return h.callHostRoutingSetCooldown(ctx, request)
 	case pluginabi.MethodHostSecretStatus:
 		return h.callHostSecretStatus(ctx, request)
 	case pluginabi.MethodHostSecretGet:

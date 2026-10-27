@@ -4,10 +4,22 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
+
+// SetQuotaClockForTest replaces the quota snapshot store's clock. It exists so
+// callers outside this package can exercise snapshot expiry deterministically
+// instead of waiting out the freshness window. Set it before the host serves
+// requests; it is not synchronized with readers.
+func (h *Host) SetQuotaClockForTest(clock func() time.Time) {
+	if h == nil || clock == nil {
+		return
+	}
+	h.quotaNow = clock
+}
 
 // RegisterPluginForTest registers a plugin directly on the host for testing.
 func (h *Host) RegisterPluginForTest(id string, plugin pluginapi.Plugin) {

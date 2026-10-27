@@ -3,7 +3,9 @@ package pluginhost
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -562,5 +564,89 @@ func TestQuotaSnapshotCache_RecordsFetchFailureAndReset(t *testing.T) {
 	}
 	if _, ok := host.CachedQuota("snapshot-provider", "auth-1"); ok {
 		t.Fatal("expected the reset to drop the cached snapshot")
+	}
+}
+
+// TestQuotaSnapshotCacheExpiresAndEvicts pins the two deadlines of a recorded
+// reading: a reading past its freshness window is still served but marked stale,
+// and a record past its retention is dropped so the store tracks live
+// credentials instead of every credential ever probed.
+func TestQuotaSnapshotCacheExpiresAndEvicts(t *testing.T) {
+	base := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
+	now := base
+	host := New()
+	host.quotaNow = func() time.Time { return now }
+
+	host.rememberQuotaSnapshot("snapshot-provider", "auth-1", pluginapi.QuotaFetchResponse{
+		Subscription: &pluginapi.QuotaSubscription{Plan: "Pro"},
+		Channels:     []pluginapi.QuotaChannel{{Key: "api-key", Label: "API Key"}},
+	})
+
+	cached, ok := host.CachedQuota("snapshot-provider", "auth-1")
+	if !ok || cached.Stale || !cached.Fetched {
+		t.Fatalf("fresh snapshot = %+v ok=%v, want a current reading", cached, ok)
+	}
+
+	// Past the freshness window the reading is still served: the plan and the
+	// channel list it carries are facts about the credential that a failing
+	// probe must not destroy.
+	now = base.Add(quotaSnapshotFreshFor + time.Second)
+	cached, ok = host.CachedQuota("snapshot-provider", "auth-1")
+	if !ok || !cached.Stale || !cached.Fetched {
+		t.Fatalf("stale snapshot = %+v ok=%v, want a stale reading", cached, ok)
+	}
+	if cached.Response.Subscription == nil || cached.Response.Subscription.Plan != "Pro" || len(cached.Response.Channels) != 1 {
+		t.Fatalf("a stale reading must keep its plan and channels: %+v", cached.Response)
+	}
+
+	// Past retention the record is gone, not merely hidden.
+	now = base.Add(quotaSnapshotRetainFor + time.Second)
+	if _, ok = host.CachedQuota("snapshot-provider", "auth-1"); ok {
+		t.Fatal("expected the record to be dropped once its retention passed")
+	}
+	host.quotaMu.Lock()
+	_, retained := host.quotaSnapshots[quotaSnapshotKey("snapshot-provider", "auth-1")]
+	host.quotaMu.Unlock()
+	if retained {
+		t.Fatal("expected the expired record to be deleted from the store, not only hidden")
+	}
+
+	// A failure after expiry refreshes retention but must not make the old
+	// reading look current again.
+	now = base
+	host.rememberQuotaSnapshot("snapshot-provider", "auth-2", pluginapi.QuotaFetchResponse{})
+	now = base.Add(quotaSnapshotFreshFor + time.Second)
+	host.rememberQuotaSnapshotFailure("snapshot-provider", "auth-2")
+	cached, ok = host.CachedQuota("snapshot-provider", "auth-2")
+	if !ok || !cached.Failed || !cached.Stale {
+		t.Fatalf("failure after expiry = %+v ok=%v, want failed and still stale", cached, ok)
+	}
+
+	// A record that only ever recorded a failure is evicted too, so one failed
+	// sweep cannot leave a permanent entry behind for every credential.
+	now = base
+	host.rememberQuotaSnapshotFailure("snapshot-provider", "auth-failed")
+	now = base.Add(quotaSnapshotRetainFor + time.Second)
+	if _, ok = host.CachedQuota("snapshot-provider", "auth-failed"); ok {
+		t.Fatal("expected a failure-only record to be evicted once its retention passed")
+	}
+
+	// The store is capped, and the record nearest eviction goes first.
+	now = base
+	capped := New()
+	capped.quotaNow = func() time.Time { return now }
+	for i := range maxQuotaSnapshots + 1 {
+		now = base.Add(time.Duration(i) * time.Second)
+		capped.rememberQuotaSnapshot("snapshot-provider", fmt.Sprintf("auth-%d", i), pluginapi.QuotaFetchResponse{})
+	}
+	capped.quotaMu.Lock()
+	size := len(capped.quotaSnapshots)
+	_, oldestKept := capped.quotaSnapshots[quotaSnapshotKey("snapshot-provider", "auth-0")]
+	capped.quotaMu.Unlock()
+	if size > maxQuotaSnapshots {
+		t.Fatalf("snapshot store size = %d, want at most %d", size, maxQuotaSnapshots)
+	}
+	if oldestKept {
+		t.Fatal("expected the record nearest eviction to be dropped first")
 	}
 }
