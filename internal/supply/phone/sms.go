@@ -867,10 +867,11 @@ func (s *Service) EnsureChannels(ctx context.Context, sid, keyword string) (int,
 	}
 
 	// Rebuild the cache from the account's authoritative joined list, not from
-	// the marketplace catalogue. The joined list (type=3) carries each channel's
-	// price, stock and on/off state; the marketplace list (type=8) has no state,
-	// so building from it would lose which channels are paused and make the
-	// guardrail blind on the next pass.
+	// the marketplace catalogue. The joined list ("/bindings") carries each
+	// channel's price, stock and on/off state; the project catalogue
+	// ("/projects/{sid}/public-codes") has no state, so building from it would
+	// lose which channels are paused and make the guardrail blind on the next
+	// pass.
 	kept, errJoinedList := s.joinedQuotesFor(ctx, sid)
 	if errJoinedList != nil {
 		return 0, errJoinedList

@@ -37,25 +37,25 @@ func TestParseHaozhumaCookieAcceptsBareAndJSON(t *testing.T) {
 // The channel list arrives from the web surface with the stock as a label and
 // the price as a string, and includes projects other than the one we rent from.
 func TestChannelsParsesWebPayload(t *testing.T) {
-	const body = `{"code":200,"msg":"成功获取列表","data":[
-	  {"uid":"21614-BJJO2R0EUM","mc":"[21614]讯飞","yhj":"0.3850","zxky":"可用数量:19","yyy":"电信|移动|联通|","hd":"190|185|","lxfs":"未留"},
-	  {"uid":"21614-E2QJC36FDG","mc":"[21614]讯飞","yhj":"0.1300","zxky":"可用数量:4","yyy":"虚拟运营商|","hd":"165|162|","lxfs":"fafafa66888"},
-	  {"uid":"21614-M54KWVSCUE","mc":"[21614]讯飞","yhj":"0.1300","zxky":"可用数量:0","yyy":"电信|","hd":"199|","lxfs":"未留"},
-	  {"uid":"58562-OEIO5JKMZH","mc":"[58562]稀土掘金/Trae","yhj":"0.1800","zxky":"可用数量:108","yyy":"移动|","hd":"186|","lxfs":"UW7788"}
-	]}`
+	const body = `{"code":0,"message":"ok","data":{"list":[
+	  {"code":"21614-BJJO2R0EUM","projectId":"21614","projectName":"\u8baf\u98de","price":"0.3850","available":19,"operators":["\u7535\u4fe1","\u79fb\u52a8","\u8054\u901a"],"prefixes":["190","185"],"contact":"\u672a\u7559","status":"joined"},
+	  {"code":"21614-E2QJC36FDG","projectId":"21614","projectName":"\u8baf\u98de","price":"0.1300","available":4,"operators":["\u865a\u62df\u8fd0\u8425\u5546"],"prefixes":["165","162"],"contact":"fafafa66888","status":"joined"},
+	  {"code":"21614-M54KWVSCUE","projectId":"21614","projectName":"\u8baf\u98de","price":"0.1300","available":0,"operators":["\u7535\u4fe1"],"prefixes":["199"],"contact":"\u672a\u7559","status":"paused"},
+	  {"code":"58562-OEIO5JKMZH","projectId":"58562","projectName":"\u7a00\u571f\u6398\u91d1/Trae","price":"0.1800","available":108,"operators":["\u79fb\u52a8"],"prefixes":["186"],"contact":"UW7788","status":"joined"}
+	],"total":4,"page":1,"size":100}}`
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("type") != "3" {
-			t.Errorf("unexpected query: %s", r.URL.RawQuery)
+		if got := r.URL.RequestURI(); got != "/bindings?page=1&size=100" {
+			t.Errorf("unexpected path: %s", got)
 		}
-		if cookie := r.Header.Get("Cookie"); cookie != "PHPSESSID=abc" {
-			t.Errorf("cookie = %q, want the session cookie", cookie)
+		if auth := r.Header.Get("Authorization"); auth != "Bearer token-abc" {
+			t.Errorf("authorization = %q, want the session token", auth)
 		}
 		_, _ = w.Write([]byte(body))
 	}))
 	defer server.Close()
 
-	provider, errProvider := NewHaozhuma(HaozhumaSecret{Token: "t", Cookie: "PHPSESSID=abc", WebBase: server.URL}, server.Client())
+	provider, errProvider := NewHaozhuma(HaozhumaSecret{Token: "t", Cookie: "token-abc", WebAPI: server.URL}, server.Client())
 	if errProvider != nil {
 		t.Fatalf("NewHaozhuma: %v", errProvider)
 	}
@@ -73,6 +73,9 @@ func TestChannelsParsesWebPayload(t *testing.T) {
 	}
 	if quotes[1].UID != "21614-M54KWVSCUE" || quotes[1].Stock != 0 {
 		t.Fatalf("second quote = %+v, want the zero-stock 0.13 channel", quotes[1])
+	}
+	if !quotes[1].Paused {
+		t.Fatal("the paused channel must be reported as paused")
 	}
 	if quotes[2].UID != "58562-OEIO5JKMZH" {
 		t.Fatalf("third quote = %+v, want the 0.18 channel", quotes[2])
@@ -244,21 +247,21 @@ func TestProbeAPICredentialProblemsAreUnready(t *testing.T) {
 	}
 }
 
-// The web probe authenticates with the session cookie alone: listing channels
-// never touches the SMS API, so a cookie-only channel is still probeable.
+// The web probe authenticates with the session token alone: listing channels
+// never touches the SMS API, so a token-only channel is still probeable.
 func TestProbeWebReportsChannels(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if cookie := r.Header.Get("Cookie"); cookie != "PHPSESSID=abc" {
-			t.Errorf("cookie = %q, want the session cookie", cookie)
+		if auth := r.Header.Get("Authorization"); auth != "Bearer token-abc" {
+			t.Errorf("authorization = %q, want the session token", auth)
 		}
-		_, _ = w.Write([]byte(`{"code":200,"msg":"ok","data":[
-		  {"uid":"1-A","mc":"[1]A","yhj":"0.10","zxky":"可用数量:1","yyy":"电信|","hd":"190|","lxfs":"未留"},
-		  {"uid":"2-B","mc":"[2]B","yhj":"0.20","zxky":"可用数量:2","yyy":"移动|","hd":"186|","lxfs":"未留"}
-		]}`))
+		_, _ = w.Write([]byte(`{"code":0,"message":"ok","data":{"list":[
+		  {"code":"1-A","projectId":"1","projectName":"A","price":"0.10","available":1,"status":"joined"},
+		  {"code":"2-B","projectId":"2","projectName":"B","price":"0.20","available":2,"status":"joined"}
+		],"total":2,"page":1,"size":100}}`))
 	}))
 	defer server.Close()
 
-	detail, errProbe := probeWeb(context.Background(), server.Client(), server.URL, `{"cookie":"PHPSESSID=abc"}`)
+	detail, errProbe := probeWeb(context.Background(), server.Client(), server.URL, `{"cookie":"token-abc"}`)
 	if errProbe != nil {
 		t.Fatalf("probeWeb: %v", errProbe)
 	}
@@ -267,7 +270,7 @@ func TestProbeWebReportsChannels(t *testing.T) {
 	}
 }
 
-// A cookie secret that carries no cookie cannot be probed, and the endpoint the
+// A credential that carries no session cannot be probed, and the endpoint the
 // credential names is what the probe calls.
 func TestProbeWebNeedsACookie(t *testing.T) {
 	if _, errProbe := probeWeb(context.Background(), nil, "", `{"token":"t"}`); !errors.Is(errProbe, ErrProbeUnready) {
@@ -368,29 +371,35 @@ func TestNewHaozhumaRejectsInvalidEndpoint(t *testing.T) {
 	}
 }
 
-// The web host is completed the same way as the API endpoint, so a scheme-less
-// web_base still reaches the web surface.
-func TestWebBaseNormalizesWebBase(t *testing.T) {
+// The control-plane base is completed the same way as the API endpoint, so a
+// scheme-less address still works. A value naming one of the vendor's own hosts
+// is read as "follow the vendor", because it was written for the surface that
+// moved.
+func TestWebAPIBaseResolvesControlPlane(t *testing.T) {
 	cases := []struct {
 		name    string
 		webBase string
+		webAPI  string
 		want    string
 	}{
-		{name: "no scheme", webBase: "h5.haozhuma.com", want: "https://h5.haozhuma.com"},
-		{name: "no scheme with trailing slash", webBase: "h5.haozhuma.com/", want: "https://h5.haozhuma.com"},
-		{name: "trailing slash is trimmed", webBase: "https://h5.haozhuma.com/", want: "https://h5.haozhuma.com"},
-		{name: "blank falls back to the default", webBase: "", want: haozhumaDefaultWebBase},
-		{name: "explicit http is kept", webBase: "http://h5.haozhuma.com", want: "http://h5.haozhuma.com"},
-		{name: "unusable falls back to the default", webBase: "://bad", want: haozhumaDefaultWebBase},
+		{name: "no scheme", webBase: "phone.example.test", want: "https://phone.example.test"},
+		{name: "no scheme with trailing slash", webBase: "phone.example.test/", want: "https://phone.example.test"},
+		{name: "trailing slash is trimmed", webBase: "https://phone.example.test/", want: "https://phone.example.test"},
+		{name: "blank falls back to the default", want: haozhumaDefaultWebAPI},
+		{name: "explicit http is kept", webBase: "http://phone.example.test", want: "http://phone.example.test"},
+		{name: "unusable falls back to the default", webBase: "://bad", want: haozhumaDefaultWebAPI},
+		{name: "the old site follows the vendor", webBase: "h5.haozhuma.com", want: haozhumaDefaultWebAPI},
+		{name: "the old api host follows the vendor", webBase: "https://api.haozhuma.cn", want: haozhumaDefaultWebAPI},
+		{name: "web_api wins over web_base", webBase: "h5.haozhuma.cn", webAPI: "https://api.example.test/v1", want: "https://api.example.test/v1"},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
-			provider, errProvider := NewHaozhuma(HaozhumaSecret{Token: "t", WebBase: testCase.webBase}, nil)
+			provider, errProvider := NewHaozhuma(HaozhumaSecret{Token: "t", WebBase: testCase.webBase, WebAPI: testCase.webAPI}, nil)
 			if errProvider != nil {
-				t.Fatalf("NewHaozhuma(web_base=%q): %v", testCase.webBase, errProvider)
+				t.Fatalf("NewHaozhuma(web_base=%q, web_api=%q): %v", testCase.webBase, testCase.webAPI, errProvider)
 			}
-			if got := provider.webBase(); got != testCase.want {
-				t.Fatalf("webBase() for %q = %q, want %q", testCase.webBase, got, testCase.want)
+			if got := provider.webAPIBase(); got != testCase.want {
+				t.Fatalf("webAPIBase() for %q/%q = %q, want %q", testCase.webBase, testCase.webAPI, got, testCase.want)
 			}
 		})
 	}

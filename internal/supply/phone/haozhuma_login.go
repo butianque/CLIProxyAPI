@@ -1,10 +1,12 @@
 package phone
 
 // This file automates the vendor's web sign-in, which is what mints the session
-// cookie the channel surface needs.
+// the channel surface needs.
 //
-// The sign-in is a two-step challenge: the page asks for a picture captcha and
-// the account/password, then the browser posts the four click coordinates back.
+// The sign-in is a two-step challenge: it asks for a picture captcha plus the
+// account and password, then posts the four click coordinates back and answers
+// with a bearer token. Plain HTTP calls do this in place of a browser session.
+//
 // The picture is a "click these four shapes in this order" puzzle: one image
 // shows four two-colour figures, another names those figures in the order they
 // must be clicked. The figures are drawn in a fixed eight-colour palette on a
@@ -25,7 +27,6 @@ import (
 	"fmt"
 	"image"
 	_ "image/png" // register the PNG decoder for the captcha images
-	"io"
 	"math"
 	"net/http"
 	"sort"
@@ -62,10 +63,11 @@ var errCaptchaRetry = errors.New("sms/haozhuma: captcha attempt failed")
 
 // WebLoginResult is the outcome of an automated web sign-in.
 type WebLoginResult struct {
-	// Cookie is the session cookie, in "PHPSESSID=..." form.
-	Cookie string
+	// Token is the raw web session token the vendor returned, stored as-is; the
+	// channel calls accept it with or without a "Bearer " prefix.
+	Token string
 	// Channels is how many joined channels the fresh session can see. It proves
-	// the cookie works rather than merely existing.
+	// the token works rather than merely existing.
 	Channels int
 }
 
@@ -115,7 +117,7 @@ func classifyColor(r, g, b uint8) (string, bool) {
 	return "", false
 }
 
-// WebLogin signs in to the web surface and returns a working session cookie.
+// WebLogin signs in to the web surface and returns a working session token.
 //
 // The account and password are the operator's browser sign-in, not the API key.
 // A rejected captcha is retried with a fresh one; a rejected password is not.
@@ -160,194 +162,100 @@ func (h *Haozhuma) webLoginOnce(ctx context.Context, user, pass string) (WebLogi
 		// usually can, so this is retryable rather than fatal.
 		return WebLoginResult{}, fmt.Errorf("%w: %v", errCaptchaRetry, errSolve)
 	}
-	cookie, errSubmit := h.submitWebLogin(ctx, captchaID, user, pass, points)
+	token, errSubmit := h.submitWebLogin(ctx, captchaID, user, pass, points)
 	if errSubmit != nil {
 		return WebLoginResult{}, errSubmit
 	}
-	channels, errVerify := h.countChannelsWithCookie(ctx, cookie)
+	channels, errVerify := h.countChannelsWithToken(ctx, token)
 	if errVerify != nil {
 		return WebLoginResult{}, errVerify
 	}
-	return WebLoginResult{Cookie: cookie, Channels: channels}, nil
+	return WebLoginResult{Token: token, Channels: channels}, nil
 }
 
 // fetchCaptcha asks the vendor for one captcha: the click picture, the order
-// hint, and the challenge id that ties them together.
+// hint, and the challenge id that ties them together. The endpoint is public, so
+// no token is sent.
 func (h *Haozhuma) fetchCaptcha(ctx context.Context) (clickPNG, orderPNG []byte, captchaID string, err error) {
-	base := h.webBase()
-
-	var timePayload struct {
-		Timestamp int64  `json:"timestamp"`
-		Token     string `json:"token"`
-		Status    string `json:"status"`
-		Msg       string `json:"msg"`
-	}
-	if errTime := h.webRequest(ctx, http.MethodGet, base+"/time.php", "", nil, &timePayload); errTime != nil {
-		return nil, nil, "", errTime
-	}
-	if strings.TrimSpace(timePayload.Token) == "" {
-		if msg := strings.TrimSpace(timePayload.Msg); msg != "" {
-			return nil, nil, "", fmt.Errorf("sms/haozhuma web login: the captcha endpoint declined: %s", msg)
-		}
-		return nil, nil, "", errors.New("sms/haozhuma web login: the server time endpoint returned no token")
-	}
-
-	request, errMarshal := json.Marshal(map[string]any{
-		"token":     timePayload.Token,
-		"timestamp": timePayload.Timestamp,
-	})
-	if errMarshal != nil {
-		return nil, nil, "", errMarshal
-	}
-	var codePayload struct {
-		Code      int    `json:"code"`
-		Msg       string `json:"msg"`
-		ImageData string `json:"image_data"`
+	var payload struct {
+		CaptchaID string `json:"captchaId"`
+		Image     string `json:"image"`
 		Order     string `json:"order"`
-		CaptchaID string `json:"captcha_id"`
 	}
-	if errCode := h.webRequest(ctx, http.MethodPost, base+"/Verificationcode.php", "application/json", request, &codePayload); errCode != nil {
-		return nil, nil, "", errCode
+	if errCall := h.webCallWithToken(ctx, "", http.MethodPost, "/captcha", nil, &payload); errCall != nil {
+		return nil, nil, "", errCall
 	}
-	if codePayload.ImageData == "" || codePayload.Order == "" {
-		return nil, nil, "", fmt.Errorf("sms/haozhuma web login: no captcha returned: %s", strings.TrimSpace(codePayload.Msg))
+	if payload.Image == "" || payload.Order == "" {
+		return nil, nil, "", errors.New("sms/haozhuma web login: the captcha endpoint returned no pictures")
 	}
 
-	clickPNG, errClick := base64.StdEncoding.DecodeString(codePayload.ImageData)
+	clickPNG, errClick := base64.StdEncoding.DecodeString(payload.Image)
 	if errClick != nil {
 		return nil, nil, "", fmt.Errorf("sms/haozhuma web login: decode captcha image: %w", errClick)
 	}
-	orderPNG, errOrder := base64.StdEncoding.DecodeString(codePayload.Order)
+	orderPNG, errOrder := base64.StdEncoding.DecodeString(payload.Order)
 	if errOrder != nil {
 		return nil, nil, "", fmt.Errorf("sms/haozhuma web login: decode order image: %w", errOrder)
 	}
-	return clickPNG, orderPNG, codePayload.CaptchaID, nil
+	return clickPNG, orderPNG, strings.TrimSpace(payload.CaptchaID), nil
 }
 
 // submitWebLogin posts the solved captcha and the credentials. On success it
-// returns the session cookie; on failure the vendor's message is classified so
-// a captcha problem stays retryable while a bad password does not.
+// returns the session token; on failure the vendor's message is classified so a
+// captcha problem stays retryable while a bad password does not.
 func (h *Haozhuma) submitWebLogin(ctx context.Context, captchaID, user, pass string, points []captchaPoint) (string, error) {
-	body, errMarshal := json.Marshal(map[string]any{
-		"clicks":     points,
-		"captcha_id": captchaID,
-		"username":   user,
-		"password":   pass,
-	})
-	if errMarshal != nil {
-		return "", errMarshal
+	body := map[string]any{
+		"username":  user,
+		"password":  pass,
+		"captchaId": captchaID,
+		"clicks":    points,
 	}
-	req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, h.webBase()+"/login.php", bytes.NewReader(body))
-	if errReq != nil {
-		return "", errReq
+	envelope, _, errRaw := h.webRaw(ctx, "", http.MethodPost, "/auth/login", body)
+	if errRaw != nil {
+		return "", errRaw
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-
-	resp, errDo := h.http.Do(req)
-	if errDo != nil {
-		return "", fmt.Errorf("sms/haozhuma web login: %w", errDo)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	var result struct {
-		Code int    `json:"code"`
-		Msg  string `json:"msg"`
-	}
-	if errDecode := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&result); errDecode != nil {
-		return "", fmt.Errorf("sms/haozhuma web login: decode login reply: %w", errDecode)
-	}
-	if result.Code != 0 {
-		message := strings.TrimSpace(result.Msg)
+	if envelope.Code != 0 {
+		message := strings.TrimSpace(envelope.Message)
 		if message == "" {
 			message = "sign-in rejected"
 		}
 		// A captcha complaint is retryable; anything else (bad account/password)
 		// must not be retried, or a typo would burn login attempts.
-		if strings.Contains(message, "验证") {
+		if strings.Contains(message, "验证码") {
 			return "", fmt.Errorf("%w: %s", errCaptchaRejected, message)
 		}
 		return "", fmt.Errorf("sms/haozhuma web login: %s", message)
 	}
-	for _, cookie := range resp.Cookies() {
-		if cookie.Name == "PHPSESSID" && cookie.Value != "" {
-			return "PHPSESSID=" + cookie.Value, nil
-		}
+	var data struct {
+		Token string `json:"token"`
 	}
-	return "", errors.New("sms/haozhuma web login: the server accepted the sign-in but returned no session cookie")
+	if errUnmarshal := json.Unmarshal(envelope.Data, &data); errUnmarshal != nil {
+		return "", fmt.Errorf("sms/haozhuma web login: decode reply: %w", errUnmarshal)
+	}
+	token := strings.TrimSpace(data.Token)
+	if token == "" {
+		return "", errors.New("sms/haozhuma web login: the server accepted the sign-in but returned no session token")
+	}
+	return token, nil
 }
 
-// countChannelsWithCookie reads the joined channel list with a candidate cookie,
-// which both proves the cookie authenticates and reports how many channels it
-// can see.
-func (h *Haozhuma) countChannelsWithCookie(ctx context.Context, cookie string) (int, error) {
+// countChannelsWithToken reads the joined channel list with a candidate token,
+// which both proves the token authenticates and reports how many channels it can
+// see.
+func (h *Haozhuma) countChannelsWithToken(ctx context.Context, token string) (int, error) {
 	var payload struct {
-		Code json.RawMessage `json:"code"`
-		Msg  string          `json:"msg"`
-		Data []webChannelRow `json:"data"`
+		List  []webBindingRow `json:"list"`
+		Total int             `json:"total"`
 	}
-	if errGet := h.webGetWithCookie(ctx, cookie, "type=3", &payload); errGet != nil {
-		return 0, errGet
-	}
-	if strings.Trim(strings.TrimSpace(string(payload.Code)), `"`) != "200" {
-		message := strings.TrimSpace(payload.Msg)
-		if message == "" {
-			message = "channel list rejected"
+	if errCall := h.webCallWithToken(ctx, token, http.MethodGet, "/bindings?page=1&size=100", nil, &payload); errCall != nil {
+		if errors.Is(errCall, ErrCredential) {
+			// Keep the credential classification: the caller reports "sign in
+			// again" as a request problem, not a platform failure.
+			return 0, fmt.Errorf("%w: sms/haozhuma web login: the fresh session was rejected", ErrCredential)
 		}
-		return 0, fmt.Errorf("sms/haozhuma web login: the fresh session was rejected: %s", message)
+		return 0, errCall
 	}
-	return len(payload.Data), nil
-}
-
-// webGetWithCookie is webGet against an explicit cookie, used before the cookie
-// has been stored.
-func (h *Haozhuma) webGetWithCookie(ctx context.Context, cookie, query string, into any) error {
-	req, errReq := http.NewRequestWithContext(ctx, http.MethodGet, h.webBase()+"/api.php?"+query, nil)
-	if errReq != nil {
-		return errReq
-	}
-	req.Header.Set("Cookie", cookie)
-	req.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-
-	resp, errDo := h.http.Do(req)
-	if errDo != nil {
-		return fmt.Errorf("sms/haozhuma web: %w", errDo)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if errDecode := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(into); errDecode != nil {
-		return fmt.Errorf("sms/haozhuma web: decode %s: %w", query, errDecode)
-	}
-	return nil
-}
-
-// webRequest performs one JSON request against the web surface and decodes the
-// reply into into.
-func (h *Haozhuma) webRequest(ctx context.Context, method, endpoint, contentType string, body []byte, into any) error {
-	var reader io.Reader
-	if body != nil {
-		reader = bytes.NewReader(body)
-	}
-	req, errReq := http.NewRequestWithContext(ctx, method, endpoint, reader)
-	if errReq != nil {
-		return errReq
-	}
-	if contentType != "" {
-		req.Header.Set("Content-Type", contentType)
-	}
-	req.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-
-	resp, errDo := h.http.Do(req)
-	if errDo != nil {
-		return fmt.Errorf("sms/haozhuma web login: %w", errDo)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if errDecode := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(into); errDecode != nil {
-		return fmt.Errorf("sms/haozhuma web login: decode %s: %w", endpoint, errDecode)
-	}
-	return nil
+	return max(payload.Total, len(payload.List)), nil
 }
 
 // solveHaozhumaCaptcha derives the four click positions from the two captcha

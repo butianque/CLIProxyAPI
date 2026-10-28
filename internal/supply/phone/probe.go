@@ -76,8 +76,8 @@ func probeAPI(ctx context.Context, client *http.Client, endpoint, credential str
 // session can see.
 //
 // The endpoint is the channel's own web address when it has one. Unlike the API
-// surface, the web surface authenticates with the session cookie alone, so a
-// cookie-only credential is a usable one.
+// surface, the web surface authenticates with the session token alone, so a
+// token-only credential is a usable one.
 func ProbeWeb(ctx context.Context, endpoint, credential, egress string) (string, error) {
 	client, errClient := clientForEgress(egress)
 	if errClient != nil {
@@ -161,7 +161,7 @@ func secretValues(secret HaozhumaSecret) []string {
 // which is what makes a cookie-only channel probeable.
 func newWebProvider(secret HaozhumaSecret, client *http.Client) (*Haozhuma, error) {
 	if strings.TrimSpace(secret.Cookie) == "" {
-		return nil, fmt.Errorf("%w: haozhuma web probe needs a session cookie", ErrCredential)
+		return nil, fmt.Errorf("%w: haozhuma web probe needs a web session token", ErrCredential)
 	}
 	endpoint, errEndpoint := normalizeEndpoint(secret.Endpoint)
 	if errEndpoint != nil {

@@ -5,13 +5,13 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"image"
 	"image/color"
 	"image/png"
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"strings"
 	"sync/atomic"
 	"testing"
 )
@@ -183,22 +183,22 @@ type captchaServer struct {
 	loginCalls atomic.Int32
 	// captchaCalls counts how many captchas were served.
 	captchaCalls atomic.Int32
-	// rejectCaptcha makes login.php answer a captcha error, and
+	// rejectCaptcha makes the login endpoint answer a captcha error, and
 	// rejectPassword makes it answer a credential error.
 	rejectCaptcha  bool
 	rejectPassword bool
 	// emptyClick serves a click image with no figures, so solving fails.
 	emptyClick bool
-	channels   string
+	// rejectSession accepts the sign-in but rejects the token when it is used,
+	// which is how a stale or half-issued session shows up.
+	rejectSession bool
+	channels      string
 }
 
 func (s *captchaServer) start(t *testing.T) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
-	mux.HandleFunc("/time.php", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"status":"success","timestamp":1791575365,"token":"tok"}`))
-	})
-	mux.HandleFunc("/Verificationcode.php", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/captcha", func(w http.ResponseWriter, _ *http.Request) {
 		s.captchaCalls.Add(1)
 		click := s.click
 		if s.emptyClick {
@@ -211,27 +211,34 @@ func (s *captchaServer) start(t *testing.T) *httptest.Server {
 			click = encodePNG(t, blank)
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"code":       1,
-			"image_data": base64.StdEncoding.EncodeToString(click),
-			"order":      base64.StdEncoding.EncodeToString(s.order),
-			"captcha_id": "captcha_test",
+			"code":    0,
+			"message": "ok",
+			"data": map[string]any{
+				"captchaId": "captcha_test",
+				"image":     base64.StdEncoding.EncodeToString(click),
+				"order":     base64.StdEncoding.EncodeToString(s.order),
+			},
 		})
 	})
-	mux.HandleFunc("/login.php", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/auth/login", func(w http.ResponseWriter, _ *http.Request) {
 		s.loginCalls.Add(1)
 		switch {
 		case s.rejectCaptcha:
-			_ = json.NewEncoder(w).Encode(map[string]any{"code": -1, "msg": "验证不通过请重试，请点击准确的验证码位置"})
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 100900, "message": "验证码不通过，请按顺序点击准确位置", "data": map[string]any{}})
 		case s.rejectPassword:
-			_ = json.NewEncoder(w).Encode(map[string]any{"code": -1, "msg": "账号或密码错误"})
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 100200, "message": "账号或密码错误", "data": map[string]any{}})
 		default:
-			http.SetCookie(w, &http.Cookie{Name: "PHPSESSID", Value: "session-abc"})
-			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "msg": "登录成功"})
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code":    0,
+				"message": "ok",
+				"data":    map[string]any{"token": "session-abc", "expiresAt": "2026-11-26T00:00:00.000+08:00"},
+			})
 		}
 	})
-	mux.HandleFunc("/api.php", func(w http.ResponseWriter, r *http.Request) {
-		if !strings.Contains(r.Header.Get("Cookie"), "PHPSESSID=") {
-			_ = json.NewEncoder(w).Encode(map[string]any{"code": "401", "msg": "请先登录"})
+	mux.HandleFunc("/bindings", func(w http.ResponseWriter, r *http.Request) {
+		if s.rejectSession || r.Header.Get("Authorization") != "Bearer session-abc" {
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 401, "message": "Unauthorized", "data": map[string]any{}})
 			return
 		}
 		_, _ = w.Write([]byte(s.channels))
@@ -255,7 +262,7 @@ func TestWebLoginSucceeds(t *testing.T) {
 	server := &captchaServer{
 		order:    buildOrderImage(t, figs),
 		click:    buildClickImage(t, figs),
-		channels: `{"code":"200","data":[{"uid":"u1","mc":"讯飞","yhj":"0.13","zxky":"可用数量:19","djzt":"已对接"}]}`,
+		channels: `{"code":0,"message":"ok","data":{"list":[{"code":"21614-u1","projectId":"21614","projectName":"讯飞","price":"0.13","available":19,"status":"joined"}],"total":1,"page":1,"size":100}}`,
 	}
 	httpServer := server.start(t)
 	defer httpServer.Close()
@@ -265,11 +272,29 @@ func TestWebLoginSucceeds(t *testing.T) {
 	if errLogin != nil {
 		t.Fatalf("web login: %v", errLogin)
 	}
-	if result.Cookie != "PHPSESSID=session-abc" {
-		t.Fatalf("cookie = %q", result.Cookie)
+	if result.Token != "session-abc" {
+		t.Fatalf("token = %q", result.Token)
 	}
 	if result.Channels != 1 {
 		t.Fatalf("channels = %d, want 1", result.Channels)
+	}
+}
+
+// A session the server hands out but then refuses is a request problem, not a
+// platform failure: the operator signs in again instead of reporting an outage.
+func TestWebLoginRejectedSessionIsCredentialError(t *testing.T) {
+	figs := captchaFigures()
+	server := &captchaServer{
+		order:         buildOrderImage(t, figs),
+		click:         buildClickImage(t, figs),
+		rejectSession: true,
+	}
+	httpServer := server.start(t)
+	defer httpServer.Close()
+
+	provider := newTestProvider(t, httpServer.URL)
+	if _, errLogin := provider.WebLogin(context.Background(), "linhua888", "web-pass"); !errors.Is(errLogin, ErrCredential) {
+		t.Fatalf("err = %v, want ErrCredential", errLogin)
 	}
 }
 

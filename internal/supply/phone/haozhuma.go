@@ -57,21 +57,27 @@ type HaozhumaSecret struct {
 	// Token is the account-level fixed token: the value every other call
 	// authenticates with. It never changes unless the password does.
 	Token string `json:"token,omitempty"`
-	// Cookie is the web session cookie (PHPSESSID=...). The web surface needs
-	// it to list joined channels; without it channel refresh is skipped and the
-	// cached list is used.
+	// Cookie is the web session token: a bearer token minted by the site's
+	// sign-in, stored here so one field carries whatever the operator pasted.
+	// The web surface needs it to list and manage channels; without it channel
+	// refresh is skipped and the cached list is used.
 	Cookie string `json:"cookie,omitempty"`
 	// WebUser and WebPass are the operator's browser sign-in for the web
 	// surface. They are a different account from the API key above: the API
 	// credential rents numbers, while the web account is what mints the session
-	// cookie. They are only needed when the cookie must be refreshed
-	// automatically; a pasted cookie works without them.
+	// token. They are only needed when the token must be refreshed
+	// automatically; a pasted token works without them.
 	WebUser string `json:"web_user,omitempty"`
 	WebPass string `json:"web_pass,omitempty"`
 	// Endpoint overrides the API host, e.g. https://api.haozhuma.com.
 	Endpoint string `json:"endpoint,omitempty"`
-	// WebBase overrides the web host, e.g. https://h5.haozhuma.com.
+	// WebBase overrides the web control plane address. It predates the split
+	// between the site and its API host, so a value naming one of the vendor's
+	// own hosts is read as "follow the vendor" rather than as an override.
 	WebBase string `json:"web_base,omitempty"`
+	// WebAPI overrides the web control plane address directly, e.g.
+	// https://api.veeto.cn/v1.
+	WebAPI string `json:"web_api,omitempty"`
 }
 
 // ParseHaozhumaSecret decodes the host secret value. The value is a JSON object
@@ -90,8 +96,8 @@ func ParseHaozhumaSecret(value string) (HaozhumaSecret, error) {
 
 // ParseHaozhumaCookie decodes the separate web-session secret into the Cookie
 // and optional WebBase fields. The value may be either a JSON object ({"cookie":
-// "...", "web_base": "..."}) or the bare cookie string, so an operator can paste
-// whatever the browser gives them.
+// "...", "web_base": "..."}) or the bare session value, so an operator can paste
+// whatever the site gives them.
 func ParseHaozhumaCookie(value string) (HaozhumaSecret, error) {
 	var secret HaozhumaSecret
 	trimmed := strings.TrimSpace(value)
@@ -111,9 +117,11 @@ func ParseHaozhumaCookie(value string) (HaozhumaSecret, error) {
 // Haozhuma is the haozhuma (豪猪) provider.
 //
 // The vendor runs two surfaces: a documented SMS API (fixed token, no login
-// flow, what this provider uses) and an undocumented web API that additionally
-// exposes channel search/join. Only the SMS API is used for renting, so a
-// provider never needs a browser session.
+// flow) used for renting and reading numbers, and a web control plane behind a
+// bearer session used for channel search/join. A provider is built from the API
+// credential, because renting is its job; the web session is a separate field
+// that only the channel calls require, and a missing one is reported as a
+// credential error of its own.
 type Haozhuma struct {
 	secret   HaozhumaSecret
 	http     *http.Client

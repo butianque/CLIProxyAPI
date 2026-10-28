@@ -75,8 +75,8 @@ func (p *ProviderImpl) Blacklist(ctx context.Context, phone string) error {
 }
 
 // WebLogin signs in to the platform's web surface with the given account and
-// password, solving its click-order captcha, and returns the session cookie and
-// the number of channels it can now see. The caller persists the cookie.
+// password, solving its click-order captcha, and returns the session token and
+// the number of channels it can now see. The caller persists the token.
 func (p *ProviderImpl) WebLogin(ctx context.Context, user, pass string) (string, int, error) {
 	provider, errProvider := NewHaozhuma(p.secret, p.http)
 	if errProvider != nil {
@@ -88,5 +88,5 @@ func (p *ProviderImpl) WebLogin(ctx context.Context, user, pass string) (string,
 	if errLogin != nil {
 		return "", 0, errLogin
 	}
-	return result.Cookie, result.Channels, nil
+	return result.Token, result.Channels, nil
 }
