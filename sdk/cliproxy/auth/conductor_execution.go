@@ -130,6 +130,11 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		resp, errHome := m.executeHome(ctx, normalized, req, opts, false)
 		return resp, unwrapExecutionBoundaryError(errHome)
 	}
+	scopedProviders, errScope := m.scopedExecutionProviders(normalized, req.Model, opts)
+	if errScope != nil {
+		return cliproxyexecutor.Response{}, errScope
+	}
+	normalized = scopedProviders
 
 	// The concurrency slot belongs to the request, not to the selection call, so
 	// the ledger is created here and released on every return path below.
@@ -195,6 +200,11 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 		resp, errHome := m.executeHome(ctx, normalized, req, opts, true)
 		return resp, unwrapExecutionBoundaryError(errHome)
 	}
+	scopedProviders, errScope := m.scopedExecutionProviders(normalized, req.Model, opts)
+	if errScope != nil {
+		return cliproxyexecutor.Response{}, errScope
+	}
+	normalized = scopedProviders
 
 	// The concurrency slot belongs to the request, not to the selection call, so
 	// the ledger is created here and released on every return path below.
@@ -254,6 +264,11 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	if len(normalized) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
+	scopedProviders, errScope := m.scopedExecutionProviders(normalized, req.Model, opts)
+	if errScope != nil {
+		return nil, errScope
+	}
+	normalized = scopedProviders
 
 	// A stream keeps its slot until the last chunk is delivered, so ownership is
 	// handed to the pump in wrapStreamResult. Until that happens this defer is the

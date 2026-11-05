@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -58,6 +59,8 @@ func TestAllowsCredentialUsesExplicitPoolTable(t *testing.T) {
 		{"pool name is matched case-insensitively", poolAuth("zcode-paid-1"), []string{"zcode-paid!"}, true},
 		{"wrong pool is rejected", poolAuth("loomy-main"), []string{"zcode-free"}, false},
 		{"scope names the credential's category", poolAuth("unlisted"), []string{"zcode"}, true},
+		{"scope names this credential directly", &Auth{ID: "ignored", FileName: "/creds/zcode-main.json", Provider: "zcode"}, []string{"zcode-main"}, true},
+		{"scope names another credential", &Auth{ID: "ignored", FileName: "/creds/zcode-main.json", Provider: "zcode"}, []string{"unlisted"}, false},
 		{"another category is rejected", &Auth{ID: "l", FileName: "l.json", Provider: "loomy"}, []string{"zcode"}, false},
 		{"one of several scopes matches", poolAuth("zcode-free-1"), []string{"loomy", "zcode-free"}, true},
 		{"nil auth with restriction is rejected", nil, []string{"loomy"}, false},
@@ -293,4 +296,167 @@ func TestSelectAuthScopesByAccountCategoryEndToEnd(t *testing.T) {
 	}); errMiss == nil {
 		t.Fatal("SelectAuth(unmatched category scope) error = nil, want auth_not_found")
 	}
+}
+
+// scopedAttemptRecorder is a provider executor that records which credentials it
+// is handed and always fails with a credential-scoped upstream error, which is
+// the state an exhausted account pool is in.
+type scopedAttemptRecorder struct {
+	provider string
+	attempts *[]string
+}
+
+func (e scopedAttemptRecorder) Identifier() string { return e.provider }
+
+func (e scopedAttemptRecorder) record(auth *Auth) error {
+	if e.attempts != nil && auth != nil {
+		*e.attempts = append(*e.attempts, auth.ID)
+	}
+	return &Error{Code: "quota_exceeded", Message: "quota exceeded", HTTPStatus: http.StatusTooManyRequests}
+}
+
+func (e scopedAttemptRecorder) Execute(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, e.record(auth)
+}
+
+func (e scopedAttemptRecorder) ExecuteStream(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return nil, e.record(auth)
+}
+
+func (e scopedAttemptRecorder) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	return auth, nil
+}
+
+func (e scopedAttemptRecorder) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (e scopedAttemptRecorder) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+// TestScopedExecutionProvidersNarrowToScope pins the outer boundary: the provider
+// list a request carries must never name an account category outside the key's
+// scope, because every later selection path inherits that list.
+func TestScopedExecutionProvidersNarrowToScope(t *testing.T) {
+	resolved := []string{"zcode-zai", "workbuddy-cn", "loomy"}
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	for _, auth := range []*Auth{
+		{ID: "narrow-zcode", FileName: "narrow-zcode.json", Provider: "zcode-zai"},
+		{ID: "narrow-wb", FileName: "narrow-wb.json", Provider: "workbuddy-cn"},
+		{ID: "narrow-loomy", FileName: "narrow-loomy.json", Provider: "loomy"},
+	} {
+		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
+		}
+	}
+	scopeOpts := func(scope string) cliproxyexecutor.Options {
+		return cliproxyexecutor.Options{Metadata: map[string]any{cliproxyexecutor.AllowedPoolsMetadataKey: scope}}
+	}
+
+	// An unrestricted caller keeps every provider.
+	if got, errScope := manager.scopedExecutionProviders(resolved, "glm-5.3", cliproxyexecutor.Options{}); errScope != nil || strings.Join(got, ",") != strings.Join(resolved, ",") {
+		t.Fatalf("unscoped providers = %v (err %v), want %v", got, errScope, resolved)
+	}
+
+	// A category scope keeps only the categories that have a credential in scope.
+	if got, errScope := manager.scopedExecutionProviders(resolved, "glm-5.3", scopeOpts("zcode-zai")); errScope != nil {
+		t.Fatalf("zcode-scoped providers error = %v", errScope)
+	} else if strings.Join(got, ",") != "zcode-zai" {
+		t.Fatalf("zcode-scoped providers = %v, want [zcode-zai]", got)
+	}
+
+	// A scope may also name a single credential; its category stays reachable.
+	if got, errScope := manager.scopedExecutionProviders(resolved, "glm-5.3", scopeOpts("narrow-loomy")); errScope != nil {
+		t.Fatalf("credential-scoped providers error = %v", errScope)
+	} else if strings.Join(got, ",") != "loomy" {
+		t.Fatalf("credential-scoped providers = %v, want [loomy]", got)
+	}
+
+	// A scope that reaches no provider is a failure, not an empty hand-off.
+	_, errScope := manager.scopedExecutionProviders(resolved, "glm-5.3", scopeOpts("zcode-bigmodel"))
+	if errScope == nil {
+		t.Fatal("unmatched scope providers error = nil, want auth_not_found")
+	}
+	if errScope.Code != "auth_not_found" || !strings.Contains(errScope.Message, "zcode-bigmodel") {
+		t.Fatalf("unmatched scope providers error = %+v, want auth_not_found naming the scope", errScope)
+	}
+}
+
+// TestScopedExecutionNeverFallsBackWhenThePoolIsExhausted is the security
+// property the pool scope exists for: once every credential inside the scope has
+// failed, the request must fail instead of being served by another category.
+// A model shared by several categories is the case where that is easy to get
+// wrong, so both the first attempt and the all-cooling retry are checked, over
+// the buffered and the streaming entry points.
+func TestScopedExecutionNeverFallsBackWhenThePoolIsExhausted(t *testing.T) {
+	const model = "glm-5.3-flash"
+	reg := registry.GetGlobalRegistry()
+	setCredentialPools(nil)
+	t.Cleanup(func() { setCredentialPools(nil) })
+
+	auths := []*Auth{
+		{ID: "exhausted-zcode-1", FileName: "exhausted-zcode-1.json", Provider: "zcode-zai"},
+		{ID: "exhausted-zcode-2", FileName: "exhausted-zcode-2.json", Provider: "zcode-zai"},
+		{ID: "exhausted-wb", FileName: "exhausted-wb.json", Provider: "workbuddy-cn"},
+		{ID: "exhausted-loomy", FileName: "exhausted-loomy.json", Provider: "loomy"},
+	}
+	for _, auth := range auths {
+		reg.RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+		authID := auth.ID
+		t.Cleanup(func() { reg.UnregisterClient(authID) })
+	}
+
+	var attempts []string
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	for _, provider := range []string{"zcode-zai", "workbuddy-cn", "loomy"} {
+		manager.executors[provider] = scopedAttemptRecorder{provider: provider, attempts: &attempts}
+	}
+	for _, auth := range auths {
+		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
+		}
+	}
+
+	// The resolved provider list covers every category that advertises the model;
+	// exactly as the handler resolves it before auth selection.
+	providers := []string{"zcode-zai", "workbuddy-cn", "loomy"}
+	scoped := cliproxyexecutor.Options{Metadata: map[string]any{cliproxyexecutor.AllowedPoolsMetadataKey: "zcode-zai"}}
+
+	assertOnlyZcode := func(phase string, requireAttempt bool) {
+		t.Helper()
+		for _, id := range attempts {
+			if id == "exhausted-wb" || id == "exhausted-loomy" {
+				t.Fatalf("%s: out-of-scope credential %q was attempted (attempts=%v)", phase, id, attempts)
+			}
+		}
+		if requireAttempt && len(attempts) == 0 {
+			t.Fatalf("%s: no in-scope credential was attempted", phase)
+		}
+	}
+
+	attempts = attempts[:0]
+	if _, errExec := manager.Execute(context.Background(), providers, cliproxyexecutor.Request{Model: model}, scoped); errExec == nil {
+		t.Fatalf("Execute with an exhausted scope returned no error (attempts=%v)", attempts)
+	}
+	assertOnlyZcode("first Execute", true)
+
+	// Every in-scope credential is now cooling down. The scope must still hold:
+	// this is the state reported as "all accounts are dead", and the moment a
+	// fallback would be visible to the caller.
+	attempts = attempts[:0]
+	if _, errExec := manager.Execute(context.Background(), providers, cliproxyexecutor.Request{Model: model}, scoped); errExec == nil {
+		t.Fatalf("Execute with every in-scope credential cooling returned no error (attempts=%v)", attempts)
+	}
+	assertOnlyZcode("cooling Execute", false)
+
+	attempts = attempts[:0]
+	streamOpts := cliproxyexecutor.Options{
+		Stream:   true,
+		Metadata: map[string]any{cliproxyexecutor.AllowedPoolsMetadataKey: "zcode-zai"},
+	}
+	if _, errStream := manager.ExecuteStream(context.Background(), providers, cliproxyexecutor.Request{Model: model}, streamOpts); errStream == nil {
+		t.Fatalf("ExecuteStream with every in-scope credential cooling returned no error (attempts=%v)", attempts)
+	}
+	assertOnlyZcode("cooling ExecuteStream", false)
 }

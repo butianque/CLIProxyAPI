@@ -132,12 +132,17 @@ func (e authSelectionEligibility) allows(auth *Auth) bool {
 // use credentials one of the entries names, so a restricted key never silently
 // falls back onto an unrelated credential.
 //
-// An entry names either an account category or a declared credential pool:
+// An entry names an account category, a single credential, or a declared
+// credential pool:
 //
 //   - A category is the credential's provider — the same grouping the credentials
 //     page shows as its tabs. It is resolved against the live credential set, so a
 //     key scoped to a category follows accounts being added or removed without any
 //     configuration write.
+//   - A single credential is named by its auth file base name, which is the same
+//     form the model catalog already compares scope entries against
+//     (registry.clientInScope). Both sides have to accept it, otherwise a key
+//     scoped to one credential is shown models that routing then refuses.
 //   - A pool is an explicit member list from the config's credential-pools table.
 //     It stays supported for hand-written configurations, but nothing in the
 //     management UI creates one any more: the categories already describe the
@@ -149,11 +154,14 @@ func (e authSelectionEligibility) allowsCredential(auth *Auth) bool {
 	if auth == nil {
 		return false
 	}
-	name := credentialName(auth)
+	name := strings.ToLower(strings.TrimSpace(credentialName(auth)))
 	// Scope entries are lowercased by splitPoolList, so compare against the
 	// provider in the same form.
 	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
 	for _, scope := range e.allowedPools {
+		if name != "" && scope == name {
+			return true
+		}
 		if credentialContains(scope, name) {
 			return true
 		}
@@ -205,6 +213,75 @@ func splitPoolList(raw string) []string {
 		return nil
 	}
 	return pools
+}
+
+// scopedExecutionProviders narrows the resolved provider list to the account
+// categories the caller's key scope can actually reach.
+//
+// Resolving a model to providers answers a question about the whole
+// installation: who advertises this model. A scoped client key may only use the
+// credentials inside its scope, so the two answers diverge as soon as several
+// categories advertise the same model. Credential selection applies the scope as
+// well, but doing it here makes the provider list itself carry the boundary, so
+// no selection path reached later (built-in scheduler, plugin scheduler, legacy
+// selector) can name a category the caller may not use.
+//
+// An unrestricted caller (no scope in metadata) keeps the list unchanged. When
+// the scope reaches none of the providers, the request fails with an
+// auth_not_found error naming the scope: "the model exists but is outside your
+// scope" and "the model does not exist" need different answers.
+//
+// Home dispatch resolves providers on its own and gets the scope with the
+// dispatch, so it is left alone here.
+func (m *Manager) scopedExecutionProviders(providers []string, model string, opts cliproxyexecutor.Options) ([]string, *Error) {
+	scope := allowedPoolsFromMetadata(opts.Metadata)
+	if m == nil || len(providers) == 0 || len(scope) == 0 || m.HomeEnabled() {
+		return providers, nil
+	}
+
+	eligibility := authSelectionEligibility{allowedPools: scope}
+	m.mu.RLock()
+	reachable := make(map[string]struct{}, len(m.auths))
+	for _, candidate := range m.auths {
+		if candidate == nil || !eligibility.allowsCredential(candidate) {
+			continue
+		}
+		if key := canonicalSchedulingProvider(executorKeyFromAuth(candidate)); key != "" {
+			reachable[key] = struct{}{}
+		}
+	}
+	m.mu.RUnlock()
+
+	kept := make([]string, 0, len(providers))
+	seen := make(map[string]struct{}, len(providers))
+	for _, provider := range providers {
+		key := canonicalSchedulingProvider(provider)
+		if key == "" {
+			continue
+		}
+		if _, ok := reachable[key]; !ok {
+			continue
+		}
+		if _, duplicate := seen[key]; duplicate {
+			continue
+		}
+		seen[key] = struct{}{}
+		kept = append(kept, provider)
+	}
+	if len(kept) == 0 {
+		label := strings.TrimSpace(model)
+		if label == "" {
+			label = "requested model"
+		}
+		return nil, &Error{
+			Code: "auth_not_found",
+			Message: fmt.Sprintf(
+				"model %q is not available in scope %s: no credential in that scope serves it",
+				label, strings.Join(scope, ","),
+			),
+		}
+	}
+	return kept, nil
 }
 
 func (m *Manager) syncSchedulerFromSnapshot(auths []*Auth) {
