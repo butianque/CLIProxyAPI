@@ -1343,6 +1343,11 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
 		return nil, nil
 	}
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
+	// The credits fallback rebuilds its own candidate set, so it must apply the
+	// key's pool scope itself: nothing upstream narrows this list. Without it a
+	// key scoped to one credential could execute on another account of the same
+	// provider, which is the fallback selection documents it never does.
+	eligibility := authSelectionEligibility{allowedPools: allowedPoolsFromMetadata(opts.Metadata)}
 	var candidates []creditsCandidateEntry
 	m.mu.RLock()
 	for _, auth := range m.auths {
@@ -1350,6 +1355,9 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
 			continue
 		}
 		if pinnedAuthID != "" && auth.ID != pinnedAuthID {
+			continue
+		}
+		if !eligibility.allowsCredential(auth) {
 			continue
 		}
 		if !strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") {

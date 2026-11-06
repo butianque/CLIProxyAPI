@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/credentialpools"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -139,14 +140,16 @@ func (e authSelectionEligibility) allows(auth *Auth) bool {
 //     page shows as its tabs. It is resolved against the live credential set, so a
 //     key scoped to a category follows accounts being added or removed without any
 //     configuration write.
-//   - A single credential is named by its auth file base name, which is the same
-//     form the model catalog already compares scope entries against
-//     (registry.clientInScope). Both sides have to accept it, otherwise a key
-//     scoped to one credential is shown models that routing then refuses.
+//   - A single credential is named by its auth file base name, the form the
+//     catalogue records when it registers a provider's models.
 //   - A pool is an explicit member list from the config's credential-pools table.
 //     It stays supported for hand-written configurations, but nothing in the
 //     management UI creates one any more: the categories already describe the
 //     credentials, so a second membership table only added a way to disagree.
+//
+// All three forms are resolved by credentialpools.MatchesScope, the same
+// implementation the model catalogue uses, so the advertised models and the
+// routable credentials can no longer disagree.
 func (e authSelectionEligibility) allowsCredential(auth *Auth) bool {
 	if len(e.allowedPools) == 0 {
 		return true
@@ -154,22 +157,7 @@ func (e authSelectionEligibility) allowsCredential(auth *Auth) bool {
 	if auth == nil {
 		return false
 	}
-	name := strings.ToLower(strings.TrimSpace(credentialName(auth)))
-	// Scope entries are lowercased by splitPoolList, so compare against the
-	// provider in the same form.
-	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
-	for _, scope := range e.allowedPools {
-		if name != "" && scope == name {
-			return true
-		}
-		if credentialContains(scope, name) {
-			return true
-		}
-		if provider != "" && scope == provider {
-			return true
-		}
-	}
-	return false
+	return credentialpools.MatchesScope(e.allowedPools, auth.Provider, credentialName(auth))
 }
 
 // credentialName is the identifier a credential is addressed by in

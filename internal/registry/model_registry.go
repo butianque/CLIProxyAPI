@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/credentialpools"
 	misc "github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
 	log "github.com/sirupsen/logrus"
 )
@@ -550,29 +551,13 @@ func modelIDListed(modelIDs []string, modelID string) bool {
 }
 
 // clientInScope reports whether a registered client falls inside a caller's
-// credential scope. It mirrors the auth manager's selection filter, where an entry
-// matches either the credential's provider (the account category the management
-// panel offers) or the credential's own name.
-//
-// The comparison is deliberately no looser than that filter. An entry that routing
-// would reject must not keep a model advertised, so only the two forms routing
-// accepts are honoured.
+// credential scope. It defers to credentialpools.MatchesScope, the same matcher
+// credential selection uses, so a scope entry that routing accepts also keeps the
+// model advertised: an entry naming the provider (the account category the
+// management panel offers), the credential's own name, or a declared
+// credential-pool the credential belongs to.
 func clientInScope(clientID, provider string, scope []string) bool {
-	name := credentialBaseName(clientID)
-	provider = strings.ToLower(strings.TrimSpace(provider))
-	for _, entry := range scope {
-		entry = strings.ToLower(strings.TrimSpace(entry))
-		if entry == "" {
-			continue
-		}
-		if provider != "" && entry == provider {
-			return true
-		}
-		if entry == name {
-			return true
-		}
-	}
-	return false
+	return credentialpools.MatchesScope(scope, provider, credentialBaseName(clientID))
 }
 
 // credentialBaseName is the identifier a scope entry uses for one credential: the

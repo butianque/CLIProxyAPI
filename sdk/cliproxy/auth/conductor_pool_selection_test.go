@@ -460,3 +460,51 @@ func TestScopedExecutionNeverFallsBackWhenThePoolIsExhausted(t *testing.T) {
 	}
 	assertOnlyZcode("cooling ExecuteStream", false)
 }
+
+// TestPoolScopeCatalogMatchesCredentialSelection pins the claim the catalogue and
+// credential selection both make: the model catalogue and credential selection
+// apply the same scope rule. A pool-named entry is a form selection accepts, so
+// the catalogue has to accept it too; otherwise a key scoped to a hand-written
+// pool is advertised an empty catalogue while routing would have served it.
+func TestPoolScopeCatalogMatchesCredentialSelection(t *testing.T) {
+	const model = "poolscope-catalog-probe"
+	reg := registry.GetGlobalRegistry()
+	for _, id := range []string{"poolscope-in.json", "poolscope-out.json"} {
+		clientID := id
+		reg.RegisterClient(clientID, "zcode", []*registry.ModelInfo{{ID: model}})
+		t.Cleanup(func() { reg.UnregisterClient(clientID) })
+	}
+	setCredentialPools(map[string][]string{"handwritten-pool": {"poolscope-in"}})
+	t.Cleanup(func() { setCredentialPools(nil) })
+
+	scope := []string{"handwritten-pool"}
+
+	// Selection: the pool member is routable, the other credential is not.
+	eligibility := authSelectionEligibility{allowedPools: scope}
+	if !eligibility.allowsCredential(&Auth{ID: "poolscope-in", FileName: "poolscope-in.json", Provider: "zcode"}) {
+		t.Fatal("selection rejected a credential named by its pool")
+	}
+	if eligibility.allowsCredential(&Auth{ID: "poolscope-out", FileName: "poolscope-out.json", Provider: "zcode"}) {
+		t.Fatal("selection accepted a credential outside the pool")
+	}
+
+	advertised := func(entries []string) bool {
+		t.Helper()
+		for _, m := range reg.GetAvailableModelsForScope("openai", entries) {
+			if got, _ := m["id"].(string); got == model {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Control: the provider form already agreed before the pool form, so it proves
+	// the probe itself is sound (a broken catalogue would fail here too).
+	if !advertised([]string{"zcode"}) {
+		t.Fatalf("catalogue for the provider form does not advertise %q; probe is unsound", model)
+	}
+	// The catalogue must agree with selection on the same entry form.
+	if !advertised(scope) {
+		t.Fatalf("catalogue for scope %v does not advertise %q, but selection accepts its credential", scope, model)
+	}
+}

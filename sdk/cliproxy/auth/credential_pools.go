@@ -1,71 +1,20 @@
 package auth
 
 import (
-	"strings"
-	"sync/atomic"
-
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/credentialpools"
 )
-
-// credentialPoolSnapshot is the resolved credential-pools table: a pool name
-// maps to the set of credential file base names it contains.
-//
-// Membership is declared explicitly in configuration rather than inferred from a
-// credential's provider. The table is published as a package-level snapshot so
-// every selection path — including the scheduler, which has no access to the
-// Manager — enforces the same rule from the same source.
-type credentialPoolSnapshot map[string]map[string]struct{}
-
-var credentialPools atomic.Pointer[credentialPoolSnapshot]
 
 // setCredentialPools publishes the resolved credential-pools table from config.
 // A nil or empty map clears it, which restores unrestricted selection for every
 // scoped key (nothing can match an empty table).
 func setCredentialPools(pools map[string][]string) {
-	if len(pools) == 0 {
-		credentialPools.Store(nil)
-		return
-	}
-	resolved := make(credentialPoolSnapshot, len(pools))
-	for pool, names := range pools {
-		pool = strings.ToLower(strings.TrimSpace(pool))
-		if pool == "" {
-			continue
-		}
-		members := make(map[string]struct{}, len(names))
-		for _, name := range names {
-			// Credential names are file base names, which are matched
-			// case-insensitively so a hand-written pool entry that differs only in
-			// case or padding still resolves to the credential it names.
-			name = strings.ToLower(strings.TrimSpace(name))
-			if name == "" {
-				continue
-			}
-			members[name] = struct{}{}
-		}
-		if len(members) > 0 {
-			resolved[pool] = members
-		}
-	}
-	if len(resolved) == 0 {
-		credentialPools.Store(nil)
-		return
-	}
-	credentialPools.Store(&resolved)
+	credentialpools.Publish(pools)
 }
 
 // credentialContains reports whether the named credential belongs to pool.
 func credentialContains(pool, name string) bool {
-	snapshot := credentialPools.Load()
-	if snapshot == nil || name == "" {
-		return false
-	}
-	members, ok := (*snapshot)[strings.ToLower(strings.TrimSpace(pool))]
-	if !ok {
-		return false
-	}
-	_, found := members[strings.ToLower(strings.TrimSpace(name))]
-	return found
+	return credentialpools.Contains(pool, name)
 }
 
 // resolveCredentialPools derives the pool table from a config snapshot. It is the

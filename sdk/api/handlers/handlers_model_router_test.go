@@ -210,6 +210,60 @@ func TestHandlerModelRouterRoutesBeforeRequestDetails(t *testing.T) {
 	}
 }
 
+// A model router may divert a request to a plugin executor instead of the built-in
+// auth path. That path selects no credential at all (it runs the plugin executor
+// with a nil auth), so a caller's pool scope has no credential to restrict there.
+// This pins that behaviour and proves the probe is sound: the provider route, with
+// the same zero-credential manager and the same scope, does fail.
+func TestModelRouterExecutorRouteNeedsNoCredential(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const model = "plugin-exec-authfree-probe"
+	const scope = "workbuddy-cn"
+	payload := []byte(fmt.Sprintf(`{"model":%q}`, model))
+
+	newScopedCtx := func() context.Context {
+		ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		ginCtx.Set("accessMetadata", map[string]string{"source": "authorization", "pools": scope})
+		return context.WithValue(context.Background(), "gin", ginCtx)
+	}
+	newHandler := func(targetKind pluginapi.ModelRouteTargetKind, target string) (*BaseAPIHandler, *handlerDirectExecutorRouteHost) {
+		host := &handlerDirectExecutorRouteHost{}
+		host.hasRouters = true
+		host.route = func(context.Context, pluginapi.ModelRouteRequest) (pluginapi.ModelRouteResponse, bool) {
+			return pluginapi.ModelRouteResponse{Handled: true, TargetKind: targetKind, Target: target}, true
+		}
+		// No credentials registered: any credential-selecting path must fail.
+		handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, coreauth.NewManager(nil, nil, nil))
+		handler.SetModelRouterHost(host)
+		return handler, host
+	}
+
+	t.Run("executor route is served without any credential", func(t *testing.T) {
+		handler, host := newHandler(pluginapi.ModelRouteTargetExecutor, "websearch-plugin")
+
+		body, _, errMsg := handler.ExecuteWithAuthManager(newScopedCtx(), "openai", model, payload, "")
+		if errMsg != nil {
+			t.Fatalf("executor route failed without credentials: %#v", errMsg)
+		}
+		if string(body) != "direct-ok" {
+			t.Fatalf("body = %q, want plugin executor response", body)
+		}
+		if got := host.lastOptions.Metadata[coreexecutor.AllowedPoolsMetadataKey]; got != scope {
+			t.Fatalf("allowed_pools metadata = %v, want %q carried to the executor", got, scope)
+		}
+	})
+
+	t.Run("provider route with the same manager still requires an in-scope credential", func(t *testing.T) {
+		handler, _ := newHandler(pluginapi.ModelRouteTargetProvider, "loomy")
+
+		body, _, errMsg := handler.ExecuteWithAuthManager(newScopedCtx(), "openai", model, payload, "")
+		if errMsg == nil {
+			t.Fatalf("provider route succeeded with no credentials (body=%q); scope probe is unsound", body)
+		}
+	})
+}
+
 func TestHandlerModelRouterDirectExecutorRunsAfterAuthInterceptor(t *testing.T) {
 	originalModel := "handler-router-after-auth-original-model"
 	targetPluginID := "websearch-plugin"

@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"net/http"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -97,4 +98,61 @@ func TestFindAllAntigravityCreditsCandidateAuths_HomeKVUnavailableReturnsError(t
 	if !strings.Contains(errCandidates.Error(), "home kv store unavailable") {
 		t.Fatalf("error = %v, want home kv store unavailable", errCandidates)
 	}
+}
+
+// TestFindAllAntigravityCreditsCandidateAuths_RespectsKeyPoolScope pins the
+// invariant credential selection documents for scoped keys: "a restricted key
+// never silently falls back onto an unrelated credential". The credits fallback
+// rebuilds its own candidate set, so it has to apply the key's pool scope itself;
+// nothing upstream narrows this list.
+func TestFindAllAntigravityCreditsCandidateAuths_RespectsKeyPoolScope(t *testing.T) {
+	m := &Manager{
+		auths: map[string]*Auth{
+			"ag-in":  {ID: "ag-in", FileName: "ag-in.json", Provider: "antigravity"},
+			"ag-out": {ID: "ag-out", FileName: "ag-out.json", Provider: "antigravity"},
+		},
+		executors: map[string]ProviderExecutor{
+			"antigravity": schedulerTestExecutor{},
+		},
+	}
+
+	candidateIDs := func(opts cliproxyexecutor.Options) []string {
+		t.Helper()
+		candidates, errCandidates := m.findAllAntigravityCreditsCandidateAuths(context.Background(), "claude-sonnet-4-6", opts)
+		if errCandidates != nil {
+			t.Fatalf("findAllAntigravityCreditsCandidateAuths() error = %v", errCandidates)
+		}
+		ids := make([]string, 0, len(candidates))
+		for _, candidate := range candidates {
+			ids = append(ids, candidate.auth.ID)
+		}
+		sort.Strings(ids)
+		return ids
+	}
+
+	// A key scoped to one credential must not see another antigravity account.
+	t.Run("scoped key sees only the credential it names", func(t *testing.T) {
+		scoped := cliproxyexecutor.Options{Metadata: map[string]any{cliproxyexecutor.AllowedPoolsMetadataKey: "ag-in"}}
+		if got := candidateIDs(scoped); strings.Join(got, ",") != "ag-in" {
+			t.Fatalf("scoped candidates = %v, want [ag-in]: the credits fallback escaped the key's scope", got)
+		}
+	})
+
+	// Without a scope every antigravity credential stays a candidate.
+	t.Run("unscoped key sees every credential", func(t *testing.T) {
+		if got := candidateIDs(cliproxyexecutor.Options{}); strings.Join(got, ",") != "ag-in,ag-out" {
+			t.Fatalf("unscoped candidates = %v, want [ag-in ag-out]", got)
+		}
+	})
+
+	// Pinning a credential outside the scope must leave no candidate at all.
+	t.Run("pinned credential outside scope yields none", func(t *testing.T) {
+		pinned := cliproxyexecutor.Options{Metadata: map[string]any{
+			cliproxyexecutor.AllowedPoolsMetadataKey: "ag-in",
+			cliproxyexecutor.PinnedAuthMetadataKey:   "ag-out",
+		}}
+		if got := candidateIDs(pinned); len(got) != 0 {
+			t.Fatalf("pinned + scoped candidates = %v, want none", got)
+		}
+	})
 }
