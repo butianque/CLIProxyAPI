@@ -676,8 +676,9 @@ func main() {
 		sdkAuth.RegisterTokenStore(sdkAuth.NewFileTokenStore())
 	}
 
-	// Register built-in access providers before constructing services.
-	configaccess.Register(&cfg.SDKConfig)
+	// Register built-in access providers before constructing services. Home mode
+	// clears api-keys deliberately, so it keeps the legacy anonymous behaviour.
+	configaccess.Register(&cfg.SDKConfig, !cfg.Home.Enabled)
 	pluginHost.ApplyConfig(context.Background(), cfg)
 	if configLoadedFromHome && homePluginStatusReady {
 		errHomePluginLoad := homeplugins.MarkLoadResults(&homePluginSyncReport, pluginHost)

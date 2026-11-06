@@ -146,8 +146,9 @@ func corsMiddleware() gin.HandlerFunc {
 }
 
 // AuthMiddleware returns a Gin middleware handler that authenticates requests
-// using the configured authentication providers. When no providers are available,
-// it allows all requests (legacy behaviour).
+// using the configured authentication providers. An empty provider list means no
+// authentication is configured, so requests are allowed through (legacy
+// behaviour kept for Home mode and keyless deployments).
 func AuthMiddleware(manager *sdkaccess.Manager) gin.HandlerFunc {
 	return accessAuthMiddleware(manager, false)
 }

@@ -10,7 +10,13 @@ import (
 )
 
 // Register ensures the config-access provider is available to the access manager.
-func Register(cfg *sdkconfig.SDKConfig) {
+//
+// An empty client key list is handled according to denyAll:
+//   - true registers a provider that rejects every request, so removing the last
+//     client key denies access instead of turning the proxy into an open relay.
+//   - false leaves authentication to any other registered provider (the legacy
+//     behaviour) and is used by Home mode, which clears api-keys on purpose.
+func Register(cfg *sdkconfig.SDKConfig, denyAll bool) {
 	if cfg == nil {
 		sdkaccess.UnregisterProvider(sdkaccess.AccessProviderTypeConfigAPIKey)
 		return
@@ -18,6 +24,13 @@ func Register(cfg *sdkconfig.SDKConfig) {
 
 	keys := normalizeKeys(cfg.APIKeys)
 	if len(keys) == 0 {
+		if denyAll {
+			sdkaccess.RegisterProvider(
+				sdkaccess.AccessProviderTypeConfigAPIKey,
+				newProvider(sdkaccess.DefaultAccessProviderName, nil, nil),
+			)
+			return
+		}
 		sdkaccess.UnregisterProvider(sdkaccess.AccessProviderTypeConfigAPIKey)
 		return
 	}
@@ -93,11 +106,11 @@ func (p *provider) Identifier() string {
 	return p.name
 }
 
+// Authenticate checks the request against the configured client key set. An
+// empty set matches nothing, so a deny-all provider rejects every request while
+// still distinguishing a missing credential from an invalid one.
 func (p *provider) Authenticate(_ context.Context, r *http.Request) (*sdkaccess.Result, *sdkaccess.AuthError) {
 	if p == nil {
-		return nil, sdkaccess.NewNotHandledError()
-	}
-	if len(p.keys) == 0 {
 		return nil, sdkaccess.NewNotHandledError()
 	}
 	authHeader := r.Header.Get("Authorization")
