@@ -31,6 +31,30 @@ plugins: {}
 	}
 }
 
+func TestParseConfigBytes_PluginMaxInFlight(t *testing.T) {
+	cases := []struct {
+		name string
+		yaml string
+		want int
+	}{
+		{name: "absent defaults to unlimited", yaml: "plugins: {}\n", want: 0},
+		{name: "explicit value", yaml: "plugins:\n  max-in-flight: 128\n", want: 128},
+		{name: "zero stays unlimited", yaml: "plugins:\n  max-in-flight: 0\n", want: 0},
+		{name: "negative clamps to unlimited", yaml: "plugins:\n  max-in-flight: -5\n", want: 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, errParse := ParseConfigBytes([]byte(tc.yaml))
+			if errParse != nil {
+				t.Fatalf("ParseConfigBytes() error = %v", errParse)
+			}
+			if cfg.Plugins.MaxInFlight != tc.want {
+				t.Fatalf("Plugins.MaxInFlight = %d, want %d", cfg.Plugins.MaxInFlight, tc.want)
+			}
+		})
+	}
+}
+
 func TestParseConfigBytes_PluginsDirExpandsLeadingTilde(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
