@@ -627,6 +627,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			errExec = markUpstreamExecutionAttemptFromContext(execCtx, errExec)
 			durationExec := time.Since(startExec)
 			if errExec != nil {
+				if isLoadShedError(errExec) {
+					return cliproxyexecutor.Response{}, errExec
+				}
 				if hasUpstreamExecutionAttempt(errExec) {
 					upstreamErr = errExec
 				}
@@ -839,6 +842,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			errExec = markUpstreamExecutionAttemptFromContext(execCtx, errExec)
 			durationExec := time.Since(startExec)
 			if errExec != nil {
+				if isLoadShedError(errExec) {
+					return cliproxyexecutor.Response{}, errExec
+				}
 				if hasUpstreamExecutionAttempt(errExec) {
 					upstreamErr = errExec
 				}
@@ -1204,6 +1210,15 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, execOpts, routeModel, streamExecutionModel, models, pooled, aliasResult, routing, !homeMode || selection != nil, selection != nil)
 		if errStream != nil {
+			if isLoadShedError(errStream) {
+				if selection != nil {
+					releaseAttempt()
+					if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, "load_shed"); errEnd != nil {
+						return nil, errEnd
+					}
+				}
+				return nil, errStream
+			}
 			if hasUpstreamExecutionAttempt(errStream) {
 				upstreamErr = errStream
 			}

@@ -26,7 +26,7 @@ func TestDynamicLibraryClientCallSurvivesReentrantCallbackStackGrowth(t *testing
 	client := newGuardedPluginClient(&dynamicLibraryClient{api: windowsPluginAPI{
 		call:       syscall.NewCallback(testReentrantPluginCall),
 		freeBuffer: syscall.NewCallback(testReentrantPluginFree),
-	}})
+	}}, nil)
 	t.Cleanup(client.Shutdown)
 
 	got, errCall := client.Call(context.Background(), "model.route", []byte(`{}`))
@@ -96,7 +96,7 @@ func TestDynamicLibraryClientCallKeepsRequestMemoryAlive(t *testing.T) {
 	client := newGuardedPluginClient(&dynamicLibraryClient{api: windowsPluginAPI{
 		call:       syscall.NewCallback(testLivenessPluginCall),
 		freeBuffer: syscall.NewCallback(testReentrantPluginFree),
-	}})
+	}}, nil)
 	t.Cleanup(client.Shutdown)
 
 	req := new(testLivenessRequestBuffer)

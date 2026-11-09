@@ -1546,6 +1546,9 @@ func (m *Manager) shouldRetryAfterErrorWithAttempted(ctx context.Context, opts c
 	if err == nil {
 		return 0, false
 	}
+	if isLoadShedError(err) {
+		return 0, false
+	}
 	var homeBusy *HomeConcurrencyBusyError
 	if errors.As(err, &homeBusy) && homeBusy != nil {
 		return 0, false
@@ -1677,6 +1680,21 @@ func isRequestRetryRoundError(err error) bool {
 		return false
 	}
 	return isCredentialRetryRoundStatus(statusCodeFromError(err)) || isTransientTransportError(err)
+}
+
+// isLoadShedError reports a deliberate admission rejection (for example the
+// host's global plugin call limit). Retrying the same request against another
+// credential cannot succeed while the limit holds, and the credential is
+// healthy, so the request must fail fast without a cooldown or a retry round.
+func isLoadShedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	type loadShedProvider interface {
+		LoadShed() bool
+	}
+	var lsp loadShedProvider
+	return errors.As(err, &lsp) && lsp != nil && lsp.LoadShed()
 }
 
 // cooldownWaitJitterCap bounds the random jitter added to cooldown waits so a

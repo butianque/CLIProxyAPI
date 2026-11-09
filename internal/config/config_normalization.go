@@ -28,6 +28,9 @@ func (cfg *Config) NormalizePluginsConfig() {
 		cfg.Plugins.StoreSources = sources
 	}
 	cfg.Plugins.StoreAuth = sdkpluginstore.NormalizeAuthConfigs(cfg.Plugins.StoreAuth)
+	if cfg.Plugins.MaxInFlight < 0 {
+		cfg.Plugins.MaxInFlight = 0
+	}
 	if cfg.Plugins.Configs == nil {
 		cfg.Plugins.Configs = map[string]PluginInstanceConfig{}
 	}

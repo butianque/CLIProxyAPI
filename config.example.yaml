@@ -1143,6 +1143,10 @@ observability:
 plugins:
   enabled: false
   dir: "plugins"
+  # Global in-flight cap for host-to-plugin calls across every loaded plugin.
+  # 0 disables the cap. A call over the cap is rejected immediately with HTTP 503
+  # instead of queueing another native call the host cannot cancel.
+  # max-in-flight: 128
   # Additional plugin store registries. The built-in official registry is always included.
   # store-sources:
   #   - "https://example.com/cliproxy-plugins/registry.json"

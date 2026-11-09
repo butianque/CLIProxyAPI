@@ -38,6 +38,11 @@ type PluginsConfig struct {
 	AuthRevision int64 `yaml:"auth-revision,omitempty" json:"auth-revision,omitempty"`
 	// Configs stores per-plugin instance configuration by plugin ID.
 	Configs map[string]PluginInstanceConfig `yaml:"configs" json:"configs"`
+	// MaxInFlight bounds how many plugin calls may run at once across every
+	// loaded plugin. Zero disables the limit. A call over the limit is rejected
+	// immediately with HTTP 503 instead of queueing another native call that the
+	// host cannot cancel.
+	MaxInFlight int `yaml:"max-in-flight,omitempty" json:"max-in-flight,omitempty"`
 }
 
 // PluginInstanceConfig stores host-owned plugin settings and the original plugin YAML subtree.

@@ -89,6 +89,7 @@ type Host struct {
 	activePluginPaths      map[string]string
 	cleanupFilesPending    bool
 	runtimeConfig          *config.Config
+	callLimiter            *pluginCallLimiter
 	authManager            *coreauth.Manager
 	modelExecutor          modelExecutor
 	modelClientIDs         map[string]struct{}
@@ -129,6 +130,7 @@ func New() *Host {
 		activePluginVersions:   make(map[string]string),
 		activePluginPaths:      make(map[string]string),
 		cleanupFilesPending:    true,
+		callLimiter:            newPluginCallLimiter(0),
 		modelClientIDs:         make(map[string]struct{}),
 		executorModelClientIDs: make(map[string]struct{}),
 		modelProviders:         make(map[string][]string),
@@ -249,6 +251,11 @@ func (h *Host) ApplyConfig(ctx context.Context, cfg *config.Config) {
 	h.mu.Lock()
 	h.runtimeConfig = cfg
 	h.mu.Unlock()
+	callLimit := 0
+	if cfg != nil {
+		callLimit = cfg.Plugins.MaxInFlight
+	}
+	h.callLimiter.setLimit(callLimit)
 
 	if !rc.Enabled {
 		h.mu.Lock()
@@ -526,7 +533,7 @@ func (h *Host) startPluginLoad(ctx context.Context, file pluginFile, item runtim
 			request.result <- pluginLoadResult{err: fmt.Errorf("plugin loader returned nil client")}
 			return
 		}
-		guardedClient := newGuardedPluginClient(client)
+		guardedClient := newGuardedPluginClient(client, h.callLimiter)
 		loaded := &loadedPlugin{
 			id:               file.ID,
 			path:             file.Path,
