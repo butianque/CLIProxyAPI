@@ -980,11 +980,13 @@ func latestCandidateErrorForModel(auths []*Auth, selectionModelFunc func(*Auth) 
 	return latestAuthErr
 }
 
-func schedulerAttributeSensitive(key string) bool {
-	key = strings.ToLower(strings.TrimSpace(key))
-	normalized := strings.NewReplacer("-", "_", ".", "_", " ", "_").Replace(key)
-	compact := strings.NewReplacer("_", "", "-", "", ".", "", " ", "").Replace(key)
-	for _, fragment := range []string{
+// Attribute keys are screened once per candidate on every scheduler pick, so the
+// normalizers and the fragment list are package-level values instead of being
+// rebuilt for every key. strings.Replacer is safe for concurrent use.
+var (
+	schedulerAttributeNormalizer         = strings.NewReplacer("-", "_", ".", "_", " ", "_")
+	schedulerAttributeCompactor          = strings.NewReplacer("_", "", "-", "", ".", "", " ", "")
+	schedulerSensitiveAttributeFragments = []string{
 		"api_key",
 		"apikey",
 		"token",
@@ -996,7 +998,14 @@ func schedulerAttributeSensitive(key string) bool {
 		"authorization",
 		"auth_header",
 		"proxy_url",
-	} {
+	}
+)
+
+func schedulerAttributeSensitive(key string) bool {
+	key = strings.ToLower(strings.TrimSpace(key))
+	normalized := schedulerAttributeNormalizer.Replace(key)
+	compact := schedulerAttributeCompactor.Replace(key)
+	for _, fragment := range schedulerSensitiveAttributeFragments {
 		if strings.Contains(key, fragment) || strings.Contains(normalized, fragment) || strings.Contains(compact, fragment) {
 			return true
 		}

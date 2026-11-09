@@ -2102,6 +2102,14 @@ func containsStructuredModelNotFound(value any, requestedModel string) bool {
 	return false
 }
 
+// Error identifiers are normalized on every failed upstream response, so these
+// replacers are package-level values rather than rebuilt per call.
+// strings.Replacer is safe for concurrent use.
+var (
+	notFoundIdentifierNormalizer = strings.NewReplacer("-", "_", " ", "_")
+	errorMessageNormalizer       = strings.NewReplacer("-", "_")
+)
+
 func isModelNotFoundIdentifier(value string) bool {
 	candidate := strings.ToLower(strings.TrimSpace(value))
 	if fragment := strings.LastIndex(candidate, "#"); fragment >= 0 && fragment+1 < len(candidate) {
@@ -2115,7 +2123,7 @@ func isModelNotFoundIdentifier(value string) bool {
 			candidate = candidate[separator+1:]
 		}
 	}
-	normalized := strings.NewReplacer("-", "_", " ", "_").Replace(candidate)
+	normalized := notFoundIdentifierNormalizer.Replace(candidate)
 	switch normalized {
 	case "model_not_found", "model_not_found_error", "unknown_model", "model_does_not_exist", "model_not_exist":
 		return true
@@ -2125,7 +2133,7 @@ func isModelNotFoundIdentifier(value string) bool {
 }
 
 func isNotFoundErrorIdentifier(value string) bool {
-	normalized := strings.NewReplacer("-", "_", " ", "_").Replace(strings.ToLower(strings.TrimSpace(value)))
+	normalized := notFoundIdentifierNormalizer.Replace(strings.ToLower(strings.TrimSpace(value)))
 	return normalized == "not_found" || normalized == "not_found_error"
 }
 
@@ -2137,7 +2145,7 @@ func isExplicitModelNotFoundMessage(message, requestedModel string) bool {
 	if strings.Contains(lower, "in request") || strings.Contains(lower, "in body") || strings.Contains(lower, "request body") {
 		return false
 	}
-	normalized := strings.NewReplacer("-", "_").Replace(lower)
+	normalized := errorMessageNormalizer.Replace(lower)
 	if strings.Contains(normalized, "model_not_found") || strings.Contains(normalized, "unknown_model") {
 		return true
 	}
