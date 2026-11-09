@@ -51,6 +51,13 @@ type authScheduler struct {
 	authGenerations     map[string]scheduledGenerationMeta
 	mixedCursors        map[string]int
 	mixedWeightedStates map[string]*smoothWeightedState
+
+	// loadOf reports how many requests a credential is serving right now. It is the
+	// scheduler's only view of live load, so a pick inside one priority tier can
+	// prefer the least loaded credentials. A nil loadOf disables the preference and
+	// keeps the strategy's original ordering, which is what scheduler-only state
+	// built without a Manager uses.
+	loadOf func(*Auth) int
 }
 
 // providerScheduler stores auth metadata and model shards for a single provider.
@@ -435,7 +442,7 @@ func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, mo
 		requirePositiveWeight: strategy == schedulerStrategyWeightedRoundRobin,
 	}
 	predicate := filter.match
-	if picked := shard.pickReadyLocked(preferWebsocket, strategy, predicate); picked != nil {
+	if picked := shard.pickReadyLocked(preferWebsocket, strategy, predicate, s.loadOf); picked != nil {
 		return picked, nil
 	}
 	return nil, shard.unavailableErrorWithScopeLocked(provider, model, predicate, filter.eligibility)
@@ -496,7 +503,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		}
 		shard := providerState.ensureModelLocked(modelKey, time.Now())
 		predicate := scheduledAuthPredicate(eligibility, tried, pinnedAuthID, strategy == schedulerStrategyWeightedRoundRobin)
-		if picked := shard.pickReadyLocked(false, strategy, predicate); picked != nil {
+		if picked := shard.pickReadyLocked(false, strategy, predicate, s.loadOf); picked != nil {
 			return picked, providerKey, nil
 		}
 		return nil, "", shard.unavailableErrorWithScopeLocked("mixed", model, predicate, eligibility)
@@ -536,7 +543,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 			if shard == nil {
 				continue
 			}
-			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, strategy, predicate)
+			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, strategy, predicate, s.loadOf)
 			if picked != nil {
 				return picked, providerKey, nil
 			}
@@ -626,7 +633,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		if shard == nil {
 			continue
 		}
-		picked := shard.pickReadyAtPriorityLocked(false, bestPriority, schedulerStrategyRoundRobin, predicate)
+		picked := shard.pickReadyAtPriorityLocked(false, bestPriority, schedulerStrategyRoundRobin, predicate, s.loadOf)
 		if picked == nil {
 			continue
 		}
@@ -1463,7 +1470,8 @@ func (m *modelScheduler) promoteExpiredLocked(now time.Time) {
 }
 
 // pickReadyLocked selects the next ready auth from the highest available priority bucket.
-func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedulerStrategy, predicate func(*scheduledAuth) bool) *Auth {
+// loadOf, when set, lets the pick inside that bucket prefer the least loaded credentials.
+func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedulerStrategy, predicate func(*scheduledAuth) bool, loadOf func(*Auth) int) *Auth {
 	if m == nil {
 		return nil
 	}
@@ -1472,7 +1480,7 @@ func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedule
 	if !okPriority {
 		return nil
 	}
-	return m.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategy, predicate)
+	return m.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategy, predicate, loadOf)
 }
 
 // highestReadyPriorityLocked returns the highest priority bucket that still has a matching ready auth.
@@ -1508,7 +1516,9 @@ func (m *modelScheduler) highestReadyPriorityLocked(preferWebsocket bool, predic
 
 // pickReadyAtPriorityLocked selects the next ready auth from a specific priority bucket.
 // The caller must ensure expired entries are already promoted when needed.
-func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priority int, strategy schedulerStrategy, predicate func(*scheduledAuth) bool) *Auth {
+// loadOf, when set, narrows the pick to the least loaded credentials inside this one
+// bucket: it never changes which bucket was chosen, so priority stays intact.
+func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priority int, strategy schedulerStrategy, predicate func(*scheduledAuth) bool, loadOf func(*Auth) int) *Auth {
 	if m == nil {
 		return nil
 	}
@@ -1519,6 +1529,9 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 	view := &bucket.all
 	if preferWebsocket && bucket.ws.pickFirst(predicate) != nil {
 		view = &bucket.ws
+	}
+	if picked := view.pickLeastLoaded(strategy, predicate, loadOf); picked != nil {
+		return picked.auth
 	}
 	var picked *scheduledAuth
 	switch strategy {
@@ -1846,6 +1859,75 @@ func (v *readyView) pickRoundRobin(predicate func(*scheduledAuth) bool) *schedul
 	for offset := 0; offset < len(v.flat); offset++ {
 		index := (start + offset) % len(v.flat)
 		entry := v.flat[index]
+		if entry == nil || entry.auth == nil {
+			continue
+		}
+		if predicate != nil && !predicate(entry) {
+			continue
+		}
+		v.lastPicked = entry.auth.ID
+		return entry
+	}
+	return nil
+}
+
+// pickLeastLoaded narrows the ready view to the credentials tied for the fewest
+// live in-flight requests and selects among them, advancing the rotation cursor
+// so tied credentials keep alternating instead of collapsing onto one ID. It
+// returns nil when there is nothing to narrow: a non-round-robin strategy, fewer
+// than two matching candidates, no load source, or every candidate tied. The
+// caller then keeps the strategy's existing order, so fill-first and weighted
+// round-robin keep their own contracts and a pool with even load behaves exactly
+// as before.
+//
+// The narrowed slice is a subsequence of v.flat, so it stays sorted by auth ID and
+// the round-robin cursor below keeps working. v.flat itself is never mutated.
+func (v *readyView) pickLeastLoaded(strategy schedulerStrategy, predicate func(*scheduledAuth) bool, loadOf func(*Auth) int) *scheduledAuth {
+	if v == nil || loadOf == nil || strategy != schedulerStrategyRoundRobin || len(v.flat) <= 1 {
+		return nil
+	}
+	lowest := -1
+	tied := true
+	matching := 0
+	for _, entry := range v.flat {
+		if entry == nil || entry.auth == nil {
+			continue
+		}
+		if predicate != nil && !predicate(entry) {
+			continue
+		}
+		matching++
+		load := loadOf(entry.auth)
+		if lowest < 0 {
+			lowest = load
+			continue
+		}
+		if load != lowest {
+			tied = false
+			lowest = min(lowest, load)
+		}
+	}
+	if matching < 2 || tied {
+		return nil
+	}
+	least := make([]*scheduledAuth, 0, matching)
+	for _, entry := range v.flat {
+		if entry == nil || entry.auth == nil {
+			continue
+		}
+		if predicate != nil && !predicate(entry) {
+			continue
+		}
+		if loadOf(entry.auth) == lowest {
+			least = append(least, entry)
+		}
+	}
+	if len(least) == 0 {
+		return nil
+	}
+	start := scheduledSuccessorIndex(least, v.lastPicked)
+	for offset := 0; offset < len(least); offset++ {
+		entry := least[(start+offset)%len(least)]
 		if entry == nil || entry.auth == nil {
 			continue
 		}

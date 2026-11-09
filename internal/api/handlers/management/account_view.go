@@ -25,6 +25,7 @@ import (
 //	auth metadata -> policy
 //	quota cache   -> quota_state, quota_stale, fetched_at, plan_id, channel, quota
 //	auth health   -> request counts and the heatmap
+//	admission gate -> in_flight and in_flight_by_model (live load, never probed)
 //
 // Two rules are not negotiable. A value that cannot be determined is omitted or
 // null, never reported as zero or false. And a read never probes upstream: quota
@@ -86,6 +87,15 @@ type accountView struct {
 	SuccessCount int64               `json:"success_count"`
 	FailureCount int64               `json:"failure_count"`
 	Heatmap      []accountHeatBucket `json:"heatmap"`
+
+	// InFlight is how many requests this credential is serving right now, summed
+	// across every model, and InFlightByModel breaks that down per model with
+	// each model's cap. The numbers come from the live admission gate — the same
+	// counter selection consults — so the panel reads the real load instead of
+	// inferring it. A credential the gate does not account for (Home mode, or an
+	// unknown credential) reports zero and an empty list.
+	InFlight        int                    `json:"in_flight"`
+	InFlightByModel []accountInFlightModel `json:"in_flight_by_model"`
 }
 
 // accountQuotaBucket is one quota window of one account. Model is the model the
@@ -121,6 +131,16 @@ type accountHeatBucket struct {
 	SuccessRate *float64 `json:"success_rate"`
 }
 
+// accountInFlightModel is one model's live in-flight count on an account and the
+// cap those requests are counted against. Model is the normalized model key the
+// admission gate counts under, so two spellings of the same model do not appear
+// as two rows.
+type accountInFlightModel struct {
+	Model    string `json:"model"`
+	InFlight int    `json:"in_flight"`
+	Limit    int    `json:"limit"`
+}
+
 // ListAccounts reports every credential as one account view.
 //
 // Optional filters: ?provider=<provider key> and ?kind=phone|email.
@@ -152,7 +172,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		if filterKind.Valid() && (!hasPoolRecord || poolRecord.Kind != filterKind) {
 			continue
 		}
-		accounts = append(accounts, buildAccountView(auth, poolRecord, hasPoolRecord, host, now))
+		accounts = append(accounts, buildAccountView(auth, poolRecord, hasPoolRecord, host, h.authManager, now))
 	}
 	sort.SliceStable(accounts, func(i, j int) bool {
 		if accounts[i].Provider != accounts[j].Provider {
@@ -179,7 +199,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 }
 
 // buildAccountView merges the layers for one credential.
-func buildAccountView(auth *coreauth.Auth, poolRecord supply.Record, hasPoolRecord bool, host *pluginhost.Host, now time.Time) accountView {
+func buildAccountView(auth *coreauth.Auth, poolRecord supply.Record, hasPoolRecord bool, host *pluginhost.Host, manager *coreauth.Manager, now time.Time) accountView {
 	unavailable, authState, statusMessage, nextRetry := reconcileAuthFileCooldownState(auth, now)
 
 	view := accountView{
@@ -200,6 +220,10 @@ func buildAccountView(auth *coreauth.Auth, poolRecord supply.Record, hasPoolReco
 		// the operator's enable switch sets the credential's disabled flag, and a
 		// policy only decides which channels the credential may route through.
 		ManuallyDisabled: auth.Disabled,
+		// InFlightByModel is always an array, never null: the panel renders it as
+		// a list, and an absent list would read as "unknown" instead of "nothing
+		// in flight".
+		InFlightByModel: []accountInFlightModel{},
 	}
 	if view.AuthState == "" {
 		view.AuthState = string(coreauth.StatusUnknown)
@@ -239,6 +263,20 @@ func buildAccountView(auth *coreauth.Auth, poolRecord supply.Record, hasPoolReco
 
 	applyCachedQuota(&view, host)
 	view.Heatmap = accountHeatmap(auth, now)
+
+	// The live load is the one thing here that is not stored on the credential:
+	// it is read from the admission gate, which counts under the same credential
+	// identity (source path or id) this view was built from. A read costs nothing
+	// and never touches the provider.
+	inFlight := manager.CredentialInFlight(auth)
+	view.InFlight = inFlight.InFlight
+	for _, model := range inFlight.ByModel {
+		view.InFlightByModel = append(view.InFlightByModel, accountInFlightModel{
+			Model:    model.Model,
+			InFlight: model.InFlight,
+			Limit:    model.Limit,
+		})
+	}
 	return view
 }
 

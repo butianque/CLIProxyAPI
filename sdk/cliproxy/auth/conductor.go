@@ -256,6 +256,14 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		manager.ApplyHomeInFlightPublisherConfig(defaultInFlightConfig)
 	}
 	manager.scheduler = newAuthScheduler(selector)
+	// The scheduler picks inside one priority tier, and this is its only view of
+	// live load: without it a tier of equally valid credentials is chosen purely by
+	// rotation, so a burst can land on a credential already serving several
+	// requests. The closure reads the admission gate, which is the same counter
+	// selection consults, so the preference never disagrees with the cap.
+	manager.scheduler.loadOf = func(auth *Auth) int {
+		return manager.CredentialInFlightTotal(auth)
+	}
 	return manager
 }
 

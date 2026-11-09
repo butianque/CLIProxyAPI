@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -384,11 +385,53 @@ func (g *credentialConcurrencyGate) usage(key string) int {
 	return g.inFlight[key]
 }
 
+// usageByCredential copies the in-flight counts that belong to one credential:
+// the credential-level key (a request with no model name) and every per-model
+// scope under it. The gate is never mutated, so the panel can read it while
+// requests are running.
+//
+// The "|" separator keeps the scan honest: a credential whose key is a prefix of
+// another's cannot match the longer one's scopes, because the byte after the
+// prefix is "|" and never a path or id continuation.
+func (g *credentialConcurrencyGate) usageByCredential(credentialKey string) map[string]int {
+	if credentialKey == "" {
+		return nil
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	prefix := credentialKey + "|"
+	out := make(map[string]int)
+	for key, count := range g.inFlight {
+		if key == credentialKey || strings.HasPrefix(key, prefix) {
+			out[key] = count
+		}
+	}
+	return out
+}
+
 // CredentialConcurrencyUsage is a read-only view of one credential's admission
 // state, for the panel to show "in flight / cap" without guessing.
 type CredentialConcurrencyUsage struct {
 	InFlight int
 	Limit    int
+}
+
+// CredentialModelConcurrencyUsage is one model's live admission state on a
+// credential: how many requests it is serving and the cap they are counted
+// against. Model is the normalized model key the gate counts under.
+type CredentialModelConcurrencyUsage struct {
+	Model    string
+	InFlight int
+	Limit    int
+}
+
+// CredentialConcurrencyInFlight is a read-only, cross-model view of one
+// credential's admission state. InFlight is the total the credential is serving
+// right now, and ByModel breaks it down per model. ByModel is never nil, so a
+// caller can render an empty list without a nil check.
+type CredentialConcurrencyInFlight struct {
+	InFlight int
+	ByModel  []CredentialModelConcurrencyUsage
 }
 
 // credentialCapLedger tracks the slot one request holds.
@@ -726,4 +769,82 @@ func (m *Manager) CredentialConcurrencySnapshot(auths []*Auth, routeModel string
 		}
 	}
 	return out
+}
+
+// CredentialInFlight reports one credential's live in-flight counts: the total
+// across every model plus a per-model breakdown, each with that model's cap. It
+// is read-only and never blocks admission.
+//
+// The credential is identified exactly as the gate identifies it
+// (credentialConcurrencyKey), so an Auth clone from List maps to the counters the
+// gate incremented for the live record. Home owns its own dispatch and
+// concurrency accounting, so it reports zero here instead of a second,
+// disagreeing number.
+//
+// A request with no model name is counted at the credential level and only adds
+// to InFlight: it has no model to appear under, and inventing a model row for it
+// would report a name the caller never asked for.
+func (m *Manager) CredentialInFlight(auth *Auth) CredentialConcurrencyInFlight {
+	out := CredentialConcurrencyInFlight{ByModel: []CredentialModelConcurrencyUsage{}}
+	if m == nil || m.HomeEnabled() || auth == nil {
+		return out
+	}
+	credentialKey := credentialConcurrencyKey(auth)
+	if credentialKey == "" {
+		return out
+	}
+	scopes := m.credentialCap.usageByCredential(credentialKey)
+	if len(scopes) == 0 {
+		return out
+	}
+	limits := credentialModelConcurrencyLimits(auth)
+	scalarLimit := credentialConcurrencyLimit(auth)
+	prefix := credentialKey + "|"
+	for scope, count := range scopes {
+		out.InFlight += count
+		if scope == credentialKey {
+			continue
+		}
+		modelKey := strings.TrimPrefix(scope, prefix)
+		limit := scalarLimit
+		if modelLimit, okLimit := limits[modelKey]; okLimit {
+			limit = modelLimit
+		}
+		out.ByModel = append(out.ByModel, CredentialModelConcurrencyUsage{
+			Model:    modelKey,
+			InFlight: count,
+			Limit:    limit,
+		})
+	}
+	sort.Slice(out.ByModel, func(i, j int) bool { return out.ByModel[i].Model < out.ByModel[j].Model })
+	return out
+}
+
+// CredentialInFlightTotal reports how many requests one credential is serving
+// right now, summed across every model. It is the allocation-free companion to
+// CredentialInFlight: a caller that only needs the total does not pay for a map
+// or a per-model slice, so it can be read on a hot path without adding pressure.
+//
+// The credential is identified exactly as the gate identifies it
+// (credentialConcurrencyKey), and Home owns its own dispatch and concurrency
+// accounting, so it reports zero here — the same rule CredentialInFlight follows.
+func (m *Manager) CredentialInFlightTotal(auth *Auth) int {
+	if m == nil || m.HomeEnabled() || auth == nil {
+		return 0
+	}
+	credentialKey := credentialConcurrencyKey(auth)
+	if credentialKey == "" {
+		return 0
+	}
+	gate := &m.credentialCap
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	prefix := credentialKey + "|"
+	total := 0
+	for key, count := range gate.inFlight {
+		if key == credentialKey || strings.HasPrefix(key, prefix) {
+			total += count
+		}
+	}
+	return total
 }

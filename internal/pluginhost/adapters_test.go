@@ -3490,6 +3490,56 @@ func setHostSnapshotForTest(host *Host, enabled bool, records ...capabilityRecor
 	host.mu.Unlock()
 }
 
+// The host publishes its live per-credential in-flight count to the plugin so the
+// plugin can align its admission with the gate that decided the request; the value is
+// the same counter selection reserves against.
+func TestBuildExecutorRequestPublishesCredentialInFlight(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth := &coreauth.Auth{ID: "loomy-inflight-1", Provider: "loomy", Status: coreauth.StatusActive, FileName: "loomy-inflight-1.json"}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register: %v", errRegister)
+	}
+
+	host := New()
+	host.SetAuthManager(manager)
+
+	built := buildExecutorRequest(host, "loomy", auth, coreexecutor.Request{Model: "loomy-model"}, coreexecutor.Options{})
+	value, ok := built.Metadata[pluginapi.ExecutorRequestCredentialInFlightMetadataKey]
+	if !ok {
+		t.Fatalf("metadata %#v is missing %q", built.Metadata, pluginapi.ExecutorRequestCredentialInFlightMetadataKey)
+	}
+	if value != 0 {
+		t.Fatalf("in flight = %#v, want 0 for an idle credential", value)
+	}
+}
+
+// A host with no gate must omit the key so a plugin keeps its local fallback instead
+// of reading a false "idle".
+func TestBuildExecutorRequestOmitsCredentialInFlightWithoutGate(t *testing.T) {
+	auth := &coreauth.Auth{ID: "loomy-inflight-2", Provider: "loomy", Status: coreauth.StatusActive, FileName: "loomy-inflight-2.json"}
+
+	built := buildExecutorRequest(New(), "loomy", auth, coreexecutor.Request{Model: "loomy-model"}, coreexecutor.Options{})
+	if _, ok := built.Metadata[pluginapi.ExecutorRequestCredentialInFlightMetadataKey]; ok {
+		t.Fatalf("metadata %#v must omit the key when the host has no gate", built.Metadata)
+	}
+}
+
+// Home mode keeps the key out of the request: the local gate is inactive there, so a
+// published zero would read as a false "idle" rather than a measurement.
+func TestBuildExecutorRequestOmitsCredentialInFlightInHomeMode(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.SetConfig(&config.Config{Home: config.HomeConfig{Enabled: true}})
+	auth := &coreauth.Auth{ID: "loomy-inflight-3", Provider: "loomy", Status: coreauth.StatusActive, FileName: "loomy-inflight-3.json"}
+
+	host := New()
+	host.SetAuthManager(manager)
+
+	built := buildExecutorRequest(host, "loomy", auth, coreexecutor.Request{Model: "loomy-model"}, coreexecutor.Options{})
+	if _, ok := built.Metadata[pluginapi.ExecutorRequestCredentialInFlightMetadataKey]; ok {
+		t.Fatalf("metadata %#v must omit the key while Home is enabled", built.Metadata)
+	}
+}
+
 func newAccessAdapterForTest(host *Host, pluginID string, provider pluginapi.FrontendAuthProvider) *accessAdapter {
 	record := normalizeTestCapabilityRecord(capabilityRecord{id: pluginID})
 	setHostSnapshotForTest(host, true, record)

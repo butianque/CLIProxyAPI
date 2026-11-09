@@ -2373,6 +2373,45 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 	return authCopy, executor, nil
 }
 
+// preferLeastLoaded narrows auths to the credentials tied for the fewest live
+// in-flight requests, preserving input order so a rotation cursor that expects
+// ID order still works. It returns the input unchanged when every candidate is
+// tied or there is nothing to choose between.
+func (m *Manager) preferLeastLoaded(auths []*Auth) []*Auth {
+	if m == nil || len(auths) <= 1 {
+		return auths
+	}
+	lowest := -1
+	tied := true
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		load := m.CredentialInFlightTotal(auth)
+		if lowest < 0 {
+			lowest = load
+			continue
+		}
+		if load != lowest {
+			tied = false
+			lowest = min(lowest, load)
+		}
+	}
+	if tied || lowest < 0 {
+		return auths
+	}
+	preferred := make([]*Auth, 0, len(auths))
+	for _, auth := range auths {
+		if auth != nil && m.CredentialInFlightTotal(auth) == lowest {
+			preferred = append(preferred, auth)
+		}
+	}
+	if len(preferred) == 0 {
+		return auths
+	}
+	return preferred
+}
+
 func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
 	if m.HomeEnabled() {
 		return m.pickNextViaHome(ctx, model, opts, tried)
@@ -2479,6 +2518,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		m.warnLogAuthUnavailable(ctx, providers, model, opts, tried, errAvailable)
 		return nil, nil, "", errAvailable
 	}
+	schedulerAcrossPriorities := m.pluginSchedulerWantsAcrossPrioritiesLocked()
 	m.mu.RUnlock()
 
 	// A credential at its concurrency cap is healthy, only busy, so it is removed
@@ -2489,6 +2529,22 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	if errAdmit != nil {
 		m.warnLogAuthUnavailable(ctx, providers, model, opts, tried, errAdmit)
 		return nil, nil, "", errAdmit
+	}
+
+	// Inside the highest priority tier, prefer the credentials carrying the fewest
+	// in-flight requests so a burst spreads across an idle pool instead of piling
+	// onto one credential. This is a round-robin refinement only: fill-first
+	// deliberately fills one credential before moving on, and weighted round-robin
+	// obeys operator weights, so narrowing either would break its contract. The
+	// slice order is preserved because the selector's round-robin cursor assumes
+	// candidates arrive sorted by ID. Across-priorities scheduling is excluded
+	// because narrowing it could change which tier can be chosen. Only selectorAuths
+	// is touched; available feeds admission and the plugin scheduler, which own
+	// their own semantics.
+	if _, roundRobin := selector.(*RoundRobinSelector); roundRobin && !schedulerAcrossPriorities {
+		if preferred := m.preferLeastLoaded(selectorAuths); len(preferred) > 0 {
+			selectorAuths = preferred
+		}
 	}
 
 	// The reservation retry loop re-selects, so all three results are declared

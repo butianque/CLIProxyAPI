@@ -609,3 +609,45 @@ func TestPatchAuthFileFieldsAccountPolicy(t *testing.T) {
 		t.Fatalf("disabling a credential must not touch its routing policy, got %#v", account["policy"])
 	}
 }
+
+// TestListAccountsReportsInFlightWireFormat pins the shape the panel parses for
+// live load. An idle credential reports zero, and in_flight_by_model is an empty
+// array — never null — because the panel renders it as a list and an absent list
+// would read as "unknown" rather than "nothing in flight".
+func TestListAccountsReportsInFlightWireFormat(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "zcode-1",
+		FileName: "zcode-1.json",
+		Provider: "zcode",
+		Status:   coreauth.StatusActive,
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	h.tokenStore = &memoryAuthStore{}
+
+	account := accountList(t, listAccounts(t, h, "/v8/management/accounts"))[0]
+
+	if got := account["in_flight"]; got != float64(0) {
+		t.Fatalf("in_flight = %#v, want 0 for an idle credential", got)
+	}
+	byModel, present := account["in_flight_by_model"]
+	if !present {
+		t.Fatalf("in_flight_by_model must be present, got %#v", account)
+	}
+	if byModel == nil {
+		t.Fatalf("in_flight_by_model must be an empty array, not null")
+	}
+	rows, ok := byModel.([]any)
+	if !ok {
+		t.Fatalf("in_flight_by_model = %#v, want an array", byModel)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("in_flight_by_model = %#v, want no rows for an idle credential", rows)
+	}
+}

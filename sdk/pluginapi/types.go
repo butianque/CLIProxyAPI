@@ -1289,6 +1289,13 @@ type ExecutorHTTPResponse struct {
 	Body []byte
 }
 
+// ExecutorRequestCredentialInFlightMetadataKey is the ExecutorRequest.Metadata key
+// under which the host publishes the selected credential's live in-flight request
+// count. It is the count selection itself reserves against, so it includes the
+// request being dispatched. A host that predates the field omits the key, and a
+// plugin must treat absence as "unknown" rather than zero.
+const ExecutorRequestCredentialInFlightMetadataKey = "credential_in_flight"
+
 // ExecutorRequest describes a model execution or token counting call.
 type ExecutorRequest struct {
 	// AuthID identifies the selected credential.

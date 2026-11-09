@@ -1067,6 +1067,18 @@ func (a *executorAdapter) HttpRequest(ctx context.Context, auth *coreauth.Auth, 
 }
 
 func buildExecutorRequest(host *Host, provider string, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) pluginapi.ExecutorRequest {
+	metadata := mergeExecutorMetadata(req.Metadata, opts.Metadata)
+	// Publish the host's live per-credential in-flight count so a plugin can align
+	// its own admission with the gate that actually decided this request. The count
+	// comes from the same counter selection reserves against, so it includes this
+	// request. Home mode is skipped on purpose: the gate is inactive there, and a
+	// zero would read as an authoritative "idle" instead of "not measured".
+	if manager := host.currentAuthManager(); manager != nil && auth != nil && !manager.HomeEnabled() {
+		if metadata == nil {
+			metadata = make(map[string]any, 1)
+		}
+		metadata[pluginapi.ExecutorRequestCredentialInFlightMetadataKey] = manager.CredentialInFlightTotal(auth)
+	}
 	return pluginapi.ExecutorRequest{
 		AuthID:          authID(auth),
 		AuthProvider:    authProvider(auth),
@@ -1079,7 +1091,7 @@ func buildExecutorRequest(host *Host, provider string, auth *coreauth.Auth, req 
 		OriginalRequest: bytes.Clone(opts.OriginalRequest),
 		SourceFormat:    opts.SourceFormat.String(),
 		Payload:         bytes.Clone(req.Payload),
-		Metadata:        mergeExecutorMetadata(req.Metadata, opts.Metadata),
+		Metadata:        metadata,
 		StorageJSON:     storageJSONFromAuth(auth),
 		AuthMetadata:    cloneAnyMap(authMetadata(auth)),
 		AuthAttributes:  authAttributes(auth),

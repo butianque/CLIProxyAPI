@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
@@ -590,4 +592,195 @@ func TestCredentialCapPressureIsPerModel(t *testing.T) {
 		t.Fatal("pressure must not report an unrelated model as saturated")
 	}
 	ledger.release()
+}
+
+// CredentialInFlight is the panel's read of live load: the cross-model total and
+// a per-model breakdown, each model carrying the cap it was counted against. The
+// numbers must match what admission actually reserved, or the panel would show a
+// load nobody is serving.
+func TestCredentialInFlightReportsLiveLoadPerModel(t *testing.T) {
+	manager, _ := newCapTestManager(t, "zcode-inflight", map[string]any{"zcode-inflight-a": nil})
+	auth := manager.List()[0]
+	auth.Metadata[AttributeModelMaxConcurrency] = []any{
+		map[string]any{"model": "glm-5.3", "max_concurrency": 5},
+		map[string]any{"model": "glm-5.3-flash", "max_concurrency": 3},
+	}
+
+	hold := func(model string) *credentialCapLedger {
+		t.Helper()
+		ledger := manager.newCredentialCapLedger()
+		ctx := withCredentialCapLedger(context.Background(), ledger)
+		if !manager.holdCredentialSlot(ctx, auth, model) {
+			t.Fatalf("hold %s: admission refused below its cap", model)
+		}
+		return ledger
+	}
+
+	firstX, secondX, onlyY := hold("glm-5.3"), hold("glm-5.3"), hold("glm-5.3-flash")
+
+	inFlight := manager.CredentialInFlight(auth)
+	if inFlight.InFlight != 3 {
+		t.Fatalf("total in flight = %d, want 3", inFlight.InFlight)
+	}
+	if total := manager.CredentialInFlightTotal(auth); total != 3 {
+		t.Fatalf("CredentialInFlightTotal = %d, want 3", total)
+	}
+
+	byModel := make(map[string]CredentialModelConcurrencyUsage, len(inFlight.ByModel))
+	for _, entry := range inFlight.ByModel {
+		byModel[entry.Model] = entry
+	}
+	if len(byModel) != 2 {
+		t.Fatalf("by-model rows = %d (%#v), want 2", len(byModel), inFlight.ByModel)
+	}
+	if got := byModel["glm-5.3"]; got.InFlight != 2 || got.Limit != 5 {
+		t.Fatalf("glm-5.3 = %+v, want in-flight 2 of limit 5", got)
+	}
+	if got := byModel["glm-5.3-flash"]; got.InFlight != 1 || got.Limit != 3 {
+		t.Fatalf("glm-5.3-flash = %+v, want in-flight 1 of limit 3", got)
+	}
+
+	secondX.release()
+	if total := manager.CredentialInFlightTotal(auth); total != 2 {
+		t.Fatalf("after releasing one glm-5.3 slot total = %d, want 2", total)
+	}
+	firstX.release()
+	onlyY.release()
+	if total := manager.CredentialInFlightTotal(auth); total != 0 {
+		t.Fatalf("after releasing every slot total = %d, want 0", total)
+	}
+}
+
+// A credential the gate does not account for reports zero and a non-nil empty
+// list rather than a number the panel would mistake for real load.
+func TestCredentialInFlightReportsEmptyForUnknownCredential(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	unknown := &Auth{ID: "never-registered", Provider: "zcode"}
+
+	inFlight := manager.CredentialInFlight(unknown)
+	if inFlight.InFlight != 0 || inFlight.ByModel == nil || len(inFlight.ByModel) != 0 {
+		t.Fatalf("unknown credential view = %#v, want zero and a non-nil empty slice", inFlight)
+	}
+	if total := manager.CredentialInFlightTotal(unknown); total != 0 {
+		t.Fatalf("unknown credential total = %d, want 0", total)
+	}
+
+	nilView := manager.CredentialInFlight(nil)
+	if nilView.InFlight != 0 || nilView.ByModel == nil || len(nilView.ByModel) != 0 {
+		t.Fatalf("nil credential view = %#v, want zero and a non-nil empty slice", nilView)
+	}
+	if total := manager.CredentialInFlightTotal(nil); total != 0 {
+		t.Fatalf("nil credential total = %d, want 0", total)
+	}
+
+	var nilManager *Manager
+	if total := nilManager.CredentialInFlightTotal(unknown); total != 0 {
+		t.Fatalf("nil manager total = %d, want 0", total)
+	}
+}
+
+// Home owns its own dispatch and concurrency accounting, so the gate reports
+// zero even while its own counters hold a slot: a second, disagreeing number
+// would be worse than none.
+func TestCredentialInFlightReportsZeroUnderHome(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	auth := &Auth{
+		ID:         "zcode-home-a",
+		Provider:   "zcode",
+		Attributes: map[string]string{AttributePath: "/auths/zcode-home-a.json"},
+	}
+	if !manager.credentialCap.tryAcquire(credentialConcurrencyKey(auth), 5) {
+		t.Fatal("priming the gate failed")
+	}
+	if total := manager.CredentialInFlightTotal(auth); total != 1 {
+		t.Fatalf("local in flight = %d, want 1", total)
+	}
+
+	manager.SetConfig(&config.Config{Home: config.HomeConfig{Enabled: true}})
+	if total := manager.CredentialInFlightTotal(auth); total != 0 {
+		t.Fatalf("home total = %d, want 0", total)
+	}
+	view := manager.CredentialInFlight(auth)
+	if view.InFlight != 0 || view.ByModel == nil || len(view.ByModel) != 0 {
+		t.Fatalf("home view = %#v, want zero and a non-nil empty slice", view)
+	}
+}
+
+// Load-aware selection is a round-robin refinement: inside one priority tier the
+// credential serving the fewest requests is tried first, while a lower tier is
+// never promoted by lower load and equally loaded credentials still rotate.
+func TestCredentialSelectionPrefersLeastLoadedInRoundRobin(t *testing.T) {
+	const provider = "loomy"
+	const model = "loomy-model"
+
+	setup := func(t *testing.T, priorities map[string]int) (*Manager, map[string]*Auth) {
+		t.Helper()
+		manager := NewManager(nil, nil, nil)
+		manager.RegisterExecutor(&capTestExecutor{identifier: provider, gate: make(chan struct{}), started: make(chan string, 8)})
+		reg := registry.GetGlobalRegistry()
+		auths := make(map[string]*Auth, len(priorities))
+		for id, priority := range priorities {
+			reg.RegisterClient(id, provider, []*registry.ModelInfo{{ID: model}})
+			t.Cleanup(func() { reg.UnregisterClient(id) })
+			auth := &Auth{
+				ID:         id,
+				Provider:   provider,
+				Status:     StatusActive,
+				Metadata:   map[string]any{"disable_cooling": true},
+				Attributes: map[string]string{AttributePath: "/auths/" + id + ".json", "priority": strconv.Itoa(priority)},
+			}
+			if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+				t.Fatalf("register %s: %v", id, errRegister)
+			}
+			auths[id] = auth
+		}
+		return manager, auths
+	}
+
+	hold := func(t *testing.T, manager *Manager, auth *Auth, count int) {
+		t.Helper()
+		for range count {
+			ctx := withCredentialCapLedger(context.Background(), manager.newCredentialCapLedger())
+			if !manager.holdCredentialSlot(ctx, auth, model) {
+				t.Fatalf("hold %s: admission refused below its cap", auth.ID)
+			}
+		}
+	}
+
+	pick := func(t *testing.T, manager *Manager) string {
+		t.Helper()
+		selected, _, _, errPick := manager.pickNextMixed(context.Background(), []string{provider}, model, cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickNextMixed: %v", errPick)
+		}
+		if selected == nil {
+			t.Fatal("pickNextMixed returned no credential")
+		}
+		return selected.ID
+	}
+
+	t.Run("an idle credential is chosen over a loaded peer", func(t *testing.T) {
+		manager, auths := setup(t, map[string]int{"a": 0, "b": 0})
+		hold(t, manager, auths["a"], 2)
+		if got := pick(t, manager); got != "b" {
+			t.Fatalf("selected %q, want the idle peer b", got)
+		}
+	})
+
+	t.Run("a lower priority tier is not promoted by lower load", func(t *testing.T) {
+		manager, auths := setup(t, map[string]int{"a": 10, "b": 0})
+		hold(t, manager, auths["a"], 3)
+		if got := pick(t, manager); got != "a" {
+			t.Fatalf("selected %q, want the higher priority tier credential a", got)
+		}
+	})
+
+	t.Run("equally loaded credentials still rotate", func(t *testing.T) {
+		manager, _ := setup(t, map[string]int{"a": 0, "b": 0})
+		first := pick(t, manager)
+		second := pick(t, manager)
+		if first == second {
+			t.Fatalf("two picks both returned %q, want rotation across equally loaded credentials", first)
+		}
+	})
 }
