@@ -219,6 +219,75 @@ func TestCredentialConcurrencyKeyUsesTheSourceFile(t *testing.T) {
 
 // A full credential must not fail the request: the same pick has to spill to the
 // credential that still has room, with no error, no result record and no cooldown.
+// TestCredentialInFlightTotalSumsEveryModelScope pins the cached credential
+// total: the gate keeps it as it takes and releases slots, and a credential's
+// total has to cover its model scopes, not just its own key.
+func TestCredentialInFlightTotalSumsEveryModelScope(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	auth := &Auth{ID: "cred-total"}
+	gate := &manager.credentialCap
+
+	for _, key := range []string{"id:cred-total", "id:cred-total|glm-5.3", "id:cred-total|glm-5.3-flash"} {
+		if !gate.tryAcquire(key, 5) {
+			t.Fatalf("tryAcquire(%q) refused an empty gate", key)
+		}
+	}
+	if got := manager.CredentialInFlightTotal(auth); got != 3 {
+		t.Fatalf("CredentialInFlightTotal = %d, want 3", got)
+	}
+
+	gate.release("id:cred-total|glm-5.3", 5)
+	if got := manager.CredentialInFlightTotal(auth); got != 2 {
+		t.Fatalf("after one release CredentialInFlightTotal = %d, want 2", got)
+	}
+
+	for _, key := range []string{"id:cred-total", "id:cred-total|glm-5.3-flash"} {
+		gate.release(key, 5)
+	}
+	if got := manager.CredentialInFlightTotal(auth); got != 0 {
+		t.Fatalf("after every release CredentialInFlightTotal = %d, want 0", got)
+	}
+
+	// A credential that shares a key prefix must not be counted in.
+	if !gate.tryAcquire("id:cred-total-other", 5) {
+		t.Fatal("tryAcquire for the sibling credential failed")
+	}
+	if got := manager.CredentialInFlightTotal(auth); got != 0 {
+		t.Fatalf("sibling credential leaked into the total: %d", got)
+	}
+}
+
+// TestPickLeastLoadedSamplesEachCandidateOnce keeps the selection cost linear in
+// the candidate count: loadOf takes the admission gate lock, so sampling a
+// candidate twice per pick doubles the contention on the hottest lock here.
+func TestPickLeastLoadedSamplesEachCandidateOnce(t *testing.T) {
+	busy := &scheduledAuth{auth: &Auth{ID: "busy"}}
+	idle := &scheduledAuth{auth: &Auth{ID: "idle"}}
+	view := &readyView{flat: []*scheduledAuth{busy, idle}}
+
+	calls := map[string]int{}
+	loadOf := func(entry *Auth) int {
+		calls[entry.ID]++
+		if entry.ID == "busy" {
+			return 3
+		}
+		return 0
+	}
+
+	picked := view.pickLeastLoaded(schedulerStrategyRoundRobin, nil, loadOf)
+	if picked == nil {
+		t.Fatal("pickLeastLoaded returned nil for two distinguishable loads")
+	}
+	if picked.auth.ID != "idle" {
+		t.Fatalf("pickLeastLoaded picked %q, want idle", picked.auth.ID)
+	}
+	for _, id := range []string{"busy", "idle"} {
+		if calls[id] != 1 {
+			t.Fatalf("loadOf called %d times for %q, want 1", calls[id], id)
+		}
+	}
+}
+
 func TestCredentialCapSpillsToAnIdleCredential(t *testing.T) {
 	manager, executor := newCapTestManager(t, "cap-spill", map[string]any{
 		"cap-spill-a": 1,

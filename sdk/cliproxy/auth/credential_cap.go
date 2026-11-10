@@ -335,6 +335,22 @@ func credentialConcurrencyKey(auth *Auth) string {
 type credentialConcurrencyGate struct {
 	mu       sync.Mutex
 	inFlight map[string]int
+	// totals caches the in-flight sum per credential, keyed by the credential
+	// half of a scope key. Without it every read walked the whole inFlight map
+	// under the gate lock, and selection reads one total per candidate.
+	totals map[string]int
+}
+
+// credentialScopeOwner returns the credential key a scope key belongs to.
+//
+// A scope is either the credential key itself or "<credential key>|<model key>";
+// credentialConcurrencyKey only ever emits a "src:" or "id:" prefix and a file
+// path or an id, so the first "|" reliably ends the credential half.
+func credentialScopeOwner(scope string) string {
+	if i := strings.IndexByte(scope, '|'); i >= 0 {
+		return scope[:i]
+	}
+	return scope
 }
 
 func (g *credentialConcurrencyGate) tryAcquire(key string, limit int) bool {
@@ -350,6 +366,10 @@ func (g *credentialConcurrencyGate) tryAcquire(key string, limit int) bool {
 		return false
 	}
 	g.inFlight[key]++
+	if g.totals == nil {
+		g.totals = make(map[string]int)
+	}
+	g.totals[credentialScopeOwner(key)]++
 	return true
 }
 
@@ -359,6 +379,18 @@ func (g *credentialConcurrencyGate) release(key string, limit int) {
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	g.releaseScope(key)
+}
+
+// releaseScope decrements both the scope count and the credential total. The
+// caller must hold g.mu.
+func (g *credentialConcurrencyGate) releaseScope(key string) {
+	owner := credentialScopeOwner(key)
+	if current := g.totals[owner]; current <= 1 {
+		delete(g.totals, owner)
+	} else {
+		g.totals[owner] = current - 1
+	}
 	current := g.inFlight[key]
 	if current <= 1 {
 		delete(g.inFlight, key)
@@ -825,6 +857,9 @@ func (m *Manager) CredentialInFlight(auth *Auth) CredentialConcurrencyInFlight {
 // CredentialInFlight: a caller that only needs the total does not pay for a map
 // or a per-model slice, so it can be read on a hot path without adding pressure.
 //
+// The gate keeps that sum as it takes and releases slots, so this read is a map
+// lookup under the lock rather than a walk over every in-flight scope.
+//
 // The credential is identified exactly as the gate identifies it
 // (credentialConcurrencyKey), and Home owns its own dispatch and concurrency
 // accounting, so it reports zero here — the same rule CredentialInFlight follows.
@@ -839,12 +874,5 @@ func (m *Manager) CredentialInFlightTotal(auth *Auth) int {
 	gate := &m.credentialCap
 	gate.mu.Lock()
 	defer gate.mu.Unlock()
-	prefix := credentialKey + "|"
-	total := 0
-	for key, count := range gate.inFlight {
-		if key == credentialKey || strings.HasPrefix(key, prefix) {
-			total += count
-		}
-	}
-	return total
+	return gate.totals[credentialKey]
 }

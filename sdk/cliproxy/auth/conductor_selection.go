@@ -1762,6 +1762,49 @@ func (m *Manager) GetByID(id string) (*Auth, bool) {
 	return auth.Clone(), true
 }
 
+// LookupByIndex returns a clone of the auth whose stable index is authIndex.
+//
+// Index lookups used to be built on List(), which clones every auth, so the cost
+// of finding one credential grew with the size of the pool. The plugin host does
+// one lookup per credential when it enumerates them, which turned that linear
+// cost into quadratic allocation churn. Scanning here and cloning only the match
+// keeps List()'s read-only contract while paying one clone per lookup.
+//
+// Computing an index stays side-effect free: indexSeed and stableAuthIndex are
+// pure, so a credential whose index has not been assigned yet is compared without
+// writing to the shared record under the read lock.
+func (m *Manager) LookupByIndex(authIndex string) (*Auth, bool) {
+	authIndex = strings.TrimSpace(authIndex)
+	if m == nil || authIndex == "" {
+		return nil, false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, auth := range m.auths {
+		if auth == nil {
+			continue
+		}
+		// EnsureIndex trims before caching, so compare on the trimmed form; a
+		// whitespace-padded value must still match the index it represents.
+		if strings.TrimSpace(auth.Index) == authIndex {
+			return auth.Clone(), true
+		}
+	}
+	for _, auth := range m.auths {
+		if auth == nil || strings.TrimSpace(auth.Index) != "" {
+			continue
+		}
+		if stableAuthIndex(auth.indexSeed()) != authIndex {
+			continue
+		}
+		clone := auth.Clone()
+		clone.Index = authIndex
+		clone.indexAssigned = true
+		return clone, true
+	}
+	return nil, false
+}
+
 // GetExecutionSessionAuthByID retrieves a Home runtime auth scoped to an execution session.
 func (m *Manager) GetExecutionSessionAuthByID(sessionID string, authID string) (*Auth, bool) {
 	sessionID = strings.TrimSpace(sessionID)

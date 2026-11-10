@@ -18,6 +18,78 @@ func poolAuth(fileName string) *Auth {
 	return &Auth{ID: fileName, FileName: fileName + ".json", Provider: "zcode"}
 }
 
+// TestLookupByIndexFindsOneCredentialWithoutTouchingTheRest pins the contract the
+// plugin host relies on: an index lookup returns a private copy of the matching
+// credential and leaves the manager's records untouched.
+func TestLookupByIndexFindsOneCredentialWithoutTouchingTheRest(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	ctx := context.Background()
+
+	assigned := &Auth{ID: "loomy-assigned", Provider: "loomy"}
+	assigned.Index = "index-assigned"
+	// A second credential keeps the lookup honest: it has to pick the right one,
+	// not just any record.
+	peer := &Auth{ID: "loomy-peer", Provider: "loomy"}
+	for _, auth := range []*Auth{assigned, peer} {
+		if _, errRegister := manager.Register(ctx, auth); errRegister != nil {
+			t.Fatalf("register %s: %v", auth.ID, errRegister)
+		}
+	}
+
+	t.Run("assigned index", func(t *testing.T) {
+		got, ok := manager.LookupByIndex("index-assigned")
+		if !ok {
+			t.Fatal("LookupByIndex did not find an explicitly assigned index")
+		}
+		if got.ID != "loomy-assigned" {
+			t.Fatalf("LookupByIndex returned %q, want loomy-assigned", got.ID)
+		}
+		if got == manager.auths["loomy-assigned"] {
+			t.Fatal("LookupByIndex returned the shared record instead of a copy")
+		}
+		got.Disabled = true
+		if manager.auths["loomy-assigned"].Disabled {
+			t.Fatal("mutating the result changed the manager's record")
+		}
+	})
+
+	t.Run("index not computed yet", func(t *testing.T) {
+		// Register assigns an index, so the only way to reach the computing branch
+		// is a record that entered the map some other way.
+		raw := &Auth{ID: "loomy-raw", Provider: "loomy"}
+		manager.mu.Lock()
+		manager.auths[raw.ID] = raw
+		manager.mu.Unlock()
+
+		want := stableAuthIndex(raw.indexSeed())
+		if want == "" {
+			t.Fatal("test credential has no index seed")
+		}
+		got, ok := manager.LookupByIndex(want)
+		if !ok {
+			t.Fatal("LookupByIndex did not compute an index that was never assigned")
+		}
+		if got.ID != "loomy-raw" {
+			t.Fatalf("LookupByIndex returned %q, want loomy-raw", got.ID)
+		}
+		if got.Index != want {
+			t.Fatalf("returned index = %q, want %q", got.Index, want)
+		}
+		if raw.Index != "" || raw.indexAssigned {
+			t.Fatalf("LookupByIndex wrote the computed index back to the record (index=%q assigned=%v)", raw.Index, raw.indexAssigned)
+		}
+	})
+
+	t.Run("unknown index", func(t *testing.T) {
+		if _, ok := manager.LookupByIndex("index-missing"); ok {
+			t.Fatal("LookupByIndex matched an index that is not present")
+		}
+		if _, ok := manager.LookupByIndex("  "); ok {
+			t.Fatal("LookupByIndex matched an empty index")
+		}
+	})
+}
+
 func TestCredentialNameUsesAuthFileBase(t *testing.T) {
 	cases := []struct {
 		name string

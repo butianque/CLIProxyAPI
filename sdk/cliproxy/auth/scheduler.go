@@ -1889,6 +1889,11 @@ func (v *readyView) pickLeastLoaded(strategy schedulerStrategy, predicate func(*
 	lowest := -1
 	tied := true
 	matching := 0
+	type loadedCandidate struct {
+		entry *scheduledAuth
+		load  int
+	}
+	candidates := make([]loadedCandidate, 0, len(v.flat))
 	for _, entry := range v.flat {
 		if entry == nil || entry.auth == nil {
 			continue
@@ -1897,7 +1902,12 @@ func (v *readyView) pickLeastLoaded(strategy schedulerStrategy, predicate func(*
 			continue
 		}
 		matching++
+		// Each loadOf call takes the admission gate lock. Sampling once and
+		// keeping the value halves that contention across the whole candidate
+		// set, and it also stops the two passes from disagreeing about a
+		// credential whose load changed mid-selection.
 		load := loadOf(entry.auth)
+		candidates = append(candidates, loadedCandidate{entry: entry, load: load})
 		if lowest < 0 {
 			lowest = load
 			continue
@@ -1911,15 +1921,9 @@ func (v *readyView) pickLeastLoaded(strategy schedulerStrategy, predicate func(*
 		return nil
 	}
 	least := make([]*scheduledAuth, 0, matching)
-	for _, entry := range v.flat {
-		if entry == nil || entry.auth == nil {
-			continue
-		}
-		if predicate != nil && !predicate(entry) {
-			continue
-		}
-		if loadOf(entry.auth) == lowest {
-			least = append(least, entry)
+	for _, candidate := range candidates {
+		if candidate.load == lowest {
+			least = append(least, candidate.entry)
 		}
 	}
 	if len(least) == 0 {

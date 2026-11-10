@@ -230,16 +230,11 @@ func (h *Host) authByIndex(authIndex string) (*coreauth.Auth, error) {
 	if manager == nil {
 		return nil, fmt.Errorf("core auth manager unavailable")
 	}
-	for _, auth := range manager.List() {
-		if auth == nil {
-			continue
-		}
-		auth.EnsureIndex()
-		if auth.Index == authIndex {
-			return auth, nil
-		}
+	auth, ok := manager.LookupByIndex(authIndex)
+	if !ok {
+		return nil, fmt.Errorf("auth not found for auth_index %s", authIndex)
 	}
-	return nil, fmt.Errorf("auth not found for auth_index %s", authIndex)
+	return auth, nil
 }
 
 func (h *Host) authPhysicalJSONByIndex(authIndex string) (*coreauth.Auth, []byte, error) {
