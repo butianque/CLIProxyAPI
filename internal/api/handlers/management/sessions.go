@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"strconv"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/secretstore"
+	log "github.com/sirupsen/logrus"
 )
 
 // Management sessions.
@@ -39,6 +41,11 @@ const (
 	sessionHeaderName = "X-CPA-Session"
 	// sessionContextKey is where the resolved session is stored on the gin context.
 	sessionContextKey = "cpa.management.session"
+	// managementKeyAuthContextKey records that this request already proved the
+	// management key (or an automation key) in the middleware in front of the
+	// session middleware. A request authenticated that way is answered on the key's
+	// authority alone: a stale session token may not turn it into a 401.
+	managementKeyAuthContextKey = "cpa.management.keyAuthenticated"
 
 	// sessionCookieName is the browser's credential. It is HttpOnly and scoped to
 	// the management API, so a page reload, a second tab, or a reopened window
@@ -84,11 +91,80 @@ const (
 var (
 	errSessionMissing = errors.New("a management session is required for this operation")
 	errSessionExpired = errors.New("management session expired")
+	// The expiry variants say which clock ran out, so the panel can distinguish
+	// "this browser is unknown" from "this browser was idle too long" and choose
+	// between quietly rebuilding the session and ending it. They wrap
+	// errSessionExpired, so an errors.Is check for "expired" still holds.
+	errSessionIdle     = fmt.Errorf("%w: idle timeout", errSessionExpired)
+	errSessionAbsolute = fmt.Errorf("%w: absolute lifetime", errSessionExpired)
+	// errSessionIP is only reachable when the operator turns address binding on
+	// with CPA_SESSION_BIND_IP=1.
+	errSessionIP = fmt.Errorf("%w: used from another address", errSessionExpired)
 )
+
+// sessionErrorReason names the cause for the response body. The panel reads it;
+// the strings are part of the management API contract.
+func sessionErrorReason(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, errSessionMissing):
+		return "missing"
+	case errors.Is(err, errSessionIdle):
+		return "idle"
+	case errors.Is(err, errSessionAbsolute):
+		return "absolute"
+	case errors.Is(err, errSessionIP):
+		return "ip"
+	default:
+		return "expired"
+	}
+}
+
+// sessionIPWarnings remembers which sessions have already logged an address change,
+// so a client that rotates addresses on every request cannot flood the log with the
+// same line. Entries are dropped when the session is.
+var sessionIPWarnings sync.Map
+
+// shortSessionID is the part of a session id that is safe to log: enough to
+// correlate a report, not enough to present as a token. The id is the first 16
+// characters of the token, so it is not a credential by itself, but keeping the
+// log short also keeps it readable.
+func shortSessionID(id string) string {
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
+}
+
+// forgetSessionWarning drops the address-change bookkeeping for a session that is
+// gone, so the map cannot grow for the lifetime of the process.
+func forgetSessionWarning(session *managementSession) {
+	if session == nil {
+		return
+	}
+	sessionIPWarnings.Delete(session.id)
+}
+
+// warnAddressChangeOnce logs the first address change of a session and stays quiet
+// afterwards.
+func warnAddressChangeOnce(session *managementSession, currentIP string) {
+	if session == nil {
+		return
+	}
+	if _, warned := sessionIPWarnings.LoadOrStore(session.id, struct{}{}); warned {
+		return
+	}
+	log.Warnf("management session %s was created from %s and is now used from %s; keeping the session (set CPA_SESSION_BIND_IP=1 to reject address changes)", shortSessionID(session.id), session.clientIP, currentIP)
+}
 
 // managementSession is one signed-in browser.
 type managementSession struct {
-	id       string
+	id string
+	// token is the registry key, kept on the session so a handler that was handed
+	// the resolved session can act on it without re-reading a header the browser
+	// may have left over from another tab.
+	token    string
 	clientIP string
 	created  time.Time
 	lastSeen time.Time
@@ -101,14 +177,22 @@ type managementSession struct {
 	persistent bool
 }
 
-// expiredForPanel reports whether the browser is no longer recognised. Only the
-// panel clock and the absolute cap apply: polling must not extend a session, but
-// neither should a quiet afternoon end it.
-func (s *managementSession) expiredForPanel(now time.Time, idle, absolute time.Duration) bool {
+// expiryReason reports which clock has run out, or nil while the browser is still
+// recognised. Only the panel clock and the absolute cap apply: polling must not
+// extend a session, but neither should a quiet afternoon end it.
+func (s *managementSession) expiryReason(now time.Time, idle, absolute time.Duration) error {
 	if idle > 0 && now.Sub(s.lastAuth) > idle {
-		return true
+		return errSessionIdle
 	}
-	return absolute > 0 && now.Sub(s.created) > absolute
+	if absolute > 0 && now.Sub(s.created) > absolute {
+		return errSessionAbsolute
+	}
+	return nil
+}
+
+// expiredForPanel reports whether the browser is no longer recognised.
+func (s *managementSession) expiredForPanel(now time.Time, idle, absolute time.Duration) bool {
+	return s.expiryReason(now, idle, absolute) != nil
 }
 
 // sessionRegistry holds the live sessions, keyed by their opaque token.
@@ -123,9 +207,17 @@ func newSessionRegistry() *sessionRegistry {
 
 // sessionIdleTTL resolves the idle limit. CPA_SESSION_IDLE_MINUTES overrides it;
 // zero or a negative value disables the idle clock.
+//
+// A non-positive value is normalised to 0 rather than passed through: the store
+// reads a non-positive grant ttl as "no store-side deadline" (see
+// secretstore.grantExpiry), so a negative here would otherwise mean one thing to
+// the session clock and another to the grant.
 func sessionIdleTTL() time.Duration {
 	if raw := strings.TrimSpace(os.Getenv("CPA_SESSION_IDLE_MINUTES")); raw != "" {
 		if minutes, errAtoi := strconv.Atoi(raw); errAtoi == nil {
+			if minutes <= 0 {
+				return 0
+			}
 			return time.Duration(minutes) * time.Minute
 		}
 	}
@@ -157,19 +249,32 @@ func sessionAbsoluteTTL() time.Duration {
 	return defaultSessionAbsoluteTTL
 }
 
-// sessionBindsIP reports whether a session is pinned to the address that created
-// it. On by default: a token copied to another host is useless. CPA_SESSION_BIND_IP=0
-// turns it off for deployments behind a rotating proxy.
+// sessionBindsIP reports whether a session is pinned to the address that created it.
+//
+// Off by default. The OWASP Session Management Cheat Sheet does not list address
+// binding as a required control, and it explicitly warns against controls that
+// break legitimate users: an address is not an identity. This deployment proves
+// the point — the server sits behind nginx with Cloudflare real_ip, so ClientIP()
+// is the client's own egress address, and a dual-stack client alternates between
+// IPv4 and IPv6 at the CDN edge; a TUN or a network switch changes it outright.
+// Binding therefore ended sessions in the middle of active use, which is a
+// security *loss* (operators work around it by disabling the timeout) rather than
+// a gain. Session theft is answered where it actually lives: the cookie is
+// HttpOnly, SameSite=Strict, scoped to the management path, CSRF-header gated,
+// short-lived, and revocable per session.
+//
+// CPA_SESSION_BIND_IP=1 turns the pin back on for a deployment whose client
+// addresses are genuinely stable; a mismatch is then logged and rejected.
 func sessionBindsIP() bool {
 	raw := strings.TrimSpace(os.Getenv("CPA_SESSION_BIND_IP"))
 	if raw == "" {
-		return true
+		return false
 	}
 	switch strings.ToLower(raw) {
-	case "0", "false", "no", "off":
-		return false
-	default:
+	case "1", "true", "yes", "on":
 		return true
+	default:
+		return false
 	}
 }
 
@@ -298,6 +403,7 @@ func (r *sessionRegistry) create(clientIP string, persistent bool) (*managementS
 	now := time.Now()
 	session := &managementSession{
 		id:         token[:16],
+		token:      token,
 		clientIP:   clientIP,
 		created:    now,
 		lastSeen:   now,
@@ -324,12 +430,17 @@ func (r *sessionRegistry) lookup(token, clientIP string) (*managementSession, er
 		return nil, errSessionExpired
 	}
 	now := time.Now()
-	if session.expiredForPanel(now, panelIdleTTL(), sessionAbsoluteTTL()) {
+	if errExpiry := session.expiryReason(now, panelIdleTTL(), sessionAbsoluteTTL()); errExpiry != nil {
 		delete(r.sessions, token)
-		return nil, errSessionExpired
+		forgetSessionWarning(session)
+		return nil, errExpiry
 	}
-	if sessionBindsIP() && session.clientIP != clientIP {
-		return nil, errSessionExpired
+	if session.clientIP != clientIP {
+		if sessionBindsIP() {
+			log.Warnf("management session %s is bound to %s but was used from %s; rejecting the request (CPA_SESSION_BIND_IP=1)", shortSessionID(session.id), session.clientIP, clientIP)
+			return nil, errSessionIP
+		}
+		warnAddressChangeOnce(session, clientIP)
 	}
 	return session, nil
 }
@@ -342,12 +453,38 @@ func (r *sessionRegistry) touch(token, clientIP string) (*managementSession, err
 	if errLookup != nil {
 		return nil, errLookup
 	}
+	if errTouch := r.touchSession(session); errTouch != nil {
+		return nil, errTouch
+	}
+	return session, nil
+}
+
+// touchSession slides the clocks of a session that was already resolved.
+//
+// This is what a touch handler should use. The panel presents its token in a
+// header while the browser also holds the cookie, and the two can disagree — an
+// older tab, a re-issued cookie, a header the panel kept after the server swept
+// the session behind it. Resolving the token again would then reject a request
+// the session middleware had just accepted, which the panel reports as "you were
+// signed out".
+func (r *sessionRegistry) touchSession(session *managementSession) error {
+	if session == nil {
+		return errSessionMissing
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if current, ok := r.sessions[session.token]; !ok || current != session {
+		return errSessionExpired
+	}
 	now := time.Now()
+	if errExpiry := session.expiryReason(now, panelIdleTTL(), sessionAbsoluteTTL()); errExpiry != nil {
+		delete(r.sessions, session.token)
+		forgetSessionWarning(session)
+		return errExpiry
+	}
 	session.lastSeen = now
 	session.lastAuth = now
-	return session, nil
+	return nil
 }
 
 // revoke drops a token and returns the session it belonged to.
@@ -363,6 +500,7 @@ func (r *sessionRegistry) revoke(token string) *managementSession {
 		return nil
 	}
 	delete(r.sessions, token)
+	forgetSessionWarning(session)
 	return session
 }
 
@@ -383,6 +521,7 @@ func (r *sessionRegistry) revokeOthers(keep string) []*managementSession {
 			continue
 		}
 		delete(r.sessions, token)
+		forgetSessionWarning(session)
 		dropped = append(dropped, session)
 	}
 	return dropped
@@ -401,6 +540,7 @@ func (r *sessionRegistry) sweep(now time.Time) []*managementSession {
 	for token, session := range r.sessions {
 		if session.expiredForPanel(now, idle, absolute) {
 			delete(r.sessions, token)
+			forgetSessionWarning(session)
 			dropped = append(dropped, session)
 		}
 	}
@@ -475,6 +615,14 @@ func dropStaleGrants(now time.Time) {
 // live one — a stale token is an expired session, and answering 401 is what sends
 // the panel back to the login page instead of letting it show stale data.
 //
+// The one exception is a request the management-key middleware has already
+// authenticated. That request was answered on the key's authority; a session token
+// it happens to carry is a leftover (another tab, another session the server has
+// already swept, a browser that kept a header after its cookie was re-issued), and
+// turning it into a 401 logs the operator out of a panel the key had just let in.
+// Such a request continues without a session, which is exactly the state a
+// key-only request has: secret operations answer 409, everything else works.
+//
 // The cookie is the browser's own credential and the header is what a script
 // sends, so they are tried in that order of authority: if the header names a
 // session that is gone but the cookie still resolves, the cookie wins. And a live
@@ -501,8 +649,21 @@ func (h *Handler) SessionMiddleware() gin.HandlerFunc {
 			}
 		}
 		if errLookup != nil {
+			if managementKeyAuthenticated(c) {
+				// Drop a cookie the server no longer knows, so the browser stops
+				// presenting it, but do not reject the request: the key already
+				// proved who is asking.
+				if cookieToken != "" {
+					clearSessionCookie(c)
+				}
+				c.Next()
+				return
+			}
 			if headerToken != "" {
-				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": errLookup.Error()})
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+					"error":  errLookup.Error(),
+					"reason": sessionErrorReason(errLookup),
+				})
 				return
 			}
 			// A stale cookie must not block a request that still carries a valid
@@ -517,6 +678,28 @@ func (h *Handler) SessionMiddleware() gin.HandlerFunc {
 		c.Set(sessionContextKey, session)
 		c.Next()
 	}
+}
+
+// markManagementKeyAuthenticated records that the request proved the management key.
+func markManagementKeyAuthenticated(c *gin.Context) {
+	if c == nil {
+		return
+	}
+	c.Set(managementKeyAuthContextKey, true)
+}
+
+// managementKeyAuthenticated reports whether the request proved the management key
+// before it reached the session middleware.
+func managementKeyAuthenticated(c *gin.Context) bool {
+	if c == nil {
+		return false
+	}
+	value, ok := c.Get(managementKeyAuthContextKey)
+	if !ok {
+		return false
+	}
+	flag, ok := value.(bool)
+	return ok && flag
 }
 
 // sessionFromContext returns the session resolved by SessionMiddleware, or nil
@@ -542,6 +725,17 @@ func sessionID(c *gin.Context) string {
 		return session.id
 	}
 	return ""
+}
+
+// sessionTokenFor returns the token of the session that authenticated this
+// request. The session the middleware resolved wins: the panel sends its token in
+// a header while the browser also holds the cookie, and the header may be a
+// leftover the middleware already discarded in favour of the cookie.
+func sessionTokenFor(c *gin.Context) string {
+	if session := sessionFromContext(c); session != nil && session.token != "" {
+		return session.token
+	}
+	return sessionToken(c)
 }
 
 // sessionVault returns the secret store as seen by the calling session. A request
@@ -634,10 +828,31 @@ func (h *Handler) GetSession(c *gin.Context) {
 
 // PostSessionTouch slides the idle clock. The panel calls it on real user
 // activity only, so background polling never keeps a session alive.
+//
+// The session the middleware resolved is authoritative. Re-reading the header
+// here would reject a request that was just accepted — the panel keeps a token in
+// a header and the browser keeps one in a cookie, and after a re-issue they are
+// not the same value. Only a request that resolved no session (the management key
+// authenticated, a stale token alongside) falls back to the token.
+//
+// A failure carries a `reason` so the panel can tell "this browser is unknown"
+// from "this browser was idle too long", and decide between rebuilding the session
+// quietly and ending it.
 func (h *Handler) PostSessionTouch(c *gin.Context) {
-	session, errTouch := h.ensureSessions().touch(sessionToken(c), c.ClientIP())
+	var (
+		session  *managementSession
+		errTouch error
+	)
+	if resolved := sessionFromContext(c); resolved != nil {
+		session, errTouch = resolved, h.ensureSessions().touchSession(resolved)
+	} else {
+		session, errTouch = h.ensureSessions().touch(sessionToken(c), c.ClientIP())
+	}
 	if errTouch != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": errTouch.Error()})
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error":  errTouch.Error(),
+			"reason": sessionErrorReason(errTouch),
+		})
 		return
 	}
 	// Keep the store's own backstop in step with the session clock.
@@ -650,7 +865,7 @@ func (h *Handler) PostSessionTouch(c *gin.Context) {
 // DeleteSession ends the calling session and drops its secret-store grant. Other
 // sessions are untouched.
 func (h *Handler) DeleteSession(c *gin.Context) {
-	session := h.ensureSessions().revoke(sessionToken(c))
+	session := h.ensureSessions().revoke(sessionTokenFor(c))
 	// The cookie goes away whether or not the token still resolved: a browser that
 	// pressed "sign out" must not keep a credential it can no longer use.
 	clearSessionCookie(c)

@@ -2,10 +2,13 @@ package config
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
+	log "github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
 )
 
@@ -115,12 +118,65 @@ func SaveConfigPreserveComments(configFile string, cfg *Config, migrateV8 ...boo
 			return fmt.Errorf("decode migrated config: %w", err)
 		}
 	}
-	if err = os.WriteFile(configFile, data, 0600); err != nil {
+	if err = writeConfigFileAtomically(configFile, data, 0600); err != nil {
 		return err
 	}
 	if migrated != nil {
 		// Keep runtime-only values intact and publish scope only after the write succeeds.
 		cfg.OAuthOnlyFields = migrated.OAuthOnlyFields
+	}
+	return nil
+}
+
+// writeConfigFileAtomically replaces path with data without ever exposing a
+// partially written file.
+//
+// os.WriteFile truncates in place, so a crash, a full disk or a killed container
+// during a save leaves a truncated config.yaml behind and the next start cannot
+// parse it. Writing beside the target and renaming is atomic on the same
+// filesystem, so a reader sees either the old document or the new one.
+//
+// The previous content is kept beside the file as path+".bak" so an operator has
+// something to restore from. That copy is best effort: a backup failure is
+// logged and must not block the save itself.
+func writeConfigFileAtomically(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, errCreate := os.CreateTemp(dir, ".config-*.tmp")
+	if errCreate != nil {
+		return fmt.Errorf("create temporary config file: %w", errCreate)
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		if errRemove := os.Remove(tmpPath); errRemove != nil && !errors.Is(errRemove, os.ErrNotExist) {
+			log.WithError(errRemove).Warn("failed to remove temporary config file")
+		}
+	}()
+	// CreateTemp already uses 0600; set it explicitly so the mode does not depend
+	// on the umask or on a future change to the helper.
+	if errChmod := tmp.Chmod(perm); errChmod != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("set temporary config file mode: %w", errChmod)
+	}
+	if _, errWrite := tmp.Write(data); errWrite != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write temporary config file: %w", errWrite)
+	}
+	// Flush before the rename: a rename that reaches the device ahead of the data
+	// would leave the new name pointing at unwritten blocks after a power loss.
+	if errSync := tmp.Sync(); errSync != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("sync temporary config file: %w", errSync)
+	}
+	if errClose := tmp.Close(); errClose != nil {
+		return fmt.Errorf("close temporary config file: %w", errClose)
+	}
+	if previous, errRead := os.ReadFile(path); errRead == nil && len(previous) > 0 {
+		if errBackup := os.WriteFile(path+".bak", previous, perm); errBackup != nil {
+			log.WithError(errBackup).Warn("failed to write config backup")
+		}
+	}
+	if errRename := os.Rename(tmpPath, path); errRename != nil {
+		return fmt.Errorf("publish config file: %w", errRename)
 	}
 	return nil
 }

@@ -268,6 +268,66 @@ func TestQuietSessionStaysSignedIn(t *testing.T) {
 	}
 }
 
+// TestSessionTTLDisablingIsNormalised pins the three clocks reading the same way
+// for a non-positive setting. The store reads a non-positive grant ttl as "no
+// store-side deadline", so a negative minute count must not reach it as a
+// different value from zero.
+func TestSessionTTLDisablingIsNormalised(t *testing.T) {
+	for _, tc := range []struct {
+		env   string
+		value string
+		want  time.Duration
+	}{
+		{"CPA_SESSION_IDLE_MINUTES", "0", 0},
+		{"CPA_SESSION_IDLE_MINUTES", "-5", 0},
+		{"CPA_SESSION_IDLE_MINUTES", "15", 15 * time.Minute},
+	} {
+		t.Run(tc.env+"="+tc.value, func(t *testing.T) {
+			t.Setenv(tc.env, tc.value)
+			if got := sessionIdleTTL(); got != tc.want {
+				t.Fatalf("sessionIdleTTL() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	// The other two already normalise, so the three agree.
+	for _, tc := range []struct {
+		env   string
+		value string
+		want  time.Duration
+	}{
+		{"CPA_PANEL_IDLE_MINUTES", "0", 0},
+		{"CPA_PANEL_IDLE_MINUTES", "-5", 0},
+	} {
+		t.Run(tc.env+"="+tc.value, func(t *testing.T) {
+			t.Setenv(tc.env, tc.value)
+			if got := panelIdleTTL(); got != tc.want {
+				t.Fatalf("panelIdleTTL() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDisabledIdleClockKeepsTheSession is what CPA_SESSION_IDLE_MINUTES=0 is for:
+// an operator who wants no idle limit at all gets one, instead of a session that
+// expires because a negative duration was compared as a deadline.
+func TestDisabledIdleClockKeepsTheSession(t *testing.T) {
+	t.Setenv("CPA_SESSION_IDLE_MINUTES", "0")
+	passphraseStoreLocked(t)
+	h, r := sessionRouter(t)
+
+	token := startSession(t, r)
+	registry := h.ensureSessions()
+	registry.mu.Lock()
+	session := registry.sessions[token]
+	registry.mu.Unlock()
+	session.lastSeen = time.Now().Add(-24 * time.Hour)
+
+	if recorder := call(t, r, http.MethodGet, "/secrets", token, nil); recorder.Code != http.StatusOK {
+		t.Fatalf("a disabled idle clock must not end the session: %d: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
 // TestPanelIdleSignsTheBrowserOut pins the window that ends a session. It is what
 // still holds when no page is running: a closed tab cannot run the panel's own
 // idle guard, so the server has to be the one that forgets the browser.
@@ -447,16 +507,30 @@ func cookieRouter(t *testing.T, allowRemote bool) *Handler {
 // whichever credentials the caller supplies.
 func cookieCall(t *testing.T, h *Handler, remoteAddr, key, cookie, csrf string) *httptest.ResponseRecorder {
 	t.Helper()
+	return managementCall(t, h, http.MethodGet, "/config", remoteAddr, key, "", cookie, csrf)
+}
+
+// managementCall issues one management request through the chain the server
+// mounts: the management-key middleware in front, the session middleware behind
+// it, then the route. headerToken is the panel's X-CPA-Session value, which may
+// disagree with the cookie the browser also holds.
+func managementCall(t *testing.T, h *Handler, method, path, remoteAddr, key, headerToken, cookie, csrf string) *httptest.ResponseRecorder {
+	t.Helper()
 	engine := gin.New()
 	engine.Use(h.Middleware(), h.SessionMiddleware())
 	engine.GET("/config", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"ok": true}) })
+	engine.GET("/session", h.GetSession)
 	engine.POST("/session", h.PostSession)
+	engine.POST("/session/touch", h.PostSessionTouch)
 	engine.DELETE("/session", h.DeleteSession)
 
-	req := httptest.NewRequest(http.MethodGet, "/config", nil)
+	req := httptest.NewRequest(method, path, nil)
 	req.RemoteAddr = remoteAddr
 	if key != "" {
 		req.Header.Set("X-Management-Key", key)
+	}
+	if headerToken != "" {
+		req.Header.Set(sessionHeaderName, headerToken)
 	}
 	if cookie != "" {
 		req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: cookie})
@@ -467,6 +541,18 @@ func cookieCall(t *testing.T, h *Handler, remoteAddr, key, cookie, csrf string) 
 	recorder := httptest.NewRecorder()
 	engine.ServeHTTP(recorder, req)
 	return recorder
+}
+
+// errorReason reads the `reason` field of an error reply.
+func errorReason(t *testing.T, recorder *httptest.ResponseRecorder) string {
+	t.Helper()
+	var payload struct {
+		Reason string `json:"reason"`
+	}
+	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &payload); errDecode != nil {
+		t.Fatalf("decode error body %q: %v", recorder.Body.String(), errDecode)
+	}
+	return payload.Reason
 }
 
 // cookieFrom pulls the management session cookie out of a response.
@@ -546,8 +632,12 @@ func TestSessionCookieWithoutTheCSRFHeaderIsRefused(t *testing.T) {
 	}
 }
 
-// TestSessionCookieIsBoundToTheAddressThatCreatedIt keeps a stolen cookie useless.
+// TestSessionCookieIsBoundToTheAddressThatCreatedIt covers the opt-in pin.
+// Address binding is off by default (see sessionBindsIP); an operator whose
+// clients really do keep one address turns it on and gets a stolen cookie
+// rejected.
 func TestSessionCookieIsBoundToTheAddressThatCreatedIt(t *testing.T) {
+	t.Setenv("CPA_SESSION_BIND_IP", "1")
 	h := cookieRouter(t, true)
 	cookie := startCookieSession(t, h, "203.0.113.7:5000", false)
 
@@ -555,9 +645,153 @@ func TestSessionCookieIsBoundToTheAddressThatCreatedIt(t *testing.T) {
 	if recorder.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401 for a cookie replayed from another address", recorder.Code)
 	}
+	if reason := errorReason(t, recorder); reason != "ip" {
+		t.Fatalf("reason = %q, want %q", reason, "ip")
+	}
 	if cleared := cookieFrom(t, recorder); cleared == nil || cleared.MaxAge >= 0 {
 		t.Fatal("a rejected cookie must be cleared in the reply")
 	}
+}
+
+// TestAddressChangeKeepsTheSession is the bug behind "signed out while working".
+//
+// The server sits behind nginx with Cloudflare real_ip, so ClientIP() is the
+// client's own egress address, and a dual-stack client alternates IPv4 and IPv6 at
+// the CDN edge; a TUN or a network switch changes it outright. Pinning the session
+// to the address that created it therefore killed sessions in the middle of active
+// use. Before the fix this test answered 401.
+func TestAddressChangeKeepsTheSession(t *testing.T) {
+	t.Setenv("CPA_SESSION_BIND_IP", "")
+	h := cookieRouter(t, true)
+
+	_, token, errCreate := h.ensureSessions().create("203.0.113.7", false)
+	if errCreate != nil {
+		t.Fatalf("create session: %v", errCreate)
+	}
+	// Same token, same browser, different address.
+	recorder := managementCall(t, h, http.MethodGet, "/session", "203.0.113.8:5000", "", "", token, sessionCSRFHeaderValue)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: a changed address must not end the session: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+// TestAddressBindingRejectsOnlyWhenEnabled is the other half: the pin still
+// exists, it just has to be asked for.
+func TestAddressBindingRejectsOnlyWhenEnabled(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		env  string
+		want int
+	}{
+		{"default", "", http.StatusOK},
+		{"disabled explicitly", "0", http.StatusOK},
+		{"enabled", "1", http.StatusUnauthorized},
+		{"enabled as true", "true", http.StatusUnauthorized},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("CPA_SESSION_BIND_IP", tc.env)
+			h := cookieRouter(t, true)
+			_, token, errCreate := h.ensureSessions().create("203.0.113.7", false)
+			if errCreate != nil {
+				t.Fatalf("create session: %v", errCreate)
+			}
+			recorder := managementCall(t, h, http.MethodGet, "/session", "203.0.113.8:5000", "", "", token, sessionCSRFHeaderValue)
+			if recorder.Code != tc.want {
+				t.Fatalf("status = %d, want %d: %s", recorder.Code, tc.want, recorder.Body.String())
+			}
+		})
+	}
+}
+
+// TestManagementKeyToleratesAStaleSessionToken is the second independent cause of
+// the sign-outs. The key middleware runs in front of the session middleware, so a
+// request the key has already authenticated must be answered on the key's
+// authority: the panel keeps its token in a header, the browser keeps one in a
+// cookie, and after a re-issue they disagree. Rejecting the request because the
+// header token is stale turned a valid key-authenticated call into a 401, which
+// the panel reports as "you were signed out". Before the fix this test answered
+// 401.
+func TestManagementKeyToleratesAStaleSessionToken(t *testing.T) {
+	h := cookieRouter(t, true)
+
+	recorder := managementCall(t, h, http.MethodGet, "/config", "203.0.113.7:5000", "test-secret", "session-that-no-longer-exists", "", "")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: a stale session token must not reject a key-authenticated request: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+// TestTouchUsesTheResolvedSession keeps the touch handler from re-reading the
+// header. The middleware already resolved this browser from its cookie; a header
+// left over from an older session must not turn the touch into a 401, because the
+// panel answers a 401 on /session/touch by ending the session.
+func TestTouchUsesTheResolvedSession(t *testing.T) {
+	h := cookieRouter(t, true)
+	const addr = "203.0.113.7:5000"
+	cookie := startCookieSession(t, h, addr, false)
+
+	recorder := managementCall(t, h, http.MethodPost, "/session/touch", addr, "", "session-that-no-longer-exists", cookie.Value, sessionCSRFHeaderValue)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: touch must use the session the middleware resolved: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+// TestSessionRefusalSaysWhy gives the panel something to act on: an unknown browser
+// and an idle-expired browser need different answers, and a bare 401 cannot tell
+// them apart. The cookie path is where an expired session is actually reported —
+// the middleware resolves it before any handler runs.
+func TestSessionRefusalSaysWhy(t *testing.T) {
+	t.Run("idle", func(t *testing.T) {
+		h := cookieRouter(t, true)
+		const addr = "203.0.113.7:5000"
+		cookie := startCookieSession(t, h, addr, false)
+
+		session, errLookup := h.ensureSessions().lookup(cookie.Value, "203.0.113.7")
+		if errLookup != nil {
+			t.Fatalf("lookup: %v", errLookup)
+		}
+		session.lastAuth = time.Now().Add(-2 * panelIdleTTL())
+
+		recorder := cookieCall(t, h, addr, "", cookie.Value, sessionCSRFHeaderValue)
+		if recorder.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401: %s", recorder.Code, recorder.Body.String())
+		}
+		if reason := errorReason(t, recorder); reason != "idle" {
+			t.Fatalf("reason = %q, want %q", reason, "idle")
+		}
+	})
+
+	t.Run("absolute", func(t *testing.T) {
+		h := cookieRouter(t, true)
+		const addr = "203.0.113.7:5000"
+		cookie := startCookieSession(t, h, addr, false)
+
+		session, errLookup := h.ensureSessions().lookup(cookie.Value, "203.0.113.7")
+		if errLookup != nil {
+			t.Fatalf("lookup: %v", errLookup)
+		}
+		// Only the absolute cap has run out: the browser clock is untouched.
+		session.created = time.Now().Add(-2 * sessionAbsoluteTTL())
+		session.lastAuth = time.Now()
+
+		recorder := cookieCall(t, h, addr, "", cookie.Value, sessionCSRFHeaderValue)
+		if recorder.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401: %s", recorder.Code, recorder.Body.String())
+		}
+		if reason := errorReason(t, recorder); reason != "absolute" {
+			t.Fatalf("reason = %q, want %q", reason, "absolute")
+		}
+	})
+
+	t.Run("missing", func(t *testing.T) {
+		h := cookieRouter(t, true)
+		recorder := managementCall(t, h, http.MethodPost, "/session/touch", "203.0.113.7:5000", "test-secret", "", "", "")
+		if recorder.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401: %s", recorder.Code, recorder.Body.String())
+		}
+		if reason := errorReason(t, recorder); reason != "missing" {
+			t.Fatalf("reason = %q, want %q", reason, "missing")
+		}
+	})
 }
 
 // TestPersistentSessionCookieOutlivesTheBrowser is what the panel's "remember this

@@ -276,3 +276,43 @@ func TestGrantRequiresSessionIdentity(t *testing.T) {
 		t.Fatalf("read from a nil store: got %v, want ErrLocked", errGet)
 	}
 }
+
+// TestNonPositiveGrantTTLMeansNoStoreDeadline pins what a non-positive ttl means.
+// CPA_SESSION_IDLE_MINUTES=0 disables the session idle clock, and it reaches
+// GrantSession as a zero ttl; falling back to SessionGrantTTL there would impose a
+// ten-minute deadline the operator explicitly turned off and would start refusing
+// credential writes mid-session.
+func TestNonPositiveGrantTTLMeansNoStoreDeadline(t *testing.T) {
+	store := grantStore(t)
+	if _, errGrant := store.GrantSession("session-a", 0); errGrant != nil {
+		t.Fatalf("grant with ttl 0: %v", errGrant)
+	}
+	store.mu.Lock()
+	expires := store.sessions["session-a"].expires
+	store.mu.Unlock()
+	if !expires.IsZero() {
+		t.Fatalf("grant with ttl 0 expires at %v, want no deadline", expires)
+	}
+
+	// No deadline means no sweep ever drops it, however far ahead the clock goes.
+	if dropped := store.SweepExpired(time.Now().Add(48 * time.Hour)); dropped != 0 {
+		t.Fatalf("sweep dropped %d grants, want 0", dropped)
+	}
+	if !store.SessionUnlocked("session-a") {
+		t.Fatal("a grant with no deadline must still authorize")
+	}
+
+	// Touch with a non-positive ttl keeps it without a deadline as well.
+	if !store.TouchSession("session-a", -time.Minute) {
+		t.Fatal("touch on a live grant must report true")
+	}
+	store.mu.Lock()
+	expires = store.sessions["session-a"].expires
+	store.mu.Unlock()
+	if !expires.IsZero() {
+		t.Fatalf("touch with a negative ttl set a deadline %v, want none", expires)
+	}
+	if _, errGet := store.SessionVault("session-a").Get("phone"); errGet != nil {
+		t.Fatalf("read after touch: %v", errGet)
+	}
+}

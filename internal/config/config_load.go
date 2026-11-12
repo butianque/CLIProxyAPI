@@ -247,6 +247,12 @@ func hashManagementKey(configFile string, data []byte, field *string, yamlKey st
 	if yaml.Unmarshal(data, &source) == nil && len(source.Content) > 0 && yamlPath(expandConfigAliases(source.Content[0]), "management."+yamlKey) != nil {
 		path[0] = "management"
 	}
-	_ = SaveConfigPreserveCommentsUpdateNestedScalar(configFile, path, hashed)
+	// A failure here leaves the plaintext key on disk while the process runs with
+	// the hashed value, so the operator would never learn that the migration did
+	// not land. Startup continues on purpose: refusing to boot over an unwritable
+	// config file would lock the operator out of the panel that could fix it.
+	if errWrite := SaveConfigPreserveCommentsUpdateNestedScalar(configFile, path, hashed); errWrite != nil {
+		log.WithError(errWrite).Warnf("failed to rewrite %s as a hash in %s; the plaintext value is still on disk", yamlKey, configFile)
+	}
 	return nil
 }

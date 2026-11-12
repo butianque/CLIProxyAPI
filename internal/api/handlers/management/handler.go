@@ -313,7 +313,10 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 				session, errLookup := h.ensureSessions().lookup(token, clientIP)
 				if errLookup != nil {
 					clearSessionCookie(c)
-					c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "management session expired"})
+					c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+						"error":  "management session expired",
+						"reason": sessionErrorReason(errLookup),
+					})
 					return
 				}
 				c.Set(sessionContextKey, session)
@@ -334,6 +337,7 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "this automation key may not call " + c.Request.Method + " " + route})
 				return
 			}
+			markManagementKeyAuthenticated(c)
 			c.Next()
 			return
 		}
@@ -343,6 +347,10 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 			c.AbortWithStatusJSON(statusCode, gin.H{"error": errMsg})
 			return
 		}
+		// The key decided for this request. The session middleware runs behind
+		// this one and must not turn a stale X-CPA-Session token into a 401 for a
+		// request that has already been let in.
+		markManagementKeyAuthenticated(c)
 		c.Next()
 	}
 }

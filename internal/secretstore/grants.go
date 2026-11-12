@@ -13,9 +13,10 @@ import (
 // different statuses.
 var ErrUnauthorized = errors.New("secret store: no grant for this session")
 
-// SessionGrantTTL is how long a session grant survives without being refreshed.
-// The management session owns the authoritative idle clock; this is the store's
-// own backstop so a forgotten grant cannot outlive the session that created it.
+// SessionGrantTTL is the idle window a management session normally passes to
+// GrantSession. The store does not apply it as a fallback: a caller that passes a
+// non-positive ttl means "no store-side deadline", and the grant then expires only
+// when its session is revoked (see grantExpiry).
 const SessionGrantTTL = 10 * time.Minute
 
 // sessionGrant records that one management session proved the master
@@ -27,6 +28,19 @@ const SessionGrantTTL = 10 * time.Minute
 type sessionGrant struct {
 	issued  time.Time
 	expires time.Time
+}
+
+// grantExpiry resolves a grant's idle deadline. A non-positive ttl means the
+// caller disabled the store-side backstop (CPA_SESSION_IDLE_MINUTES=0 and
+// friends), so the grant carries a zero deadline, which sessionGrant.expired
+// treats as "never expires". Falling back to SessionGrantTTL here instead would
+// turn "no deadline" into a ten-minute deadline and sign the operator out of the
+// credentials they configured to stay unlocked.
+func grantExpiry(now time.Time, ttl time.Duration) time.Time {
+	if ttl <= 0 {
+		return time.Time{}
+	}
+	return now.Add(ttl)
 }
 
 // expired reports whether the grant's idle deadline has passed. A zero deadline
@@ -131,9 +145,6 @@ func (s *Store) GrantSession(sessionID string, ttl time.Duration) (Vault, error)
 	if sessionID == "" {
 		return Vault{}, ErrUnauthorized
 	}
-	if ttl <= 0 {
-		ttl = SessionGrantTTL
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.key == nil {
@@ -143,7 +154,7 @@ func (s *Store) GrantSession(sessionID string, ttl time.Duration) (Vault, error)
 	if s.sessions == nil {
 		s.sessions = make(map[string]*sessionGrant)
 	}
-	s.sessions[sessionID] = &sessionGrant{issued: now, expires: now.Add(ttl)}
+	s.sessions[sessionID] = &sessionGrant{issued: now, expires: grantExpiry(now, ttl)}
 	return Vault{store: s, session: sessionID}, nil
 }
 
@@ -153,16 +164,13 @@ func (s *Store) TouchSession(sessionID string, ttl time.Duration) bool {
 	if s == nil || sessionID == "" {
 		return false
 	}
-	if ttl <= 0 {
-		ttl = SessionGrantTTL
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
 	if errAuth := s.authorizeLocked(sessionID, now); errAuth != nil {
 		return false
 	}
-	s.sessions[sessionID].expires = now.Add(ttl)
+	s.sessions[sessionID].expires = grantExpiry(now, ttl)
 	return true
 }
 

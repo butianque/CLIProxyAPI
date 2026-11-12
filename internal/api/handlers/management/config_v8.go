@@ -193,7 +193,7 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 	// without this a leaked key would keep working through every browser that was
 	// already signed in — the panel's copy promises the opposite.
 	if secretKeyChanged(previousCfg, next) {
-		for _, ended := range h.ensureSessions().revokeOthers(sessionToken(c)) {
+		for _, ended := range h.ensureSessions().revokeOthers(sessionTokenFor(c)) {
 			revokeSessionGrant(ended.id)
 		}
 	}
